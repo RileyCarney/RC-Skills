@@ -1,0 +1,121 @@
+# Use a private image
+Source: https://docs.boxlite.ai/cloud/private-images
+
+Register one registry login so BoxLite can pull your private images, and know which images that login covers.
+
+Most images need nothing from you. A private one needs a login BoxLite can pull with — registered once per registry, after which referencing it is identical to [any other image](/cloud/use-your-image):
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+box = await rt.create(
+    BoxOptions(image="ghcr.io/acme/api:1.4.0"),
+    name="demo",
+)
+```
+
+No credentials at the call site, ever. Which login gets used is worked out from the reference.
+
+## Which images a login covers
+
+An image reference has three parts, and a login is registered against the first one:
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+ghcr.io / acme/api : 1.4.0
+   │         │        └── tag
+   │         └── repository
+   └── registry host    ← the login is for this
+```
+
+You can narrow it to part of the registry with a **repository prefix**:
+
+| Registered as | Covers |
+| - | - |
+| `ghcr.io`, no prefix | Every private image on `ghcr.io` |
+| `ghcr.io` + `acme/` | `ghcr.io/acme/api`, `ghcr.io/acme/worker`, … not `ghcr.io/other/x` |
+| `ghcr.io` + `acme/team-a/` | Only what is under `acme/team-a/` |
+
+When several logins could match, **the most specific one wins**. So a broad `acme/` login can cover an organization while `acme/team-a/` overrides it for one team.
+
+> [!NOTE]
+>
+> A prefix is whole path segments and must end in `/`. `acme/` is accepted; `acme` is refused. Omit it to cover the whole registry.
+
+A login can be registered for `ghcr.io`, `docker.io`, `quay.io`, and Google Container Registry — `gcr.io` and its `us.`, `eu.`, and `asia.` hosts. Any other host is refused when you create the login.
+
+### What goes in username and password
+
+BoxLite signs in the same way everywhere — a username and a password or token. What those two values *are* is each registry's own convention, and getting them wrong is the usual reason a pull fails with `UNAUTHORIZED`.
+
+| Registry | `username` | `password` |
+| - | - | - |
+| `ghcr.io` | Your GitHub username | A [classic personal access token](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry) with the `read:packages` scope |
+| `docker.io` | Your Docker Hub username | A [Docker Hub access token](https://docs.docker.com/security/for-developers/access-tokens/) with read-only permission |
+| `quay.io` | A [robot account](https://docs.quay.io/glossary/robot-accounts.html) name, like `acme+puller` | That robot account's token |
+| `gcr.io` and its regional hosts | `_json_key` | The whole [service account JSON key](https://cloud.google.com/artifact-registry/docs/docker/authentication), as one string |
+
+> [!NOTE]
+>
+> For Google, `oauth2accesstoken` with a short-lived access token also works, but the token expires — a service account key is what you want for a login BoxLite keeps.
+
+Your own account's password is never the right answer. Every registry above issues a token meant for exactly this, and each can be scoped to read-only.
+
+## Register the login
+
+> [tab] Console
+>
+> 1. Open **Images**, then the **Private registries** tab.
+> 2. Click **Connect a registry**.
+> 3. Fill in the host, your username, and a password or access token. Add a repository prefix if you want to narrow it.
+>
+> The table then lists the host, what it covers, the username, and when it was added.
+>
+> This is the easier path for a one-time setup, and the only one that does not need a Full-access API key.
+
+> [tab] SDK
+>
+> ```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> await rt.images.registries.create(
+>     registry_host="ghcr.io",
+>     username="<YOUR_REGISTRY_USERNAME>",
+>     password="<YOUR_REGISTRY_TOKEN>",
+>     repository_prefix="acme/",      # optional
+> )
+> ```
+>
+> Use this when the login has to be created without a person — provisioning a new environment, say. It needs a key with **Full** access.
+
+Use a read-only pull token where your registry issues one. BoxLite only ever pulls.
+
+## Then start boxes as usual
+
+With the login in place, a private reference behaves exactly like a public one. It is recorded in [the catalog](/cloud/image-catalog) once the box boots, counts against the same limit, and can carry [aliases](/cloud/image-aliases).
+
+## Review or remove a login
+
+> [tab] Console
+>
+> The **Private registries** tab lists every login with its host, coverage, and username, and removes one from the row's action menu.
+
+> [tab] SDK
+>
+> ```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> registries = await rt.images.registries.list()
+> await rt.images.registries.remove(login_id)
+> ```
+
+Removing a login leaves images already in the catalog alone. New boxes that needed it fail to pull.
+
+## Things that will bite you
+
+* **The password is write-only.** Nothing ever reads it back — not the console, not the SDK. Rotating a credential means removing the login and creating it again; there is no update.
+* **A prefix without a trailing `/` is refused.** `acme/`, not `acme`.
+* **Forbidden errors on registry calls are a key problem.** These calls need **Full** access; a **Boxes** key cannot make them.
+
+## Next
+
+> [card] [Pin a build](/cloud/image-aliases)
+>
+> Name the exact build production should boot.
+
+> [card] [The catalog](/cloud/image-catalog)
+>
+> Private images count against the same limit as public ones.

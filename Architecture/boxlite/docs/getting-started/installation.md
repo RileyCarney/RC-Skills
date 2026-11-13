@@ -1,0 +1,260 @@
+# Installation
+Source: https://docs.boxlite.ai/getting-started/installation
+
+Install the four SDKs and the CLI, and confirm your machine meets the virtualization requirement.
+
+BoxLite is not an ordinary container runtime — it starts a real lightweight VM (Hypervisor.framework on macOS, KVM on Linux), so beyond the package you need hardware virtualization.
+
+> [!NOTE]
+>
+> **You may not need this page.** For most people `pip install boxlite` (or the npm / cargo / go equivalent) is the whole install, and the [Quickstart](/getting-started/quickstart) has it inline. Come here for the platform matrix, offline and pinned installs, building from source, the CLI, and install troubleshooting.
+
+> [!WARNING]
+>
+> **No hardware virtualization on this machine?** Nothing on this page will fix that — CI runners, most nested VMs, and containers cannot run a microVM. Use [BoxLite Cloud](/cloud/quickstart) instead: your machine needs only an API key and HTTPS, and it is the same SDK.
+
+## Prerequisites
+
+### Platform and virtualization requirements (common to all SDKs)
+
+| Platform | Architecture | Status | Virtualization requirement |
+| - | - | - | - |
+| macOS | Apple Silicon (ARM64) | Supported | macOS 12+, built-in Hypervisor.framework (no `/dev/kvm` needed) |
+| macOS | Intel (x86_64) | Not supported | — |
+| Linux | x86_64 | Supported | KVM enabled, `/dev/kvm` accessible |
+| Linux | ARM64 (aarch64) | Supported | KVM enabled, `/dev/kvm` accessible |
+| Windows | x86_64 | Supported via WSL2 | Configure KVM inside WSL2 per the Linux requirements |
+
+> Platform support source: the platform table in the repository root `README.md`. macOS arm64 runs without `/dev/kvm` (it uses Hypervisor.framework).
+
+**Network**: the first run of any image pulls it from the registry, so outbound network access is required once per image. Later runs use the local layer cache. Without hardware virtualization the box fails to start — see [Troubleshooting](#troubleshooting) below.
+
+### Language runtime versions
+
+| SDK | Minimum version | Install method |
+| - | - | - |
+| Python | 3.10+ | `pip install boxlite` (prebuilt wheel) |
+| Node.js | 18+ | `npm install @boxlite-ai/boxlite` (prebuilt native module) |
+| Rust | 1.88 or newer (`Cargo.toml` `rust-version`) | Build from source (crate name `boxlite`) |
+| Go | 1.24+, CGO enabled | `go get github.com/boxlite-ai/boxlite/sdks/go` + `go run .../cmd/setup` (prebuilt native library) |
+| C | C11-compatible compiler (GCC/Clang) | Build `libboxlite` from source |
+| CLI | — | One-line script / cargo / source |
+
+### Required only when building from source: protoc
+
+The prebuilt pip / npm packages **do not** need `protoc`. But when you build the Rust core from source (this includes `cargo build` for the Rust SDK, the C SDK, and the CLI), the build script `src/shared/build.rs` calls `protoc` to compile the Protocol Buffers and requires **protoc >= 3.12** (for proto3 optional fields).
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Install protoc (choose one per platform)
+# macOS (Homebrew)
+brew install protobuf
+
+# Ubuntu / Debian
+sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+# Verify the version (must be >= 3.12)
+protoc --version
+# Expected output, e.g.: libprotoc 3.21.12
+```
+
+> The repository provides `make setup:build`, which installs the build dependencies (including protoc) per platform. Run it before building from source.
+
+***
+
+## Verify the install
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Python
+python3 -c "import boxlite; print(boxlite.__version__)"
+# Node
+node -e "console.log(require('@boxlite-ai/boxlite/package.json').version)"
+# CLI
+boxlite --version
+```
+
+A runnable first box, in all five languages, is on the [Quickstart](/getting-started/quickstart).
+
+## Parameters and Returns
+
+### Install artifacts and entry points
+
+| SDK | Package / artifact | Install command | Import / link method | Verify |
+| - | - | - | - | - |
+| Python | `boxlite` (PyPI) | `pip install boxlite` | `import boxlite` | `boxlite.__version__` |
+| Node.js | `@boxlite-ai/boxlite` (npm) | `npm install @boxlite-ai/boxlite` | `import { SimpleBox } from "@boxlite-ai/boxlite"` | See Troubleshooting below |
+| Rust | crate `boxlite` (source `src/boxlite/src/`) | `cargo build --release -p boxlite` | `use boxlite::...;` | `cargo build` succeeds |
+| C | `libboxlite.{dylib,so,a}` + `sdks/c/include/boxlite.h` | `cargo build --release -p boxlite-c` | `#include "boxlite.h"` + link `-lboxlite` | `boxlite_version()` |
+| CLI | `boxlite` binary | `curl -fsSL https://sh.boxlite.ai \| sh` | Command-line invocation | `boxlite --help` |
+
+> Note: the Node package name is `@boxlite-ai/boxlite`, **not** `boxlite` and **not** `@boxlite/sdk`. It is pure ESM (`"type": "module"`).
+
+### Python optional extras
+
+| Extra | Install command | Provides | Behavior when missing |
+| - | - | - | - |
+| default | `pip install boxlite` | Async API (`SimpleBox` / `CodeBox`, etc.) | — |
+| `sync` | `pip install "boxlite[sync]"` | Sync API (`SyncBoxlite` / `SyncSimpleBox`, etc.; needs greenlet) | Accessing a Sync class raises `AttributeError` |
+| `orchestration` | `pip install "boxlite[orchestration]"` | Orchestration (`BoxRuntime` / `ManagedBox`; needs cloudpickle) | These classes are unavailable |
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Install both sync and orchestration capabilities at once
+pip install "boxlite[sync,orchestration]"
+```
+
+### CLI install methods
+
+| Method | Command | Notes |
+| - | - | - |
+| One-line script | `curl -fsSL https://sh.boxlite.ai \| sh` | Installs to `$HOME/.local/bin/boxlite` (make sure that directory is on `PATH`) |
+| cargo (compile from source) | `cargo install boxlite-cli` | Needs the Rust toolchain + protoc |
+| cargo binstall (prebuilt) | `cargo binstall boxlite-cli` | Pulls a prebuilt binary, no compilation |
+| Build from source | `cargo build --release -p boxlite-cli` | Output at `target/release/boxlite` |
+
+### Pinning a version and overriding the install directory
+
+The one-line script reads three environment variables. The env-var prefix has to sit on the `sh` side of the pipe — variables placed before `curl` only decorate the curl process and never reach the installer.
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Pin a version and choose a custom install directory
+curl -fsSL https://sh.boxlite.ai \
+  | BOXLITE_VERSION=vX.Y.Z BOXLITE_INSTALL_DIR=/usr/local/bin sh
+```
+
+| Variable | Effect |
+| - | - |
+| `BOXLITE_VERSION` | Installs a specific tagged release (for example `vX.Y.Z`) instead of `latest` |
+| `BOXLITE_INSTALL_DIR` | Installs the binary to this directory instead of `$HOME/.local/bin` |
+| `BOXLITE_EXPECTED_SHA256` | Pins the expected SHA-256 of the downloaded tarball (see below) |
+
+When you pin a non-latest version, the installer falls back to the remote `.sha256` sidecar in that release for the expected digest. That anchor shares its trust root with the tarball, so for a guarantee independent of the release page, look up the digest in the release's attested `SHA256SUMS` and pass it in explicitly:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Pin both the version and an independently attested digest
+curl -fsSL https://sh.boxlite.ai \
+  | BOXLITE_VERSION=vX.Y.Z \
+    BOXLITE_EXPECTED_SHA256=<sha256-of-boxlite-cli-vX.Y.Z-target.tar.gz> sh
+```
+
+### Verifying the installer and artifacts
+
+Each release publishes raw tarballs (`boxlite-cli-vX.Y.Z-<target>.tar.gz`), matching `.sha256` sidecars, a combined `SHA256SUMS`, and sigstore-backed build provenance attestations. Verifying these is the recommended path before running anything in production or untrusted environments.
+
+To verify a manually downloaded tarball:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Check the digest against the published sidecar
+sha256sum -c "boxlite-cli-${VERSION}-${TARGET}.tar.gz.sha256"
+
+# Verify the build provenance attestation (requires the GitHub CLI)
+gh attestation verify "boxlite-cli-${VERSION}-${TARGET}.tar.gz" \
+  --repo boxlite-ai/boxlite
+```
+
+The `curl … | sh` shortcut cannot self-verify, since the script runs as it is piped in. To verify `install.sh` before running it — it is also covered by `SHA256SUMS`, an `install.sh.sha256` sidecar, and the same sigstore attestation:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+curl -fsSL -o install.sh \
+  "https://github.com/boxlite-ai/boxlite/releases/latest/download/install.sh"
+curl -fsSL -o install.sh.sha256 \
+  "https://github.com/boxlite-ai/boxlite/releases/latest/download/install.sh.sha256"
+sha256sum -c install.sh.sha256
+gh attestation verify install.sh --repo boxlite-ai/boxlite
+sh ./install.sh
+```
+
+### Node prebuilt native targets
+
+The native binaries bundled with the npm package cover `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`. There is **no Windows artifact** (use WSL2). `playwright-core` is an optional peer dependency (used only by BrowserBox).
+
+***
+
+## Troubleshooting
+
+The following collects common errors and platform-specific issues.
+
+### Linux: KVM unavailable / permission denied
+
+If the host genuinely has no virtualization — a CI runner, a nested VM, a container — none of the steps below apply. [BoxLite Cloud](/cloud/quickstart) needs no local virtualization.
+
+**Error:** Box fails to start, reporting it cannot access `/dev/kvm` or `Permission denied`.
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Confirm the CPU supports virtualization
+grep -E 'vmx|svm' /proc/cpuinfo   # any output means supported
+
+# Confirm the KVM module is loaded and the device exists
+lsmod | grep kvm
+ls -l /dev/kvm
+
+# Add the current user to the kvm group (requires re-login or newgrp to take effect)
+sudo usermod -aG kvm $USER
+newgrp kvm
+```
+
+This is an environment constraint: without hardware virtualization the start fails, but the process stays alive and can be caught with `try/except` (Python) or `try/catch` (Node).
+
+### macOS: Intel machine or an old system
+
+**What you see:** Python raises `RuntimeError`, Node throws a bare `Error`, and the C SDK returns `UnsupportedEngine` (code 19) — or the process segfaults.
+
+* Only Apple Silicon (ARM64) is supported. Intel Macs are not supported.
+* macOS 12+ is required. Hypervisor.framework is built into the system, needs no manual setup, and does not require `/dev/kvm`.
+
+### macOS: the box starts but is immediately denied by the sandbox
+
+On Apple Silicon the box runs under a Seatbelt policy, which can reject a path or operation your image needs. The symptom is a start that fails with a `sandbox` or `deny` message rather than a virtualization error. See [Debug macOS Seatbelt denials](/development/macos-sandbox-debugging) for how to read the denial and loosen the policy.
+
+### Windows: a direct install does not run
+
+BoxLite has no native Windows artifact. Install inside WSL2 and configure KVM per the Linux steps above (WSL2 requires the user in the `kvm` group).
+
+### Building from source: protoc not found or too old
+
+**Error:** the build stops, reporting that `protoc` is missing, or that proto3 optional fields fail to compile.
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Install and confirm the version is >= 3.12
+brew install protobuf           # macOS
+sudo apt-get install -y protobuf-compiler   # Ubuntu/Debian
+protoc --version                # must be >= 3.12
+```
+
+Reminder: prebuilt `pip install boxlite` / `npm install @boxlite-ai/boxlite` **do not** invoke protoc; only the `cargo build` path needs it. When building from source, run `make setup:build` first to gather dependencies.
+
+### Building from source: forgot to init submodules
+
+**Error:** the build is missing the vendored dependency sources under `src/deps/` (libkrun, libkrunfw, e2fsprogs, and bubblewrap are all git submodules).
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+git submodule update --init --recursive   # required after cloning
+```
+
+### Node: native extension not found / unsupported engine
+
+**Error:** `BoxLite native extension not found` or `Unsupported engine`.
+
+* Confirm Node >= 18: `node --version`.
+* Confirm the platform is on the prebuilt target list (macOS arm64 / Linux x64 / Linux arm64). Intel Mac and native Windows are not supported.
+* The package is pure ESM; use `import` (or `.mjs`). CommonJS `require()` fails.
+
+### Image pull failure raises RuntimeError (not BoxliteError)
+
+A missing command or an image pull failure raises a standard `RuntimeError` (Python) / bare `Error` (Node), not `BoxliteError`. See [Error Handling](/guides/error-handling#troubleshooting).
+
+### Verifying the install prints an unexpected version
+
+`boxlite.__version__` reads `importlib.metadata.version("boxlite")`, i.e. the actually installed package version. A mismatch usually means an old version is installed in the environment:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+pip install --upgrade boxlite
+python -c "import boxlite; print(boxlite.__version__)"
+```
+
+### Enabling debug logs
+
+Any SDK or the CLI can control the underlying runtime logs with `RUST_LOG` to diagnose a stalled start or a pull problem:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+RUST_LOG=debug python hello_boxlite.py
+# Log levels: trace / debug / info / warn / error
+```

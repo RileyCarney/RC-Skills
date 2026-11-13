@@ -1,0 +1,631 @@
+# Concurrent execution deadlock investigation
+Source: https://docs.boxlite.ai/development/concurrent-exec-deadlock
+
+**Resolved and superseded.** A historical record of one deadlock — kept for the debugging method, not as current behavior.
+
+The hang is fixed: the guest now forks a single-threaded zygote before tokio starts any threads, and that zygote handles every `clone3()` (`src/guest/src/container/zygote.rs`). **If you hit a concurrent `exec` hang today, do not assume it is this bug** — re-diagnose from the Troubleshooting section below.
+
+## Conclusion
+
+### Root cause: musl's `__malloc_lock` deadlocks after `clone3()` in a multi-threaded process
+
+The guest binary (`boxlite-guest`) is statically linked against **musl libc** (`aarch64-unknown-linux-musl`) and runs on a **multi-threaded tokio runtime**. When `libcontainer` calls `clone3()` to fork the intermediate process, the child inherits a **locked `__malloc_lock`** (musl's global allocator mutex, symbol address `0x16f6e68` in BSS) — the lock was held by another tokio thread that happened to be doing a heap allocation at the moment of the fork. Because musl does **not** install a `pthread_atfork` handler to reset `__malloc_lock` in the child, the intermediate process deadlocks on its **first memory allocation** — before it can send any channel message or close the inherited file descriptors. The parent then blocks forever on `recvmsg()`.
+
+### Deadlock Call Graph
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+TOKIO RUNTIME (multi-threaded, PID 1 inside guest VM)
+┌──────────────────────────────────────────────────────────────┐
+│                                                              │
+│  Thread A (tokio-runtime-w)        Thread B (any tokio thrd) │
+│  ┌───────────────────────────┐     ┌────────────────────────┐│
+│  │ ExecService::exec()       │     │ (doing any work)       ││
+│  │   ↓                       │     │   ↓                    ││
+│  │ ContainerExecutor::spawn()│     │ Vec::push() / String   ││
+│  │   ↓                       │     │ ::from() / format!()   ││
+│  │ container.lock().await    │     │   ↓                    ││
+│  │   ↓                       │     │ malloc()               ││
+│  │ spawn_blocking {          │     │   ↓                    ││
+│  │   builder.build()         │     │ lock(__malloc_lock) ◄━━━━━ HOLDS
+│  │     ↓                    │     │ 0x16f6e68 = 0x02      ││
+│  │   tenant_builder.build() │     │   ↓                    ││
+│  │     ↓                    │     │ (memcpy, split, etc.)  ││
+│  │   builder_impl.create()  │     │   ↓                    ││
+│  │     ↓                    │     │ unlock(__malloc_lock)   ││
+│  │   run_container()        │     └────────────────────────┘│
+│  │     ↓                    │                                │
+│  │   container_main_process │                                │
+│  │     ↓                    │                                │
+│  │   socketpair() x3        │  Creates 6 fds:               │
+│  │   (SEQPACKET+CLOEXEC)    │    main_sender    (ms)        │
+│  │     ↓                    │    main_receiver   (mr)        │
+│  │                          │    inter_sender   (is)        │
+│  │   ════════════════════════════════════════════════════    │
+│  │   clone3()  ← FORK ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━    │
+│  │   ════════════════════════════════════════════════════    │
+│  │     ↓ (parent path)      │                                │
+│  │   close(ms) ✓            │                                │
+│  │   close(is) ✓            │                                │
+│  │     ↓                    │                                │
+│  │   mr.recv() ━━━━━━━━━━━━━━━━━━━━━ BLOCKS FOREVER        │
+│  │   (recvmsg on SEQPACKET) │   (peer ms still open in     │
+│  │   (syscall 212, aarch64) │    child process)             │
+│  └───────────────────────────┘                               │
+└──────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════ clone3() boundary ══════════════
+
+INTERMEDIATE PROCESS (PID 248, single-threaded child)
+┌──────────────────────────────────────────────────────────────┐
+│                                                              │
+│  Inherited from fork:                                        │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │ • ALL 6 channel fds (ms, mr, is, ir, xs, xr)          │  │
+│  │ • __malloc_lock at 0x16f6e68 = 0x80000002 (LOCKED)     │  │
+│  │ • Thread B DOES NOT EXIST in this process              │  │
+│  │ • musl has NO pthread_atfork to reset __malloc_lock    │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                              │
+│  container_intermediate_process()                            │
+│    ↓                                                         │
+│  FIRST LINE OF CODE that does heap allocation:               │
+│    Vec::new(), String::from(), format!(), PathBuf, Box, etc. │
+│    ↓                                                         │
+│  malloc() → lock(__malloc_lock) → futex(FUTEX_WAIT_PRIVATE)  │
+│    ↓                                                         │
+│  ═══════════ DEADLOCK ═══════════                            │
+│  Lock owner (Thread B) does not exist in child.              │
+│  futex will NEVER be woken.                                  │
+│                                                              │
+│  Consequences:                                               │
+│    ✗ NEVER sends intermediate_ready to parent                │
+│    ✗ NEVER forks init process                                │
+│    ✗ NEVER closes inherited channel fds:                     │
+│        fd=23 → main_sender   (peer of parent's mr)           │
+│        fd=25 → inter_sender  (peer of parent's ir)           │
+│    ✗ NEVER exits                                             │
+│                                                              │
+│  Parent's recv() consequence:                                │
+│    poll(mr) → revents=0x0 (peer alive, no POLLHUP)           │
+│    FIONREAD → 0 bytes available                              │
+│    → recvmsg blocks forever                                  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Why it is intermittent (\~30-50%)
+
+The deadlock occurs only when another thread happens to hold `__malloc_lock` at the exact instant `clone3()` runs. When several tokio workers allocate memory frequently, this overlap is likely but not certain:
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+Thread B:    ──────[ malloc ]───────[ malloc ]───────[ malloc ]──
+                      ▲                                 ▲
+                  lock held                         lock held
+                  (few μs)                          (few μs)
+
+clone3():    ─────────┼───────────────┼──────────────────┼──────
+                   DEADLOCK          SAFE             DEADLOCK
+```
+
+### Why it is musl-specific
+
+| Behavior | glibc | musl |
+| - | - | - |
+| `pthread_atfork` for malloc | Yes — resets the lock in the child | **No** — explicitly unsupported |
+| `__malloc_lock` in the child | Reset to the unlocked state | **Copied as-is (stays locked)** |
+| `fork()` safety | malloc is largely safe | **Unsafe if another thread is in malloc** |
+
+### Fix Options
+
+| Option | Approach | Pros | Cons |
+| - | - | - | - |
+| **A** | Watchdog kills the process + retry | Fast; no libcontainer changes | Retry adds latency |
+| **B** | **Pre-fork helper process (the zygote)** | Eliminates the entire bug class | Adds architectural complexity |
+| **C** | Child closes fds before allocating | Fixes the fd leak | Does not fix the futex deadlock |
+| **D** | Switch to glibc | Removes the root cause directly | Larger binary, dynamic linking |
+| **E** | vfork / CLONE_VFORK | Fixes it at the fork layer | Large libcontainer changes |
+
+**Adopted and implemented: Option B (the zygote pre-fork model).** The implementation is in `src/guest/src/container/zygote.rs`: the zygote is forked **before** tokio starts any threads, stays single-threaded for its entire lifetime, and handles all `build()` calls over IPC (a SEQPACKET socket, serialized with a mutex) — so `clone3()` always runs in a single-threaded context where `__malloc_lock` cannot be held by another thread. This is the same pattern used by runwasi's Zygote (PR #775) and runc's nsexec. The investigation report originally recommended "A (short term) + B (long term)"; the more thorough Option B was adopted in the end.
+
+### Upstream status (youki)
+
+This is a **known issue** in the youki project, tracked at [containers/youki#2144](https://github.com/containers/youki/issues/2144) ("cargo test with musl hangs occasionally"), raised in July 2023 by maintainer `yihuaf`.
+
+**The issue was never truly fixed in any release (including v0.6.0).** Upstream only worked around it:
+
+| PR | Action | Date | Status |
+| - | - | - | - |
+| [#2150](https://github.com/containers/youki/pull/2150) | Disable the flaky musl test in CI | 2023-07 | Merged |
+| [#2615](https://github.com/containers/youki/pull/2615) | Attempted fix: leak the `Box` closure to avoid `free()` in the child | — | Closed, not merged |
+| [#2685](https://github.com/containers/youki/pull/2685) | Set `--test-threads=1` to serialize all tests | 2024-02 | Merged |
+
+The note on PR #2685: *"The root cause is that the tests run in a multi-threaded environment, which should not happen in real use."*
+
+**Why upstream does not treat it as a problem, but BoxLite is affected:**
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+Upstream youki:   youki CLI (single-threaded) → clone3() → safe ✓
+BoxLite guest:    tokio runtime (multi-threaded) → spawn_blocking → clone3() → DEADLOCK ✗
+```
+
+Upstream assumes youki runs as a standalone single-threaded CLI, where no other thread holds `__malloc_lock` at fork time. BoxLite embeds `libcontainer` in a multi-threaded tokio runtime — exactly the scenario upstream considers "should not happen in real use". **Upgrading libcontainer does not fix the problem**: the [v0.6.0 release](https://github.com/containers/youki/releases/tag/v0.6.0) (2025-02) made no changes to clone3, fork, or multi-threaded behavior. The fix had to be implemented by BoxLite itself (the zygote above).
+
+***
+
+## Reproducing the shape of the bug
+
+The following is a **regression-verification** script: it issues several concurrent `exec` calls against the same box and waits for all of them to return. **On the current, fixed version it should pass reliably** — this is the same class of workload that previously had a \~30-50% chance of hanging. Use it as a smoke test for whether this bug has regressed.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Requires: pip install boxlite   (latest published version)
+# Platform: Linux+KVM or macOS (Apple Hypervisor.framework)
+# Purpose: concurrent exec regression smoke test — after the fix all should return reliably, with no hang
+import asyncio
+
+from boxlite import SimpleBox
+from boxlite.errors import BoxliteError
+
+# The deadlock was originally triggered at concurrency 8; raise the pressure slightly here
+CONCURRENCY = 16
+
+async def main() -> None:
+    # SimpleBox is an async context manager; the box is created lazily and only starts on entering async with
+    try:
+        async with SimpleBox(image="alpine:latest") as box:
+            async def one(i: int) -> str:
+                # SimpleBox.exec timeout parameter is timeout (float, seconds); env takes a dict (not a list)
+                result = await box.exec("echo", f"hello_{i}", timeout=30.0)
+                # a non-zero exit code does not raise; check exit_code yourself
+                if result.exit_code != 0:
+                    raise RuntimeError(
+                        f"task {i} exit_code={result.exit_code} stderr={result.stderr!r}"
+                    )
+                return result.stdout.strip()
+
+            # Launch CONCURRENCY execs at once; before the fix this had a ~30-50% chance of hanging forever
+            outputs = await asyncio.gather(*(one(i) for i in range(CONCURRENCY)))
+            print(f"all {len(outputs)} execs returned, e.g. {outputs[:3]}")
+    except BoxliteError as exc:
+        # wrapper-layer error (parent of ExecError/TimeoutError/ParseError)
+        print(f"BoxLite error: {exc}")
+    except RuntimeError as exc:
+        # Note: image pull failure / no virtualization raise a standard RuntimeError, not BoxliteError
+        print(f"runtime error (image pull / virtualization?): {exc}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+> To run a test closer to the original reproduction inside the source repository, use the guest-side zygote concurrency test (it asserts that 4 concurrent `build()` calls all complete with no deadlock; see the test module at the end of `src/guest/src/container/zygote.rs`). Prefer `make test`; do not call `cargo` directly.
+
+* This page is for contributors and kernel/runtime debuggers; it is **not** an SDK usage tutorial. Before reading, you should understand: process `fork`/`clone3` semantics, Unix-domain `SOCK_SEQPACKET` socketpairs, futexes, and the difference between musl and glibc in `fork()` safety.
+* Reading/modifying the guest and zygote source and running the Rust tests requires the BoxLite source repository and `make` / `cargo test` (prefer the `make` targets; do not call `cargo` directly).
+
+***
+
+## Debug Process (methodology reference)
+
+> The procedure below is the reusable core of this page. Source paths have been updated to the real repository layout with the `src/guest/...` prefix. `libcontainer/...` refers to the vendored youki crate (a dependency, not under the BoxLite repository's `src/`).
+
+### Step 1: Reproduce the hang
+
+**Tool:** `cargo test --nocapture` + a loop runner.
+
+Run `test_concurrent_exec_high_concurrency` in a loop: it issues 8 concurrent `exec("echo hello_N")` calls against the same VM and waits for all of them to complete.
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Historical reproduction script (from that time); the current version is fixed, so it should pass reliably
+# Inside the repository prefer make targets, not cargo directly
+for i in $(seq 1 10); do
+  cargo test -p boxlite --features krun \
+    --test execution_shutdown test_concurrent_exec_high_concurrency \
+    -- --nocapture 2>&1
+done
+```
+
+**Observation:** A failure rate of roughly \~30-50%. When it hangs, one exec never returns and the test times out at 120s. The hang always occurs inside `TenantContainerBuilder::build()` within the guest VM.
+
+**Conclusion:** A reproducible race. The container mutex guarantees that only one `build()` runs at a time, yet it still hangs intermittently.
+
+### Step 2: Locate where build() blocks
+
+**Tool:** Reading the libcontainer (youki v0.5.7) source.
+
+Trace the call path (the first two lines are BoxLite guest source; the rest is the vendored youki crate):
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+src/guest/src/service/exec/executor.rs   → ContainerExecutor::spawn()
+src/guest/src/container/command.rs       → build_and_spawn()
+libcontainer/tenant_builder.rs           → TenantContainerBuilder::build()
+libcontainer/builder_impl.rs             → ContainerBuilderImpl::create() → run_container()
+libcontainer/container_main_process.rs   → container_main_process()
+libcontainer/process/channel.rs          → channel pairs (SEQPACKET)
+libcontainer/process/fork.rs             → clone3() without CLONE_FILES
+```
+
+**Key findings:**
+
+* `build()` creates a pipe (O_CLOEXEC), then `create()` → `container_main_process()`.
+* `container_main_process()` creates 3 channel pairs with `socketpair(AF_UNIX, SOCK_SEQPACKET, SOCK_CLOEXEC)`, then calls `clone3()`.
+* After the fork, the parent closes `main_sender` and `inter_sender`, then blocks on `main_receiver.wait_for_intermediate_ready()` (a single `recvmsg`).
+* The channel `Sender`/`Receiver` wrap raw fds and have **no Drop implementation** — they must be closed explicitly or they leak.
+* `clone3()` is called **without** `CLONE_FILES` — the child gets a copy of the fd table.
+* The intermediate process forks the init process using `clone3_sibling` (with `CLONE_PARENT` and **no exit signal**).
+
+**Conclusion:** The block is in `recvmsg` on the `main_receiver` SEQPACKET socket, waiting for the intermediate process to send `intermediate_ready`.
+
+### Step 3: Add a watchdog diagnostic thread
+
+**Tool:** Custom diagnostic code added to `src/guest/src/container/command.rs`.
+
+Add a watchdog thread that fires if `build()` has not completed within 3 seconds:
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+let done = Arc::new(AtomicBool::new(false));
+let done_clone = done.clone();
+let parent_tid = nix::unistd::gettid().as_raw();
+
+let watchdog = std::thread::spawn(move || {
+    std::thread::sleep(Duration::from_secs(3));
+    if done_clone.load(Ordering::Relaxed) { return; }
+    eprintln!("[guest-diag] watchdog: build() still running after 3s");
+    // ... diagnostic code ...
+});
+```
+
+**Initial diagnosis:** Scan `/proc` for youki / child processes.
+
+**Finding:** No child process named after youki exists. The parent thread's wchan = `__skb_wait_for_more_packets` (a SEQPACKET recv wait).
+
+**Conclusion:** Confirms the hang is in the parent's channel recv, and that no clearly named child process is alive.
+
+### Step 4: Read the parent thread's syscall info
+
+**Tool:** `/proc/self/task/<tid>/wchan` and `/proc/self/task/<tid>/syscall`.
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+let wchan = std::fs::read_to_string(
+    format!("/proc/self/task/{}/wchan", parent_tid)
+);
+let syscall = std::fs::read_to_string(
+    format!("/proc/self/task/{}/syscall", parent_tid)
+);
+```
+
+**Result (consistent across all hangs):**
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+wchan   = __skb_wait_for_more_packets
+syscall = 212 0x18 ...    (212 = recvmsg on aarch64, 0x18 = fd 24)
+```
+
+**Conclusion:** The parent blocks on `recvmsg(fd=24)`. The fd number can differ across runs (24 or 23, because of gaps in fd allocation) but is always the `main_receiver` SEQPACKET.
+
+### Step 5: Dump all open fds
+
+**Tool:** readlink over `/proc/self/fd/`.
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+    for fd in sorted_fds {
+        let link = std::fs::read_link(format!("/proc/self/fd/{}", fd));
+        eprintln!("[guest-diag]   fd={}: {:?}", fd, link);
+    }
+}
+```
+
+**Result (typical hang):**
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+fd=22: socket:[1243]    ← NotifyListener (STREAM)
+fd=24: socket:[1245]    ← BLOCKED (main_receiver, SEQPACKET)
+fd=26: socket:[1247]    ← channel socket
+fd=27: socket:[1248]    ← channel socket
+fd=28: socket:[1249]    ← channel socket
+```
+
+**Conclusion:** 4 SEQPACKETs are alive (6 created − 2 senders closed = 4), matching the expected state after the parent closes `main_sender`/`inter_sender`.
+
+### Step 6: Inspect socket state via /proc/net/unix
+
+**Tool:** Filter `/proc/net/unix` by socket inode.
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+let mut socket_inodes: Vec<String> = Vec::new();
+// ... extract inodes from the readlink results ...
+
+if let Ok(content) = std::fs::read_to_string("/proc/net/unix") {
+    for line in content.lines() {
+        if socket_inodes.iter().any(|ino| line.contains(ino)) {
+            eprintln!("[guest-diag]   {}", line);
+        }
+    }
+}
+```
+
+**Result:**
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+Inode  Type  St  RefCount
+1243   0001  01  00000002   tenant-notify-*.sock (STREAM, listening)
+1245   0005  03  00000003   SEQPACKET, connected
+1247   0005  03  00000003   SEQPACKET, connected
+1248   0005  03  00000003   SEQPACKET, connected
+1249   0005  03  00000003   SEQPACKET, connected
+```
+
+**Key observation:** Every SEQPACKET has `RefCount=3`. For a connected Unix socketpair, RefCount=3 = 1 (self) + 1 (file/fd) + 1 (peer reference), which means the **peer socket is still alive** — some process still holds the sender-side fd.
+
+**Conclusion:** Even though the parent closed its own copies, the sender-side peers are still alive. Another process holds copies of `main_sender`/`inter_sender`.
+
+### Step 7: Verify the peer is alive with poll() and FIONREAD
+
+**Tool:** Call `poll()` and `ioctl(FIONREAD)` on the blocked fd.
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+if let Some(fd) = blocked_fd {
+    let mut pfd = nix::libc::pollfd {
+        fd, events: nix::libc::POLLIN | nix::libc::POLLHUP | nix::libc::POLLERR, revents: 0
+    };
+    let ret = unsafe { nix::libc::poll(&mut pfd, 1, 0) };
+    // ... also ioctl(FIONREAD) ...
+}
+```
+
+**Result (all hangs):**
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+poll_ret=0  revents=0x0     ← no event, peer alive (no POLLHUP)
+FIONREAD ioctl_ret=0 bytes=0   ← no data to read
+```
+
+**Conclusion:** The kernel explicitly confirms the peer socket (main_sender) is still alive and held by some process. If all copies had been closed, `POLLHUP` would appear.
+
+### Step 8: Extend /proc/net/unix to all SEQPACKETs
+
+**Tool:** Relax the `/proc/net/unix` filter to include all Type `0005` entries.
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+if line.contains(" 0005 ")
+    || socket_inodes.iter().any(|ino| line.contains(ino)) {
+    eprintln!("[guest-diag]   {}", line);
+}
+```
+
+**Result:** Now 6 SEQPACKETs appear (previously only 4):
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+Inode  RefCount  Notes
+1244   00000003  ← new! peer socket (main_sender), not in our fd table
+1245   00000003  ← our blocked main_receiver
+1246   00000003  ← new! peer socket (inter_sender), not in our fd table
+1247   00000003
+1248   00000003
+1249   00000003
+```
+
+**Conclusion:** The peer sockets (inodes 1244, 1246) are alive in the system but not in this process's fd table. Another process holds them.
+
+### Step 9: Scan every process's fd table to find the socket holder
+
+**Tool:** readlink over `/proc/<pid>/fd/` across all PIDs.
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+if let Ok(proc_entries) = std::fs::read_dir("/proc") {
+    for pe in proc_entries.flatten() {
+        // ... for each numeric PID ...
+        let fd_dir = pe.path().join("fd");
+        if let Ok(fd_entries) = std::fs::read_dir(&fd_dir) {
+            for fe in fd_entries.flatten() {
+                if let Ok(link) = std::fs::read_link(fe.path()) {
+                    // if link has the form "socket:[NNNN]", print pid/fd/link
+                    eprintln!("pid=... fd=... -> {:?}", link);
+                }
+            }
+        }
+    }
+}
+```
+
+**Result (the breakthrough):**
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+pid=212 fd=24 -> socket:[1245]    ← our blocked main_receiver
+pid=212 fd=26 -> socket:[1247]
+pid=212 fd=27 -> socket:[1248]
+pid=212 fd=28 -> socket:[1249]
+
+pid=248 fd=22 -> socket:[1244]    ← extra! main_sender peer
+pid=248 fd=23 -> socket:[1245]
+pid=248 fd=24 -> socket:[1246]    ← extra! inter_sender peer
+pid=248 fd=25 -> socket:[1247]
+pid=248 fd=26 -> socket:[1248]
+pid=248 fd=27 -> socket:[1249]
+```
+
+**Conclusion: PID 248 holds copies of the sender-side sockets (1244, 1246) that the parent already closed.** These are fd copies inherited from `clone3()`. PID 248 is the intermediate child process that never closed them — because it never ran its initial setup.
+
+### Step 10: Identify the blocked child process
+
+**Tool:** `/proc/<pid>/{comm,stat,wchan,syscall,stack}`.
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+let comm = std::fs::read_to_string(proc_dir.join("comm"));
+let wchan = std::fs::read_to_string(proc_dir.join("wchan"));
+let syscall = std::fs::read_to_string(proc_dir.join("syscall"));
+let stack = std::fs::read_to_string(proc_dir.join("stack"));
+```
+
+**Result:**
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+USERSPACE pid=248 ppid=211 state=S comm=tokio-runtime-w
+  wchan=futex_wait_queue
+  syscall=98 0x16f6e68 0x80 0xffffffff80000002
+  stack:
+    futex_wait_queue+0x6c/0x98
+    __futex_wait+0xb4/0x12c
+    futex_wait+0x64/0xcc
+    do_futex+0xf8/0x1a0
+    __arm64_sys_futex+0xd0/0x14c
+    invoke_syscall+0x48/0x10c
+```
+
+**Key findings:**
+
+* PID 248 is a child of the guest agent (ppid=211).
+* `comm=tokio-runtime-w` — inherited from the thread name of the tokio worker that performed the fork.
+* Blocked in `futex_wait_queue` — waiting on a userspace futex (address `0x16f6e68`).
+* syscall arguments: `futex(0x16f6e68, FUTEX_WAIT_PRIVATE, 0x80000002)`
+  * `FUTEX_WAIT_PRIVATE` = an in-process futex (not cross-process).
+  * `0x80000002` = locked + contended (NPTL mutex encoding).
+
+**Conclusion:** The intermediate child process is **deadlocked on a userspace mutex**. It inherited a locked mutex from the parent's multi-threaded address space, but the lock-holding thread does not exist in the child. This is the classic "fork in a multi-threaded process" problem.
+
+### Step 11: Resolve the futex address to a symbol
+
+**Tool:** Run `llvm-nm` on the statically linked guest binary.
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+llvm-nm --numeric-sort \
+    target/aarch64-unknown-linux-musl/debug/boxlite-guest \
+  | grep -B5 -A5 16f6e68
+```
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+00000000016f6de8 B __libc
+00000000016f6e50 B __hwcap
+00000000016f6e58 B __eintr_valid_flag
+00000000016f6e5c B __thread_list_lock
+00000000016f6e60 B __abort_lock
+00000000016f6e68 B __malloc_lock          ← exact match
+00000000016f6e6c B __malloc_replaced
+00000000016f6e70 B __aligned_alloc_replaced
+00000000016f6e78 B __bss_end__
+```
+
+**Conclusion:** The futex at `0x16f6e68` is **`__malloc_lock`** — musl libc's global heap allocator mutex. The intermediate process deadlocks on its **first `malloc()`**, because `__malloc_lock` was held by another tokio thread at fork time and musl has no `pthread_atfork` handler to reset it in the child.
+
+### Step 12: Confirm the mechanism
+
+The mutex is **not shared across processes**. `clone3()` **copies** the entire address space into the child; the child gets a snapshot of the mutex in its locked state, but the lock-holding thread (Thread B) does not exist in the child:
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+BEFORE clone3():
+  Parent process memory:
+  ┌─────────────────────────────────────┐
+  │  0x16f6e68 (__malloc_lock) = LOCKED │ ← held by Thread B
+  └─────────────────────────────────────┘
+       Thread A         Thread B
+       (calls clone3)   (doing malloc)
+
+AFTER clone3():
+  Parent (unchanged)          Child (COPY of parent memory)
+  ┌───────────────────┐      ┌───────────────────┐
+  │ __malloc_lock=LOCKED│      │ __malloc_lock=LOCKED│
+  │ Thread B exists ✓  │      │ Thread B GONE ✗    │
+  │ → will unlock      │      │ → stuck forever    │
+  └───────────────────┘      └───────────────────┘
+```
+
+**Why `__malloc_lock` is the worst inherited lock:** it is unavoidable. The intermediate process can hardly run any meaningful code without allocating memory — `Vec::new()`, `String::from()`, `format!()`, and `PathBuf` operations all call `malloc()` and all try to acquire `__malloc_lock`.
+
+***
+
+## Environment Details (at investigation time)
+
+| Component | Details |
+| - | - |
+| Platform | macOS ARM64 (Apple Silicon), VM via libkrun |
+| Guest kernel | Linux aarch64 |
+| Guest binary | `boxlite-guest`, statically linked, musl libc |
+| Target triple | `aarch64-unknown-linux-musl` |
+| Runtime | tokio multi-threaded (4 worker threads) |
+| libcontainer | youki v0.5.7 (vendored) |
+| Channel type | `AF_UNIX SOCK_SEQPACKET` with `SOCK_CLOEXEC` |
+
+## libcontainer channel architecture
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+container_main_process() creates 3 channel pairs (6 SEQPACKET sockets):
+
+  Parent side        Peer (child side)     Purpose
+  ─────────────────────────────────────────────────────────────
+  main_receiver  ←→  main_sender          children → parent readiness
+  inter_sender   ←→  inter_receiver       parent → intermediate config
+  init_sender    ←→  init_receiver        parent → init config
+
+Fork lifecycle:
+  1. Parent creates all 3 pairs (6 fds)
+  2. clone3() → intermediate (inherits copies of all 6 fds)
+  3. Parent closes main_sender, inter_sender (2 fds)
+  4. Parent calls main_receiver.recv() —— waits for intermediate_ready
+  5. Intermediate should: setup → send intermediate_ready → fork init → exit
+  6. Init should: setup → send init_ready → exec() (CLOEXEC closes channel fds)
+
+When intermediate deadlocks at step 5:
+  - The main_sender copy held by intermediate stays open
+  - Parent's recv() never reaches EOF (peer alive)
+  - Parent blocks forever
+```
+
+## Test Results Summary (reproduction data, pre-fix)
+
+| Batch | Runs | Stalls | Stall Rate |
+| - | - | - | - |
+| Batch 1 | 8 | 3 | 37.5% |
+| Batch 2 | 8 | 3 | 37.5% |
+| Batch 3 | 10 | 4 | 40.0% |
+| Batch 4 | 12 | 1 | 8.3% |
+| **Total** | **38** | **11** | **28.9%** |
+
+## Diagnostic Techniques Reference (reusable techniques)
+
+| Technique | Source | What it reveals |
+| - | - | - |
+| `/proc/self/task/<tid>/wchan` | procfs | Kernel wait-channel name |
+| `/proc/self/task/<tid>/syscall` | procfs | Blocked syscall number + register arguments |
+| `/proc/self/fd/<N>` readlink | procfs | fd → inode mapping (`socket:[NNNN]`) |
+| `/proc/net/unix` | procfs | Unix socket state, RefCount, Type, Inode |
+| `/proc/<pid>/fd/` cross-process scan | procfs | Which process holds a specific socket |
+| `/proc/<pid>/stack` | procfs | Kernel stack of a stuck process |
+| `/proc/<pid>/comm` | procfs | Process/thread name |
+| `poll(fd, POLLIN\|POLLHUP, 0)` | syscall | Whether the peer is alive (POLLHUP = peer dead) |
+| `ioctl(fd, FIONREAD)` | syscall | Bytes pending in the socket recv buffer |
+| `llvm-nm --numeric-sort` | toolchain | Resolve an address to a symbol in a static binary |
+
+## Files Read During Investigation
+
+> BoxLite guest source uses the `src/guest/...` prefix; `libcontainer/...` is the vendored youki crate (a dependency, not under this repository's `src/`).
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+src/guest/src/container/command.rs                               (MODIFIED — watchdog)
+src/guest/src/service/exec/executor.rs                           (ContainerExecutor::spawn)
+src/guest/src/service/exec/mod.rs
+libcontainer/src/channel.rs                                      (base channel, socketpair)
+libcontainer/src/process/channel.rs                              (Main/Inter/Init channels)
+libcontainer/src/process/container_main_process.rs               (fork + channel lifecycle)
+libcontainer/src/process/container_intermediate_process.rs       (intermediate setup)
+libcontainer/src/process/fork.rs                                 (clone3, CLONE_PARENT)
+libcontainer/src/container/tenant_builder.rs                     (build() entry point)
+libcontainer/src/container/builder_impl.rs                       (run_container, NotifyListener)
+libcontainer/src/notify_socket.rs                                (dangerous Clone impl)
+```
+
+> The fix is implemented in `src/guest/src/container/zygote.rs` (Option B: a single-threaded zygote, pre-forked, serializing all `build()` calls over IPC).
+
+***
+
+## Troubleshooting
+
+The deadlock described in this investigation has been **fixed**. If you still hit a "concurrent exec hangs / never returns" symptom, re-diagnose using the table below — it is very likely not the musl bug described here.
+
+| Symptom / error | Possible cause | Fix |
+| - | - | - |
+| All concurrent `exec` calls hang with no return for a long time | **Unrelated** to the deadlock on this page (it is fixed). Usually the box is not yet ready, or the first image pull is slow | Set a `timeout` on `exec` (`SimpleBox.exec(..., timeout=30.0)`, float seconds); run a single `exec` first to confirm the box starts |
+| `RuntimeError` mentioning image pull / network | An image-pull failure raises a **standard `RuntimeError`** (not `BoxliteError`) | Retry with `try/except RuntimeError`; check the network and image name |
+| Box `start()` fails but the process stays alive | No hardware virtualization | Requires Linux + KVM, or macOS (Apple Hypervisor.framework, no `/dev/kvm`); WSL2 needs KVM with your user in the `kvm` group. Without virtualization, startup fails but the exception is catchable |
+| An `exec` command "fails" but raises no exception | A non-zero exec exit **does not raise**; it returns `ExecResult(exit_code != 0)` | Check `result.exit_code` yourself; `raise` if needed (see Quick Example) |
+| A missing command raises a **bare `Error`** / `RuntimeError`, and `isinstance(e, BoxliteError)` is False | A missing command / spawn failure follows the standard exception path | Catch the standard `RuntimeError` (Python) / bare `Error` (Node); do not catch only `BoxliteError` |
+| You need to confirm the bug has not regressed | — | Run this page's Quick Example (16 concurrent execs should all return reliably), or the concurrent `build()` test at the end of `src/guest/src/container/zygote.rs` |
+
+> Environment constraint: BoxLite requires hardware virtualization. Linux + KVM; macOS uses Apple Hypervisor.framework (no `/dev/kvm` needed on macOS arm64); macOS Intel is not supported.

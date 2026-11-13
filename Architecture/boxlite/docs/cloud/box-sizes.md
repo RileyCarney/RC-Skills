@@ -1,0 +1,59 @@
+# Choose a size for a Cloud box
+Source: https://docs.boxlite.ai/cloud/box-sizes
+
+The three preset sizes, the per-organization ceilings that bound any single box, and the SDK fields that set them.
+
+Size is vCPU, memory, and disk. Pick the smallest preset that runs your workload comfortably — it is what you pay for by the hour.
+
+## Prerequisites
+
+* An API key from the console, exported as `BOXLITE_API_KEY`. See [API keys](/cloud/api-keys).
+* `pip install boxlite`, and the REST URL exported as `BOXLITE_REST_URL`. See [Quickstart](/cloud/quickstart).
+
+## Choose a size
+
+The console offers three presets and a custom option:
+
+| Size | vCPU | Memory | Disk |
+| - | - | - | - |
+| **Small** | 1 | 1 GiB | 10 GiB |
+| **Medium** | 2 | 4 GiB | 20 GiB |
+| **Large** | 4 | 8 GiB | 50 GiB |
+| **Custom** | Your value | Your value, in GiB | Your value, in GiB |
+
+Pick **Small** for shell work and short scripts, **Medium** for test suites and dependency installs, **Large** for builds and anything that keeps several processes hot.
+
+## Per-organization ceilings
+
+**Custom** is bounded. Your organization has one ceiling per box:
+
+| Resource | Ceiling per box |
+| - | - |
+| Compute | 4 vCPU |
+| Memory | 32 GiB |
+| Storage | 120 GiB |
+
+The console shows these under **Box limits** on the Billing page, with the reason:
+
+> Limits mitigate misuse and keep box and compute capacity fairly available across all users.
+
+Read your current ceilings in [Managing billing](/cloud/billing#per-box-resource-ceilings). Split a workload that wants more than one box can hold across several boxes rather than trying to raise a single box past the ceiling.
+
+## The SDK's sizing fields
+
+`BoxOptions` accepts `cpus`, `memory_mib`, and `disk_size_gb`. Their types, units, and general behavior live in [Compute resources](/manage-sandbox/compute-resources) — the console sizes above are the verified way to size a Cloud box, so set the size in the console when you want a specific shape.
+
+The disk field is named `disk_size_gb`. `disk_gib` is a common guess and fails at construction with a no-such-field error.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| - | - | - |
+| `BoxOptions(disk_gib=20)` fails with a no-such-field error | The field is `disk_size_gb` | Use `BoxOptions(disk_size_gb=20)`. See [Compute resources](/manage-sandbox/compute-resources) |
+| A box request asks for more CPU, memory, or disk than your organization allows | Ceilings are 4 vCPU compute, 32 GiB memory, and 120 GiB storage per box | Lower the request, or spread the work across several boxes. Check your ceilings in [Managing billing](/cloud/billing#per-box-resource-ceilings) |
+
+## Next steps
+
+> [card] [Boxes](/cloud/boxes)
+>
+> Everything else about configuring a box on Cloud.

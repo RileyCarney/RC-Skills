@@ -1,0 +1,386 @@
+# Quickstart
+Source: https://docs.boxlite.ai/getting-started/quickstart
+
+Install BoxLite and run your first sandbox — the same five steps in Python, Node.js, Rust, Go, and C.
+
+Five steps get you a running box: **create it, start it, run something inside, read the output, tear it down.** Every language below does exactly that.
+
+## Prerequisites
+
+* **Hardware virtualization on this machine** — KVM on Linux, Apple Silicon on macOS, WSL2 on Windows. If you do not have it, the box will not start; take the [BoxLite Cloud track](/cloud/quickstart) instead, which needs none.
+* The toolchain for your language: Python 3.9+, Node.js 18+, Rust 1.88+, Go 1.24+ with CGO, or a C11 compiler.
+
+Platform matrix, offline installs, and the CLI are on [Installation](/getting-started/installation).
+
+## Install
+
+```bash Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+pip install boxlite
+
+# Verify
+python3 -c "import boxlite; print(boxlite.__version__)"
+```
+
+```bash Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+npm install @boxlite-ai/boxlite
+```
+
+```bash Rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+cargo add boxlite
+cargo add tokio --features macros,rt-multi-thread
+cargo add futures
+```
+
+```bash Go theme={"theme":{"light":"github-light","dark":"github-dark"}}
+go get github.com/boxlite-ai/boxlite/sdks/go
+
+# One-time: fetches the prebuilt native library for your platform
+go run github.com/boxlite-ai/boxlite/sdks/go/cmd/setup
+```
+
+```bash C theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# The C SDK is built from source; see the C track on Installation.
+git clone https://github.com/boxlite-ai/boxlite && cd boxlite
+make sdk-c
+```
+
+## Your first box
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# hello.py — your first BoxLite sandbox
+import asyncio
+import boxlite
+
+async def main() -> None:
+    try:
+        # async with: the box is created and started on entry, and stopped and cleaned up on exit (auto_remove defaults to True)
+        async with boxlite.SimpleBox(image="python:alpine") as box:
+            print(f"Sandbox started: {box.id}")
+
+            # exec does not raise on a non-zero exit code; check exit_code yourself
+            result = await box.exec("python", "-c", "print('Hello from BoxLite!')")
+
+            print("stdout:", result.stdout.strip())
+            print("exit_code:", result.exit_code)
+            if result.exit_code != 0:
+                print("stderr:", result.stderr.strip())
+    except RuntimeError as exc:
+        # Image pull failure / startup failure without virtualization both raise a standard RuntimeError
+        print(f"Sandbox failed to run: {exc}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```javascript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// hello.mjs — your first BoxLite sandbox
+import { SimpleBox } from "@boxlite-ai/boxlite";
+
+async function main() {
+  // alpine:latest is small and quick to pull, suitable for smoke tests.
+  // Without cpus/memoryMib, the runtime's default VM size applies.
+  // Pass cpus/memoryMib explicitly to control the footprint.
+  const box = new SimpleBox({ image: "alpine:latest" });
+
+  try {
+    // exec(cmd, ...args) -> { exitCode, stdout, stderr }
+    const result = await box.exec("echo", "Hello from BoxLite!");
+
+    // Important: a non-zero exit code does not raise; check exitCode yourself.
+    if (result.exitCode !== 0) {
+      throw new Error(`Command failed (exit ${result.exitCode}): ${result.stderr}`);
+    }
+
+    console.log("stdout:", result.stdout.trim());
+    console.log("exitCode:", result.exitCode);
+  } catch (err) {
+    // Image pull failure / missing command, etc. raise a standard Error (not necessarily a BoxliteError).
+    console.error("Execution error:", err);
+    process.exitCode = 1;
+  } finally {
+    // The box is lazily created; stop() stops and cleans up (autoRemove defaults to true).
+    await box.stop();
+  }
+}
+
+main();
+```
+
+```rust Rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+use boxlite::{BoxCommand, BoxOptions, BoxliteRuntime, RootfsSpec};
+use futures::StreamExt; // provides .next() for the stdout stream
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Get the global default runtime (construction is synchronous; do not .await)
+    let runtime = BoxliteRuntime::default_runtime();
+
+    // 2. Configure a box based on the alpine image
+    let options = BoxOptions {
+        rootfs: RootfsSpec::Image("alpine:latest".into()),
+        ..Default::default()
+    };
+
+    // 3. Create the box (pass None as name to let the runtime auto-name it). create/exec/stop are async
+    let litebox = runtime.create(options, None).await?;
+    println!("Created box: {}", litebox.id());
+
+    // 4. Execute a command — note the method is exec (not run)
+    let mut execution = litebox
+        .exec(BoxCommand::new("echo").arg("Hello from BoxLite!"))
+        .await?;
+
+    // 5. Read stdout as a stream (each item is one line String)
+    if let Some(mut stdout) = execution.stdout() {
+        while let Some(line) = stdout.next().await {
+            println!("{}", line);
+        }
+    }
+
+    // 6. Wait for completion and check the exit code (a non-zero code does not error automatically; check it yourself)
+    let result = execution.wait().await?;
+    if !result.success() {
+        eprintln!("Command exited with a non-zero code: {}", result.exit_code);
+    }
+
+    // 7. Cleanup: stop the box
+    litebox.stop().await?;
+
+    Ok(())
+}
+```
+
+```go Go theme={"theme":{"light":"github-light","dark":"github-dark"}}
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	boxlite "github.com/boxlite-ai/boxlite/sdks/go"
+)
+
+func main() {
+	ctx := context.Background()
+
+	// 1. Get the runtime (synchronous construction; no .Close() needed until you're done with it)
+	rt, err := boxlite.NewRuntime()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer rt.Close()
+
+	// 2. Create a box (default rootfs is set by the image argument)
+	box, err := rt.Create(ctx, "alpine:latest")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer box.Close()
+
+	// 3. Execute a command — Exec implicitly starts the box on first call
+	res, err := box.Exec(ctx, "echo", "Hello from BoxLite!")
+	if err != nil {
+		// A nil res accompanies a non-nil err: check err before touching res
+		log.Fatal(err)
+	}
+
+	// 4. A non-zero exit code does not become an error — check it yourself
+	if res.ExitCode != 0 {
+		fmt.Printf("command failed (exit=%d): %s", res.ExitCode, res.Stderr)
+		return
+	}
+	fmt.Print(res.Stdout)
+}
+```
+
+```c C theme={"theme":{"light":"github-light","dark":"github-dark"}}
+#include <stdio.h>
+#include "boxlite.h"
+
+int main(void) {
+    CBoxliteSimple *box = NULL;
+    CBoxliteError error = {0};  /* must be zero-initialized */
+
+    /* Create and automatically start a box. Passing 0 for cpus/memory = use defaults. */
+    BoxliteErrorCode code =
+        boxlite_simple_new("python:slim", 0, 0, &box, &error);
+    if (code != Ok) {
+        fprintf(stderr, "create box failed (code %d): %s\n",
+                error.code, error.message ? error.message : "unknown");
+        boxlite_error_free(&error);  /* free error.message on the failure path too */
+        return 1;
+    }
+
+    /* Run inside the box: python -c "print('Hello from BoxLite!')" */
+    const char *args[] = {"-c", "print('Hello from BoxLite!')"};
+    CBoxliteExecResult *result = NULL;
+    code = boxlite_simple_run(box, "python", args, 2, &result, &error);
+    if (code == Ok) {
+        printf("exit code: %d\n", result->exit_code);
+        printf("stdout: %s", result->stdout_text ? result->stdout_text : "");
+        if (result->stderr_text && result->stderr_text[0]) {
+            fprintf(stderr, "stderr: %s", result->stderr_text);
+        }
+        boxlite_result_free(result);  /* free the result (includes stdout/stderr strings) */
+    } else {
+        fprintf(stderr, "exec failed (code %d): %s\n",
+                error.code, error.message ? error.message : "unknown");
+        boxlite_error_free(&error);
+    }
+
+    boxlite_simple_free(box);  /* automatically stop + remove + free the runtime */
+    return 0;
+}
+```
+
+Run it:
+
+```bash Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+python hello.py
+```
+
+```bash Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+node hello.mjs
+```
+
+```bash Rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+cargo run
+```
+
+```bash Go theme={"theme":{"light":"github-light","dark":"github-dark"}}
+go run hello.go
+```
+
+```bash C theme={"theme":{"light":"github-light","dark":"github-dark"}}
+./hello
+```
+
+Each language prints its own shape. Python and Node.js, run on an Apple Silicon Mac:
+
+```text Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+Sandbox started: mgu4zgTIGXLL
+stdout: Hello from BoxLite!
+exit_code: 0
+```
+
+```text Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+stdout: Hello from BoxLite!
+exitCode: 0
+```
+
+## What keeps the box alive
+
+Worth knowing before you build anything longer than the script above, because it decides when a box disappears.
+
+Every box runs one **main command** — the image's `ENTRYPOINT + CMD`, or whatever you pass as `entrypoint` / `cmd`. It runs as PID 1 inside the box, and **the box stops when it exits**. `python:alpine` above has a long-running main command, which is why `exec` works.
+
+Two consequences:
+
+* Set `cmd` to something short-lived and the box stops as soon as it finishes. A later `exec` is refused until you `start()` again.
+* A crashed main command stops the box, and nothing restarts it. There is no restart policy.
+
+Which means there are two ways to run work, and they behave differently:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# 1. Work beside the main command — the box outlives the work.
+#    Use this for agent jobs, and when you want to inspect the box afterwards.
+async with boxlite.SimpleBox(image="python:alpine") as box:
+    await box.exec("python", "-c", "print('a job')")
+
+# 2. Work as the main command — the box lives exactly as long as the work.
+#    Use this for services, and for one-shot runs whose exit code you need.
+async with boxlite.SimpleBox(
+    image="python:alpine",
+    entrypoint=["python3"],
+    cmd=["-c", "import time; time.sleep(3600)"],
+) as box:
+    ...
+```
+
+[The main command](/manage-sandbox/lifecycle#the-main-command) covers the full rules, and [Exit codes](/manage-sandbox/lifecycle#exit-codes) covers how to read what the main command exited with.
+
+***
+
+### The scope that owns the box
+
+This applies in every language, and it is the first thing that surprises people.
+
+A box is tied to the scope that owns it. In Python and Node the `async with` / `await using` block owns it, and **the box is destroyed when that block exits** — including when an exception unwinds it. In Rust, Go, and C the box lives until you remove it explicitly, so a program that exits early leaves it running.
+
+Two consequences:
+
+* **Do not return a box handle out of the block that created it.** The box is already gone by the time the caller sees it.
+* **In Rust, Go, and C, tear down in the error path too.** A `defer`, a `Drop`, or an explicit cleanup label — otherwise a crashed program leaves a box behind, and on Cloud a leftover box keeps costing you money. See [What a box costs](/cloud/box-costs).
+
+## Next: running untrusted code
+
+`SimpleBox` runs commands you wrote. For code an LLM produced, **`CodeBox`** is the type you want — it adds a language-aware execution surface on top of the same isolation.
+
+`CodeBox` is available in **Python and Node.js**. In Rust, Go, and C, run untrusted code through `SimpleBox` and the exec API.
+
+See [Run code in a sandbox](/agent-tools/code-execution-python) for the full treatment.
+
+## Parameters and returns
+
+The per-language signatures, types, and return shapes live in the SDK reference:
+
+> [card] [Python](/reference/python)
+
+> [card] [Node.js](/reference/nodejs)
+
+> [card] [Rust](/reference/rust)
+
+> [card] [Go](/reference/go)
+
+> [card] [C](/reference/c)
+
+> [card] [CLI](/reference/cli)
+
+## Troubleshooting
+
+### `Schema version mismatch` aborts the process
+
+All BoxLite SDKs share one database at `~/.boxlite/db/boxlite.db`, and a newer SDK upgrades its schema in place. An older SDK then finds a schema it does not know and stops — a Python SDK that took the database to schema v10 leaves a Node SDK expecting v8 unable to start:
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+Schema version mismatch: database has v10, process expects v8. Upgrade boxlite to a newer version.
+fatal runtime error: failed to initiate panic, error 5, aborting
+```
+
+**This is a process abort, not an exception — a `try`/`catch` around your code does not catch it.**
+
+Install the same version of every SDK you use. When you need two versions side by side, give the older process its own data directory:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+BOXLITE_HOME="$PWD/.boxlite-node" node hello.mjs
+```
+
+### Everything else
+
+| Symptom | Cause | Fix |
+| - | - | - |
+| The box fails to start with a virtualization error | The machine has no KVM, no Apple Silicon hypervisor, or is a nested VM or container | Use the [Cloud track](/cloud/quickstart), which needs no local virtualization. Full matrix on [Installation](/getting-started/installation) |
+| A non-zero exit code does not raise an exception | `exec` returns the exit code rather than raising | Check `result.exit_code` yourself, as every example above does |
+| Node aborts with `Schema version mismatch` and `try`/`catch` does not catch it | All SDKs share `~/.boxlite/db/boxlite.db`; a newer SDK upgraded its schema in place, and the older one aborts rather than raising | Give the older process its own `BOXLITE_HOME`, or match SDK versions. See [above](#schema-version-mismatch-aborts-the-process) |
+| The box is gone before you use it | The `async with` / `await using` block that owned it exited | Keep the work inside the block, or use the runtime API to create a box you own explicitly |
+| A crashed program left a box running | Rust, Go, and C do not tear down on scope exit | Tear down in the error path — `defer`, `Drop`, or an explicit cleanup |
+| `cargo build` fails on a missing `protoc` | The Rust build needs Protocol Buffers | Install `protobuf` for your platform, then rebuild |
+
+## Next steps
+
+> [card] [Box types](/manage-sandbox/sandbox-types)
+>
+> SimpleBox, CodeBox, BrowserBox, ComputerBox — which type for which job.
+
+> [card] [Agent tools](/agent-tools/index)
+>
+> Run code, drive a PTY, a browser, or a desktop from your agent.
+
+> [card] [Architecture](/architecture/index)
+>
+> What actually happens when you call `exec`.
+
+> [card] [BoxLite Cloud](/cloud/quickstart)
+>
+> The same SDK against a hosted runtime — no local virtualization.

@@ -1,0 +1,84 @@
+# Wallet or a plan?
+Source: https://docs.boxlite.ai/cloud/plans
+
+Two ways to fund usage on BoxLite Cloud, the usage level at which a subscription starts costing less than paying from your wallet, and the concurrency limit that is not a money question at all.
+
+Usage on BoxLite Cloud can be funded two ways: from a prepaid **wallet** alone, or from a **plan** whose included quota covers usage first and whose wallet picks up the rest. Which one costs less is arithmetic, and it turns on a single number — your monthly usage.
+
+## How funding works
+
+**Quota covers first, the wallet funds the rest.** A box draws on this cycle's included quota until the quota is gone, and on your prepaid wallet balance from then on.
+
+An account does not have to carry a plan. With no plan there is no included quota, and every dollar of usage comes straight out of the wallet — pay-as-you-go, in the ordinary sense.
+
+## The plans
+
+Each plan buys more usage than it costs, which is where the saving comes from:
+
+| Plan | Price | Included quota | Concurrency limit | Saving past quota |
+| - | - | - | - | - |
+| Starter | \$19/mo | \$30 | 20 boxes | \$11/mo |
+| Pro | \$149/mo | \$250 | 100 boxes | \$101/mo |
+| Max | \$499/mo | \$900 | 1000 boxes | \$401/mo |
+
+The last column is the quota minus the price. Once your usage passes a plan's quota, that is exactly what the plan saves you against paying full price from the wallet, every month.
+
+**Enterprise** is negotiated rather than self-serve: custom limits and compliance review, arranged through [sales@boxlite.ai](mailto:sales@boxlite.ai). A negotiated plan carries no public price, and an unlimited quota or concurrency shows as unlimited rather than as a number.
+
+## Which one costs less
+
+Look up what the console reports as spent this month, and three thresholds decide it:
+
+| When your monthly usage passes | Move to | Because |
+| - | - | - |
+| **\$20** | Starter | Starter's $19 buys $30 of usage |
+| **\$161** | Pro | Pro's flat $149 beats Starter's $150 at this point |
+| **\$601** | Max | Max's flat $499 beats Pro's $500 at this point |
+
+The first threshold is a plan's own price: past $20 of usage, Starter's flat $19 beats paying full price from the wallet. The other two are crossovers against the **previous plan's total cost** at that usage level, not against their own price — Starter's $19 plus overage reaches Pro's flat $149 at $160, and Pro's reaches Max's at $600. Below a plan's own price you are buying quota you will not use.
+
+These thresholds assume a typical month. If your usage swings — a heavy month followed by a quiet one — the plan price is charged either way, so size against your *steady* level rather than your peak.
+
+## Concurrency is a separate decision
+
+Concurrency caps how many boxes run **at the same time** — not how many you create over a month, and not how much work each one does. It is independent of quota: you can hit the limit with quota to spare, and exhaust quota while running a single box.
+
+If you are building an agent fleet, size against your fan-out. An orchestrator that runs 40 parallel agents, one box each, needs a plan whose limit clears 40 — Starter's 20 will stall it halfway through the batch.
+
+So concurrency alone can push you onto a larger plan well before the money says to move. A fleet of 40 short-lived Small boxes might spend \$60 a month — Starter territory on cost — while needing Pro's 100-box limit to run at all.
+
+## Changing plans
+
+The direction of the change decides when it lands and what you are charged:
+
+| Change | When it applies | What you are charged now |
+| - | - | - |
+| **Upgrade** | Immediately, and the new quota is available right away | The prorated difference, today |
+| **Downgrade** | At the next cycle roll | Nothing |
+| **Cancel** | At the end of the cycle you have paid for | Nothing |
+| **Subscribe** (from no plan) | As soon as payment is confirmed | The plan price, through Stripe checkout |
+
+Two details worth knowing before you act:
+
+* **A downgrade does not cost you this cycle's quota.** The quota you already paid for stays available until the cycle rolls, along with the current plan's concurrency limit.
+* **A queued change can be called off.** While a downgrade or cancellation is scheduled, the console offers to keep your current plan instead, which discards the queued change.
+
+## Troubleshooting
+
+| Situation | Why it happens | What to do |
+| - | - | - |
+| New boxes are refused while your existing boxes keep running fine | You are at your plan's concurrency limit — the cap is on boxes running simultaneously, not on boxes created | Stop or delete a box to free a slot, or move to a plan with a higher limit |
+| Cost is showing as wallet-funded rather than quota-covered | This cycle's included quota is consumed, so usage now draws on the prepaid balance | Nothing is broken. Keep the wallet funded, or move to a plan whose quota matches your steady-state usage |
+| Your plan shows as having no subscription | The account carries no plan, so there is no included quota and no plan concurrency limit | Pick a plan, or keep running on wallet balance alone if your usage is below \$20/mo |
+| A plan change you scheduled has not happened | Downgrades and cancellations apply at the cycle roll, not immediately | Check the cycle end date. To act sooner, upgrade instead — upgrades apply immediately |
+| Switching away from your current plan is refused | Your plan is negotiated rather than self-serve, so it has no catalog price to switch against | Talk to [sales@boxlite.ai](mailto:sales@boxlite.ai) before changing |
+
+## Next steps
+
+> [card] [What a box costs](/cloud/box-costs)
+>
+> The hourly rates behind every dollar figure on this page.
+
+> [card] [Managing billing](/cloud/billing)
+>
+> Top up the wallet, set automatic reload, and read the usage chart.

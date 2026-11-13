@@ -1,0 +1,205 @@
+# Stop paying for boxes you have finished with
+Source: https://docs.boxlite.ai/cloud/cost-controls
+
+The two lifecycle controls that decide how long each half of a box’s bill runs, and the volume pattern that keeps data without keeping a disk.
+
+Compute billing stops on its own. Disk billing does not. These are the controls that close that second loop.
+
+## Which half of the bill each control closes
+
+Two lifecycle controls decide how long each half of the bill runs, and their defaults
+pull in opposite directions:
+
+| Control | Default | What it does to your bill |
+| - | - | - |
+| `auto_stop` | 900 seconds (15 minutes idle) | **Compute billing stops on its own.** After 15 idle minutes the box stops, and vCPU and memory come off the bill |
+| `auto_delete` | `0`, disabled | **Disk billing never stops on its own.** A stopped box keeps its disk, and keeps being charged for it, indefinitely |
+
+So by default you stop paying for compute automatically, and you pay for disk forever. Setting `auto_delete` closes that second loop.
+
+## Cap a box's lifetime
+
+`auto_delete` must be larger than `auto_stop` when both are non-zero. This example gives
+a box 15 idle minutes to be reused, then deletes it an hour after it stops:
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# costCappedBox.py — create a box that cleans itself up
+# Run: python costCappedBox.py
+import asyncio
+import os
+import time
+
+from boxlite import ApiKeyCredential, Boxlite, BoxliteRestOptions, BoxOptions
+
+IMAGE = "ghcr.io/boxlite-ai/boxlite-agent-base:v0.1.0"
+
+async def main() -> None:
+    api_key = os.environ.get("BOXLITE_API_KEY")
+    if not api_key:
+        raise SystemExit("Set BOXLITE_API_KEY to your blk_live_... key first.")
+
+    rt = Boxlite.rest(BoxliteRestOptions(
+        url=os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
+        credential=ApiKeyCredential(api_key),
+    ))
+
+    box = None
+    try:
+        box = await rt.create(
+            BoxOptions(
+                image=IMAGE,
+                auto_stop=900,     # stop after 15 idle minutes -> compute billing ends
+                auto_delete=3600,  # delete an hour after stopping -> disk billing ends
+            ),
+            name=f"capped-{int(time.time())}",
+        )
+        await box.start()
+        print(f"box {box.id} will delete itself an hour after it stops")
+    except Exception as exc:
+        print(f"create failed: {type(exc).__name__}: {exc}")
+        if box is not None:
+            await rt.remove(box.id, force=True)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// costCappedBox.ts — create a box that cleans itself up
+// Run: node costCappedBox.ts
+import { ApiKeyCredential, BoxliteRestOptions, JsBoxlite } from "@boxlite-ai/boxlite";
+
+const IMAGE = "ghcr.io/boxlite-ai/boxlite-agent-base:v0.1.0";
+
+const apiKey = process.env.BOXLITE_API_KEY;
+if (!apiKey) {
+  throw new Error("Set BOXLITE_API_KEY to your blk_live_... key first.");
+}
+
+async function main(): Promise<void> {
+  const rt = JsBoxlite.rest(
+    new BoxliteRestOptions({
+      url: process.env.BOXLITE_REST_URL ?? "https://api.boxlite.ai",
+      credential: new ApiKeyCredential(apiKey),
+    }),
+  );
+
+  let box = null;
+  try {
+    box = await rt.create(
+      {
+        image: IMAGE,
+        autoStop: 900, // stop after 15 idle minutes -> compute billing ends
+        autoDelete: 3600, // delete an hour after stopping -> disk billing ends
+      },
+      `capped-${Math.floor(Date.now() / 1000)}`,
+    );
+    await box.start();
+    console.log(`box ${box.id} will delete itself an hour after it stops`);
+  } catch (err) {
+    console.error(`create failed: ${err}`);
+    if (box) {
+      await rt.remove(box.id, true);
+    }
+  }
+}
+
+main();
+```
+
+```go Go theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// costCappedBox.go — create a box that cleans itself up
+// Run: go run costCappedBox.go
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	boxlite "github.com/boxlite-ai/boxlite/sdks/go"
+)
+
+const image = "ghcr.io/boxlite-ai/boxlite-agent-base:v0.1.0"
+
+func main() {
+	apiKey := os.Getenv("BOXLITE_API_KEY")
+	if apiKey == "" {
+		fmt.Println("Set BOXLITE_API_KEY to your blk_live_... key first.")
+		os.Exit(1)
+	}
+
+	restURL := os.Getenv("BOXLITE_REST_URL")
+	if restURL == "" {
+		restURL = "https://api.boxlite.ai"
+	}
+
+	rt, err := boxlite.NewRest(boxlite.BoxliteRestOptions{
+		URL:        restURL,
+		Credential: boxlite.NewApiKeyCredential(apiKey),
+	})
+	if err != nil {
+		fmt.Printf("connect failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer rt.Close()
+
+	ctx := context.Background()
+	box, err := rt.Create(ctx, image,
+		boxlite.WithName(fmt.Sprintf("capped-%d", time.Now().Unix())),
+		boxlite.WithAutoStopInterval(900),    // compute billing ends after 15 idle minutes
+		boxlite.WithAutoDeleteInterval(3600), // disk billing ends an hour after stopping
+	)
+	if err != nil {
+		fmt.Printf("create failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := box.Start(ctx); err != nil {
+		fmt.Printf("start failed: %v\n", err)
+		_ = rt.Remove(ctx, box.ID())
+		os.Exit(1)
+	}
+
+	fmt.Printf("box %s will delete itself an hour after it stops\n", box.ID())
+}
+```
+
+See [Lifecycle on Cloud](/cloud/box-lifecycle) for the full semantics of these fields,
+including how `auto_resume` brings a stopped box back.
+
+> [!NOTE]
+>
+> **From the CLI you can set only half of this.** `boxlite create` accepts `--auto-stop`,
+> and takes a friendlier duration than the SDK — `30s`, `15m`, `2h`, `7d` rather than raw
+> seconds:
+>
+> ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> boxlite create python --name worker --auto-stop 15m
+> ```
+>
+> `--auto-delete` is refused on a box made this way, because `boxlite create` makes a
+> detached box:
+>
+> ```
+> Error: invalid argument: remove-on-stop is incompatible with detach=true.
+> Detached boxes should use auto_delete=0 ... for manual lifecycle control.
+> ```
+>
+> To close the disk half of the bill, set `auto_delete` from an SDK, as above.
+
+## Keep the data, drop the disk
+
+`auto_delete` is uncomfortable when the box holds something you need later. That is what volumes are for, and it happens to be the cheapest arrangement available:
+
+* A **managed volume** is not part of a box's metered resources. Mounting one adds nothing to the box's hourly price.
+* A **stopped box** is billed for its disk for as long as it exists.
+
+So when you want to keep results but not keep paying, write them to a volume and let the box go. See [Volumes](/cloud/volumes).
+
+## Next steps
+
+> [card] [Pricing](/cloud/pricing)
+>
+> Rates, what the standard sizes cost, and how the hours are counted.

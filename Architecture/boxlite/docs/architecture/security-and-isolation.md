@@ -1,0 +1,69 @@
+# Security and isolation
+Source: https://docs.boxlite.ai/architecture/security-and-isolation
+
+How BoxLite's isolation is layered against a guest assumed malicious from the moment it starts, and which layer each SecurityOptions field controls.
+
+> Import note: both `SecurityOptions` and `AdvancedBoxOptions` are exported at the top level: `from boxlite import AdvancedBoxOptions, SecurityOptions`.
+
+Two independent lines of defense separate guest from host: a **hardware-level microVM** and a **process-level jailer**. **Defaults differ by layer**: the Rust runtime applies a full jailer when you pass no `SecurityOptions` at all, but constructing `SecurityOptions()` in Python with no fields turns every switch **off**. For untrusted code, always pass `SecurityOptions.standard()` or `.maximum()` rather than relying on any default.
+
+## The Isolation Model: two independent lines of defense
+
+BoxLite uses **defense in depth**: even if one layer is breached, the others still hold.
+
+![BoxLite isolation boundaries: a trusted host process spawns a jailed shim process, which runs the microVM containing the guest agent and untrusted code](https://mintcdn.com/boxliteai/XY_XBI4hOU27pfmd/assets/diagrams/isolation-boundaries.svg?fit=max\&auto=format\&n=XY_XBI4hOU27pfmd\&q=85\&s=5fb6b43f36669a7d1c801e83bdd08d96)
+
+### Line of defense one: hardware virtualization (the microVM)
+
+Each box is a separate lightweight virtual machine, with the guest kernel physically isolated from the host kernel.
+
+| Boundary | Enforced by | Isolation provided |
+| - | - | - |
+| Guest → Shim | KVM (Linux) / Hypervisor.framework (macOS) | Memory isolation, CPU in non-root mode, paravirtualized devices only, privileged instructions trap into the hypervisor |
+
+> Limitation: a vulnerability in the hypervisor itself could in theory let the guest escape — which is exactly why a second line of defense is needed.
+
+### Line of defense two: the process-level jailer (constraining the shim process)
+
+Even if the guest escapes the VM, it lands in a jailer-constrained shim process, not on the bare host. The jailer enables different mechanisms per platform:
+
+| Mechanism | Linux | macOS |
+| - | - | - |
+| Syntax filtering | seccomp (BPF syscall allowlist) | sandbox-exec (Seatbelt, SBPL default-deny) |
+| Filesystem isolation | chroot / pivot_root + mount namespace | sandbox path allowlist |
+| Process/network isolation | new PID ns, (optional) new net ns | sandbox network rules |
+| Privilege drop | drop to an unprivileged uid/gid (default nobody/nogroup 65534) | unsupported (still runs as the current user) |
+| Resource limits | cgroups v2 + rlimits | rlimits only |
+| Environment scrubbing | clear environment variables (keep only an allowlist), close inherited FDs | same |
+
+> macOS isolation is weaker than Linux: no privilege drop, no cgroups, no network namespace. For running untrusted code in production, prefer Linux. To debug macOS sandbox errors, see [macos-sandbox-debugging](/development/macos-sandbox-debugging).
+
+## What each switch turns off
+
+`SecurityOptions` fields map onto the two lines of defense above. For the types, defaults, presets, and
+how to attach them to a box, see
+[Inject secrets and harden a box](/manage-sandbox/secrets-and-security#parameters-and-returns).
+
+| Field | Layer it acts on |
+| - | - |
+| `jailer_enabled` | The jailer master switch — line of defense two, Linux and macOS |
+| `seccomp_enabled` | seccomp syscall filtering (**Linux only**; ignored on macOS) |
+| `max_open_files` | RLIMIT_NOFILE on the shim process |
+| `max_file_size` | RLIMIT_FSIZE (bytes) |
+| `max_processes` | RLIMIT_NPROC |
+| `max_memory` | RLIMIT_AS (bytes); `None` defers to the VM configuration |
+| `max_cpu_time` | RLIMIT_CPU (seconds) |
+| `network_enabled` | **Jailer-level** TCP policy for the host-side sandbox (macOS seatbelt + Linux landlock). `False` denies all TCP, which gvproxy's VM networking needs left on. This is **not** the guest-networking switch — that is `NetworkSpec.mode` |
+| `close_fds` | Closes inherited FDs other than stdin/stdout/stderr before startup |
+
+Errors you hit while configuring these — the `AdvancedBoxOptions` import, the top-level `security=`
+keyword, the absent `minimum()` preset — are answered on
+[Inject secrets and harden a box](/manage-sandbox/secrets-and-security#troubleshooting).
+
+## Related Pages
+
+* [Secrets and security configuration](/manage-sandbox/secrets-and-security) — `Secret`/Vault entry point and security-option usage
+* [Volume mounts](/manage-sandbox/volumes) — read-only/read-write volumes and the `read_only` bool
+* [Network access](/manage-sandbox/network-access) — `NetworkSpec`, the guest-networking control (distinct from the jailer's `network_enabled` above)
+* [Architecture overview](/architecture/index) — microVM / shim / runtime layering
+* [Debug macOS Seatbelt denials](/development/macos-sandbox-debugging)

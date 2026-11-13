@@ -1,0 +1,187 @@
+# BoxLite Cloud vs open source
+Source: https://docs.boxlite.ai/cloud/vs-opensource
+
+Every difference between self-hosted BoxLite and BoxLite Cloud — entry point, auth, exec shape, storage, lifecycle, images, and billing — plus how to port existing code.
+
+Open-source BoxLite runs on hardware you own and manage; BoxLite Cloud runs on BoxLite's resource pool, and you reach it with a URL and an API key over the same SDK.
+
+This page is the single place where those differences are enumerated. Every other Cloud page links here instead of restating them.
+
+## Side by side
+
+| Dimension | Open source (self-hosted) | Cloud |
+| - | - | - |
+| Where boxes run | Your machine or server, with hardware virtualization (Linux KVM, macOS Hypervisor.framework) | BoxLite's resource pool — no virtualization on your machines |
+| Entry point | `SimpleBox(...)` or `Boxlite.default()` | `Boxlite.rest(BoxliteRestOptions(url, credential))` |
+| Authentication | None for a loopback-only `boxlite serve`; an `--api-key` is mandatory once it binds a non-loopback address | A `blk_live_...` key created in the console — see [API keys](/cloud/api-keys) |
+| `path_prefix` | The reference server needs `path_prefix="default"` | Not used |
+| `exec` call shape | In-process runtime: varargs, `box.exec("echo", "hi")`. A self-hosted `boxlite serve` uses the keyword-list form, like Cloud | Keyword list: `box.exec("echo", args=["hi"])` |
+| Teardown | `async with` context manager, or `stop()` | `await rt.remove(box.id, force=True)` |
+| Persistent storage | Host directory bind mount: `volumes=[(host_path, guest_path)]` | Managed volumes; host bind mounts are ignored — see [Volumes](/cloud/volumes) |
+| Exposing a service | Port forwarding to the host: `ports=[(host_port, guest_port)]` | A tunnel to a guest port, which carries a public URL — see [Network](/cloud/network). Sharing a port with a browser or another person goes through a preview URL — see [Network policy](/cloud/network-policy) |
+| Snapshots, clone, export, import | Available — see [Snapshots and clones](/manage-sandbox/snapshots) | Disabled. The hosted service reports `snapshots_enabled`, `clone_enabled`, `export_enabled`, and `import_enabled` as false |
+| Managed checkpoints | Not supported by the local runtime or local `boxlite serve` | Save a stopped box and create independent boxes from it — see [Checkpoints](/cloud/checkpoints) |
+| Lifecycle management | Fully manual — you start, stop, and remove every box | Idle-stop, resume-on-access, and delete-after-stopping, set in the console or with `auto_stop` / `auto_resume` / `auto_delete` — see [Boxes](/cloud/boxes) |
+| Image operations | `boxlite pull` and the `images` API are available | Not supported over REST. Shared Linux base images are available automatically to keys with Boxes access |
+| Resource limits | Whatever your hardware allows | Per-box ceilings, plus a plan-level concurrency limit — see [Managing billing](/cloud/billing#per-box-resource-ceilings) |
+| Cost | Free software; you pay for your own servers | Metered — a subscription quota is consumed first, and a wallet funds the rest |
+
+### What the table compresses
+
+**Virtualization moves, it does not disappear.** Self-hosting puts the virtualization requirement on your host, which is why BoxLite fails to start a box on machines without KVM or Hypervisor.framework. On Cloud that requirement lives in the resource pool, so your client can be any machine that can make HTTPS requests — including CI runners and nested VMs.
+
+**Storage is the difference that breaks silently.** Every other row in this table produces a visible error if you get it wrong. A host bind mount does not: in REST mode the mount is accepted and ignored, so your code runs and your data is simply not there. Replace host bind mounts with a managed volume before you port. [Volumes](/cloud/volumes) covers creating one and mounting it.
+
+**Choose the Cloud operation for the state you need.** Local `box.snapshot`, clone, and `.boxlite` export/import APIs do not run on Cloud. Use [Checkpoints](/cloud/checkpoints) to save a stopped box's disk and execution configuration and create new boxes from it. Use [Volumes](/cloud/volumes) for data shared across box lifecycles. Checkpoints do not preserve memory or support boxes with volumes or Secrets.
+
+**A Cloud box has a lifecycle policy; a self-hosted box does not.** Cloud can stop a box when it goes idle, resume it when you reach for it again, and delete it after it has been stopped for a while. Set the policy in the console, or from code with `auto_stop` and `auto_delete` (both in seconds, `0` to disable) and `auto_resume`. The defaults are the platform's either way: a 15-minute idle stop, no auto-delete, and resume on access — so a box created over the API stops itself after 15 idle minutes unless you pass `auto_stop` explicitly. See [Boxes](/cloud/box-lifecycle).
+
+**Images are prepared for you.** Because image operations are not supported over REST, you do not pull on Cloud. Pick one of the console's base images, or the default `ghcr.io/boxlite-ai/boxlite-agent-base:v0.1.0`. A Boxes-scoped key gives you the shared Linux base images automatically.
+
+## Which should I use?
+
+Self-host when:
+
+* You already run machines with virtualization capacity, and adding boxes costs you nothing new.
+* You need host bind mounts — the box must read and write a directory on the same machine as your process.
+* You need local image operations, such as pulling or inspecting images from the CLI.
+* You want zero external dependency: no account, no network egress to a control plane, no third party in the failure path.
+
+Choose Cloud when:
+
+* Your machines have no hardware virtualization — laptops under a corporate policy, most managed CI runners, nested VMs.
+* You want an agent to stay reachable without operating servers yourself: storage that outlives the box, and a lifecycle that stops it when idle and wakes it on access.
+* You want to scale box count without capacity planning, by changing a plan instead of provisioning hosts.
+* You want per-box resource ceilings enforced for you across a multi-tenant workload.
+
+The two are not exclusive. The same SDK talks to both, so developing against a local box and running the same code against Cloud in production is a change of runtime handle, not a rewrite.
+
+## Porting existing open-source code to Cloud
+
+Four edits cover almost every port:
+
+1. Swap the runtime handle to `Boxlite.rest(BoxliteRestOptions(url, credential))`.
+2. Change `exec` from varargs to `args=[...]`.
+3. Replace the `async with` context manager with an explicit `await rt.remove(box.id, force=True)` in a `finally` block.
+4. Replace host bind mounts with a managed volume.
+
+### Before: a local box on your own machine
+
+```python local_box.py theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Runs on your own machine. Requires hardware virtualization (KVM or Hypervisor.framework).
+import asyncio
+import os
+import tempfile
+
+import boxlite
+
+
+async def main() -> None:
+    # A host directory the box will read and write directly.
+    with tempfile.TemporaryDirectory() as host_dir:
+        with open(os.path.join(host_dir, "notes.txt"), "w") as f:
+            f.write("written on the host\n")
+
+        try:
+            async with boxlite.SimpleBox(
+                image="alpine:latest",
+                volumes=[(host_dir, "/data")],
+            ) as box:
+                result = await box.exec("cat", "/data/notes.txt")
+                # A non-zero exit code does not raise — check it yourself.
+                print(result.stdout if result.exit_code == 0 else result.stderr, end="")
+        except RuntimeError as exc:
+            print("Box failed to start:", exc)
+
+
+asyncio.run(main())
+```
+
+### After: the same job on Cloud
+
+```python cloud_box.py theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Runs against BoxLite Cloud. No local virtualization needed.
+# Set BOXLITE_API_KEY, and BOXLITE_VOLUME_ID to a volume you created in the console.
+import asyncio
+import os
+import time
+
+from boxlite import ApiKeyCredential, Boxlite, BoxliteRestOptions, BoxOptions
+
+
+async def main() -> None:
+    api_key = os.environ.get("BOXLITE_API_KEY")  # <YOUR_API_KEY>
+    volume_id = os.environ.get("BOXLITE_VOLUME_ID")  # <YOUR_VOLUME_ID>
+    if not api_key or not volume_id:
+        print("Set BOXLITE_API_KEY and BOXLITE_VOLUME_ID before running this script.")
+        return
+
+    # Synchronous construction. No path_prefix on Cloud.
+    rt = Boxlite.rest(
+        BoxliteRestOptions(
+            url=os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
+            credential=ApiKeyCredential(api_key),
+        )
+    )
+
+    box = None
+    try:
+        box = await rt.create(
+            BoxOptions(
+                image="ghcr.io/boxlite-ai/boxlite-agent-base:v0.1.0",
+                # A managed volume replaces the host bind mount.
+                volumes=[(volume_id, "/data")],
+            ),
+            name=f"port-demo-{int(time.time())}",  # name belongs to create(), not BoxOptions
+        )
+        await box.start()
+
+        # Write into the volume, then read it back. The data survives this box.
+        write = await box.exec("sh", args=["-c", "echo 'written in the box' > /data/notes.txt"])
+        await write.wait()
+
+        execution = await box.exec("cat", args=["/data/notes.txt"])
+        output = ""
+        async for line in execution.stdout():
+            output += line
+        result = await execution.wait()
+
+        print(f"Exit code: {result.exit_code}")
+        print(output)
+    except Exception as exc:
+        print(f"Cloud call failed: {exc!r}")
+    finally:
+        # Teardown lives on the runtime, not on the box.
+        if box is not None:
+            await rt.remove(box.id, force=True)
+
+
+asyncio.run(main())
+```
+
+The volume in the second script is the part that carries state forward. Destroy the box and create another one against the same volume id, and `/data/notes.txt` is still there.
+
+### Do not send `path_prefix` to Cloud
+
+This one catches people who came from the open-source reference server. That server mounts its routes under a prefix, so the client must pass `path_prefix="default"` — see [Manage remote sandboxes over REST](/guides/agent-service-endpoint). Cloud serves the SDK REST API without a prefix, so you pass only `url` and `credential`. Carry a `path_prefix` over from working self-hosted code and your requests will not land where you expect.
+
+## Troubleshooting a port
+
+| Symptom | Cause | Fix |
+| - | - | - |
+| Files written to a mounted host directory are missing inside the box | Host bind mounts are ignored in REST mode | Create a managed volume and mount it by id: `volumes=[(volume_id, "/data")]` — see [Volumes](/cloud/volumes) |
+| Requests fail to reach the expected route | `path_prefix` was carried over from the open-source reference server | Pass only `url` and `credential` to `BoxliteRestOptions` |
+| `box.remove()` is not available on the box handle | Removal is a runtime method on Cloud | `await rt.remove(box.id, force=True)` |
+| `BoxOptions` rejects `name` as an unknown field | `name` is a parameter of `create()`, not a `BoxOptions` field | `await rt.create(BoxOptions(...), name="my-box")` |
+| `BoxOptions` rejects `disk_gib` as an unknown field | The field has a different name | Use `disk_size_gb` |
+| `BoxOptions` rejects `idle_timeout` or `wake_on_access` as unknown fields | Those are not the field names | Use `auto_stop`, `auto_resume`, and `auto_delete` — see [Boxes](/cloud/boxes) |
+| `boxlite pull` and image APIs report that the operation is unsupported | Image operations are not supported over REST | Use a console base image or `ghcr.io/boxlite-ai/boxlite-agent-base:v0.1.0` |
+| HTTP 401 on every call | The key is missing, wrong, or expired | Check `BOXLITE_API_KEY` and the key's expiry — see [API keys](/cloud/api-keys) |
+| Box creation fails once a number of boxes are already running | You reached your plan's concurrency limit | Remove idle boxes, or change plan — see [Wallet or a plan?](/cloud/plans#concurrency-is-a-separate-decision) |
+| A long-running job stops partway through | The box hit its idle timeout — work inside the box does not count as activity | Adjust the idle switches for that box — see [Boxes](/cloud/boxes) |
+
+## Next
+
+* [Cloud quickstart](/cloud/quickstart) — create a key and run your first command end to end.
+* [What is BoxLite Cloud](/cloud/index) — the runtime model and what Cloud adds.
+* [Python SDK reference](/reference/python) — the full signatures, types, and defaults shared by both runtimes.

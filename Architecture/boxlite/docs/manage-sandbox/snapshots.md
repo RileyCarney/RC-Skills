@@ -1,0 +1,277 @@
+# Snapshots and clones
+Source: https://docs.boxlite.ai/manage-sandbox/snapshots
+
+Save a sandbox's disk state, create a fully independent copy, or pack an entire sandbox into a portable archive.
+
+Three distinct primitives: **snapshot** marks a disk state in place, **clone** produces a brand-new independent box from an existing one, and **export / import** packs a box into a portable `.boxlite` archive. They are not interchangeable — the differences are in [Parameters and Returns](#parameters-and-returns).
+
+> [!NOTE]
+>
+> For hosted boxes, use [Cloud checkpoints](/cloud/checkpoints) to save a stopped box and create new boxes from its saved state. See [Cloud vs open source](/cloud/vs-opensource) for API availability.
+
+## Which one do you need?
+
+| Need | Use | Number of copies | Cross-machine |
+| - | - | - | - |
+| Label a known-good disk state in place (**no guaranteed rollback yet**) | `snapshot.create` | 0 (in place) | No |
+| Produce an independent running instance | `clone_box` | 1 (new box) | No |
+| Migrate / back up / distribute elsewhere | `export` + `import_box` | 1 (new box) | Yes |
+
+## End to end: clone, export, import
+
+The following walks through "write data -> clone -> export -> import -> verify data is preserved" end to end and is runnable as-is.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+import tempfile
+
+import boxlite
+
+async def main() -> None:
+    # the Boxlite runtime is a [synchronous] context manager; do not await
+    runtime = boxlite.Boxlite.default()
+
+    source = None
+    cloned = None
+    imported = None
+    try:
+        # 1) create the source box and write a marker file
+        #    auto_remove=False: export/clone require the source box to be available during the operation
+        source = await runtime.create(
+            boxlite.BoxOptions(image="alpine:latest", auto_remove=False),
+            name="snapshot-demo-source",
+        )
+        exec_handle = await source.exec(
+            "sh", ["-c", "echo 'hello-from-source' > /root/marker.txt"]
+        )
+        result = await exec_handle.wait()
+        if result.exit_code != 0:
+            raise RuntimeError("failed to write marker file")
+
+        # 2) take a snapshot (a save point) within the same sandbox; can be restored at any time later
+        info = await source.snapshot.create(name="clean-state")
+        print(f"snapshot created: {info.name} (size_bytes={info.size_bytes})")
+
+        # 3) clone a fully independent new sandbox (the source box keeps running, unaffected)
+        cloned = await source.clone_box(name="snapshot-demo-clone")
+        out = await cloned.exec("cat", ["/root/marker.txt"])
+        async for line in out.stdout():
+            print(f"clone reads: {line.strip()}")
+        await out.wait()
+
+        # 4) export the source box as a portable .boxlite archive, then import it as a new sandbox
+        with tempfile.TemporaryDirectory() as export_dir:
+            archive_path = await source.export(dest=export_dir)
+            print(f"archive exported: {archive_path}")
+
+            imported = await runtime.import_box(archive_path, name="snapshot-demo-imported")
+            out = await imported.exec("cat", ["/root/marker.txt"])
+            async for line in out.stdout():
+                print(f"imported reads: {line.strip()}")
+            await out.wait()
+
+    except Exception as exc:
+        # virtualization unavailable, image pull failure, etc. are raised as standard exceptions
+        print(f"run failed: {type(exc).__name__}: {exc}")
+    finally:
+        # cleanup: remove is called on the [runtime], not box.remove()
+        for box in (imported, cloned, source):
+            if box is None:
+                continue
+            try:
+                await box.stop()
+            except Exception:
+                pass
+            try:
+                await runtime.remove(box.id, force=True)
+            except Exception:
+                pass
+        runtime.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+> Note: `box.snapshot` is a **property (getter)** that returns a snapshot handle; its `create/list/get/remove/restore` methods are async and require `await`.
+
+## Parameters and Returns
+
+### Snapshots: `box.snapshot.create / list / get / remove / restore`
+
+`box.snapshot` is a synchronous property on the Box that returns a `SnapshotHandle`. All of its methods are async.
+
+| Method | Signature | Required / optional | Description |
+| - | - | - | - |
+| `create` | `create(*, options=None, name: str)` | `name` required (keyword-only); `options` optional | Snapshots the current disk state. Returns a `SnapshotInfo` |
+| `list` | `list()` | — | Lists all snapshots for this sandbox. Returns `list[SnapshotInfo]` |
+| `get` | `get(name: str)` | `name` required | Gets a snapshot by name. Returns `SnapshotInfo \| None` (`None` if it does not exist) |
+| `remove` | `remove(name: str)` | `name` required | Removes the named snapshot. Returns `None` |
+| `restore` | `restore(name: str)` | `name` required | Restores the sandbox disk to the snapshot's state. **You must `await box.stop()` first**: calling this on a running sandbox raises `RuntimeError: Cannot restore snapshot while box is running. Stop the box first.` After `stop()` the box handle is invalidated, so re-acquire it with `runtime.get(box.id)` before calling `exec` again. The return value is empty (`()`/`None`). See the "restore behavior" section under [Troubleshooting](#troubleshooting). |
+
+> `create`'s `name` is a **keyword-only** parameter: `await box.snapshot.create(name="v1")`. `options` is currently a placeholder `SnapshotOptions()` (an empty struct) and can usually be omitted.
+
+**`SnapshotInfo` fields** (source `sdks/python/src/snapshots.rs`):
+
+| Field | Type | Description |
+| - | - | - |
+| `id` | `str` | Internal snapshot ID |
+| `box_id` | `str` | ID of the owning sandbox |
+| `name` | `str` | Snapshot name (the one you passed at creation) |
+| `created_at` | `int` | Creation time (Unix seconds) |
+| `container_disk_bytes` | `int` | Container disk size (bytes) |
+| `size_bytes` | `int` | Size occupied by the snapshot (bytes) |
+
+### Clone: `box.clone_box`
+
+| Parameter | Type | Required / optional | Description |
+| - | - | - | - |
+| `options` | `CloneOptions` | Optional (keyword) | Currently an empty struct; can be omitted |
+| `name` | `str` | Optional (keyword) | Name of the new sandbox; auto-generated if omitted |
+
+Returns: a new `Box` (an independent disk copy). Cloning a running sandbox quiesces and resumes the source VM automatically; the cloned sandbox starts in a stopped state and starts automatically on its first `exec`.
+
+### Export: `box.export`
+
+| Parameter | Type | Required / optional | Description |
+| - | - | - | - |
+| `dest` | `str` | **Required** (keyword) | Output directory path for the archive |
+| `options` | `ExportOptions` | Optional (keyword) | Currently an empty struct; can be omitted |
+
+Returns: `str` — the full path of the generated `.boxlite` archive file.
+
+### Import: `runtime.import_box`
+
+Note: `import_box` is called on the **runtime** object, not on a box.
+
+| Parameter | Type | Required / optional | Description |
+| - | - | - | - |
+| `archive_path` | `str` | **Required** (positional) | Path of the archive previously produced by `export` |
+| `name` | `str` | Optional | Name of the new sandbox after import |
+
+Returns: a new `Box`.
+
+## Node example (clone plus export/import)
+
+The corresponding Node SDK methods are `box.cloneBox(opts?, name?)`, `box.export(dest, opts?)`, and `runtime.importBox(archivePath, name?)`; the snapshot handle is reached via `box.snapshot` (`create/list/get/remove/restore`). Note the package name is `@boxlite-ai/boxlite`.
+
+```typescript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { JsBoxlite } from "@boxlite-ai/boxlite";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+async function main(): Promise<void> {
+  const runtime = JsBoxlite.withDefaultConfig();
+  let source, cloned, imported;
+  try {
+    // create the source box and write a marker
+    source = await runtime.create(
+      { image: "alpine:latest", autoRemove: false },
+      "snapshot-demo-source",
+    );
+    let ex = await source.exec("sh", ["-c", "echo hello > /root/marker.txt"]);
+    await ex.wait();
+
+    // clone an independent copy
+    cloned = await source.cloneBox(undefined, "snapshot-demo-clone");
+
+    // export then import
+    const dir = mkdtempSync(join(tmpdir(), "boxlite-"));
+    const archive = await source.export(dir);          // returns the archive path string
+    imported = await runtime.importBox(archive, "snapshot-demo-imported");
+
+    ex = await imported.exec("cat", ["/root/marker.txt"]);
+    await ex.wait();
+    console.log("imported box available, id =", imported.id);
+  } catch (err) {
+    console.error("run failed:", err);
+  } finally {
+    for (const box of [imported, cloned, source]) {
+      if (!box) continue;
+      try { await runtime.remove(box.id, true); } catch { /* ignore */ }
+    }
+    runtime.close(); // close() is synchronous
+  }
+}
+
+main();
+```
+
+## Troubleshooting
+
+### Startup fails: no hardware virtualization (environment constraint)
+
+Snapshot, clone, and export all require the sandbox to start first, and starting a sandbox requires hardware virtualization:
+
+* **Linux**: requires KVM (`/dev/kvm` accessible, user in the `kvm` group). WSL2 also requires KVM enabled.
+* **macOS**: uses Apple's Hypervisor.framework and **does not need** `/dev/kvm`.
+* Without virtualization, `create`/`start` fail with a standard exception (the process itself stays alive and can be caught with try/except and surfaced).
+
+### `AttributeError: ... has no attribute 'remove'` (calling remove on a box)
+
+Removing a sandbox must be called on the **runtime**: `await runtime.remove(box.id, force=True)`, **not** `box.remove()`. To list sandboxes, use `runtime.list_info()`, not `runtime.list()`.
+
+### `await box.info()` errors / coroutine was never awaited
+
+`box.info()` is **async**; `await` it. It returns a `BoxInfo`, and the state is at `(await box.info()).state` (a `BoxStateInfo`, whose field is named `.status`).
+
+### restore behavior: stop first; the handle is invalidated
+
+`snapshot.restore` has a few caveats:
+
+* **You must stop the sandbox first**: calling `await box.snapshot.restore("v1")` on a running sandbox raises
+  `RuntimeError: invalid state: Cannot restore snapshot while box is running. Stop the box first.` (it is catchable with try/except, not a panic). Call `await box.stop()` first, then restore.
+* **The handle is invalidated after stop**: after `stop()`, calling `exec` on the old handle raises
+  `RuntimeError: stopped: Handle invalidated after stop(). Use runtime.get() to get a new handle.`. Re-run `box = await runtime.get(box.id)` to obtain a fresh handle.
+
+> Limitation: `restore` re-points the sandbox at the snapshot's disk state, but it is not a guaranteed rollback of everything written since — writes already flushed by a running guest can survive. When you need a guaranteed clean environment, prefer `clone_box` or `export` / `import_box`.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# correct restore call sequence
+await box.stop()
+await box.snapshot.restore("v1")          # returns ()
+box = await runtime.get(box.id)           # the handle must be re-acquired after stop
+out = await box.exec("cat", ["/root/x.txt"])
+```
+
+### Removing a snapshot the "current disk depends on" raises `RuntimeError`
+
+Calling `snapshot.remove(name)` on a snapshot the "current disk currently depends on" (for example, one you restored to) raises:
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+RuntimeError: invalid state: Cannot remove snapshot: current disk depends on this snapshot. Restore a different snapshot first.
+```
+
+This is a catchable standard exception. Restore to a different snapshot first, or remove a snapshot that is not depended upon.
+
+### Image pull failure raises `RuntimeError`
+
+A missing command or an image pull failure raises a standard `RuntimeError` (Python) / bare `Error` (Node), not `BoxliteError`. See [Error Handling](/guides/error-handling#troubleshooting).
+
+### `SnapshotHandle.create() takes 0 positional arguments but 1 was given`
+
+`create`'s signature is `create(*, options=None, name)` — `name` is keyword-only:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+await box.snapshot.create(name="v1")    # correct
+# await box.snapshot.create("v1")       # TypeError, as above
+```
+
+### Cloning under the default `auto_remove` makes context exit fail
+
+Clone and export both work while the source box is running. The problem shows up at teardown: with the default `auto_remove=True`, leaving the context tries to remove a box the clone still depends on, and the exit itself raises:
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+RuntimeError: invalid state: Cannot remove box: boxes [<clone-id>] have clone dependencies on it.
+Remove those first or use force=true.
+```
+
+Pass `auto_remove=False` on any box you intend to clone or export, and remove it yourself once the clones are gone:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import boxlite
+
+opts = boxlite.BoxOptions(image="alpine:latest", auto_remove=False)
+```
+
+Looking a clone source up after it is gone returns `None` rather than raising, so the failure you actually see is `AttributeError: 'NoneType' object has no attribute 'clone_box'`.

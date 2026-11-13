@@ -1,0 +1,748 @@
+# Use secrets in a local box
+Source: https://docs.boxlite.ai/manage-sandbox/secrets-and-security
+
+Make an LLM call from a local box using Python, TypeScript, or CLI without putting the model key inside the box.
+
+Let a local box call an authenticated HTTPS API without placing the real credential in its environment or files. Your host supplies a `Secret`; BoxLite's outbound proxy inserts its value into configured request headers for allowed hosts.
+
+For remotely hosted boxes, use [Cloud Secrets](/cloud/secrets). The examples below run a local VM and require [a supported machine with hardware virtualization](/getting-started/installation#platform-and-virtualization-requirements-common-to-all-sdks). They do not require a Cloud API key.
+
+## Make your first LLM call
+
+Run one inference request inside a box. Your workstation supplies the real model key to BoxLite; the code inside the box sends only `<BOXLITE_SECRET:model>` and receives the model's reply.
+
+You need an OpenAI API key with access to `gpt-4.1-mini`. Run the commands on your workstation. The examples create a disposable box, print the reply, and remove the box automatically.
+
+Using another OpenAI-compatible provider? Change `api.openai.com` in both the Secret host and request URL, and change the model ID. Use that provider's key. The real key still belongs only in the Secret configuration.
+
+> [tab] Python
+>
+> ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> python3 -m venv .venv
+> source .venv/bin/activate
+> python -m pip install --upgrade boxlite
+> ```
+>
+> Save as `llm_secret.py`:
+>
+> ```python llm_secret.py theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> import asyncio
+> import json
+> from getpass import getpass
+>
+> import boxlite
+>
+>
+> async def main():
+>     runtime = boxlite.Boxlite(boxlite.Options(home_dir=".boxlite-secrets-demo"))
+>     token = getpass("OpenAI API key: ")
+>     box = None
+>
+>     async def run(command, args):
+>         execution = await box.exec(command, args=args)
+>         output = "".join([part async for part in execution.stdout()])
+>         result = await execution.wait()
+>         if result.exit_code != 0:
+>             raise RuntimeError(f"{command} failed with exit code {result.exit_code}")
+>         return output
+>
+>     try:
+>         box = await runtime.create(boxlite.BoxOptions(
+>             image="python:alpine",
+>             auto_stop=0,
+>             auto_delete=0,
+>             secrets=[boxlite.Secret(
+>                 name="model",
+>                 value=token,
+>                 hosts=["api.openai.com"],
+>                 headers={"Authorization": "Bearer {value}"},
+>             )],
+>         ))
+>         print(f"Created box: {box.id}")
+>         await box.start()
+>         request = """
+> import json, ssl, urllib.request
+> payload = {
+>     "model": "gpt-4.1-mini",
+>     "messages": [{"role": "user", "content": "Say hello in one short sentence."}],
+>     "max_tokens": 64,
+> }
+> request = urllib.request.Request(
+>     "https://api.openai.com/v1/chat/completions",
+>     data=json.dumps(payload).encode(),
+>     headers={
+>         "Content-Type": "application/json",
+>         "Authorization": "Bearer <BOXLITE_SECRET:model>",
+>     },
+> )
+> context = ssl.create_default_context(cafile="/etc/ssl/certs/ca-certificates.crt")
+> with urllib.request.urlopen(request, context=context, timeout=60) as response:
+>     print(json.load(response)["choices"][0]["message"]["content"])
+> """
+>         print((await run("python", ["-c", request])).strip())
+>     finally:
+>         try:
+>             if box is not None:
+>                 await runtime.remove(box.id, force=True)
+>                 print("Removed the test box")
+>         finally:
+>             runtime.close()
+>
+>
+> asyncio.run(main())
+>
+> ```
+>
+> ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> python llm_secret.py
+> ```
+
+> [tab] TypeScript
+>
+> ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> npm install @boxlite-ai/boxlite tsx
+> ```
+>
+> Read your provider key on the host (Bash or Zsh):
+>
+> ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> read -r -s OPENAI_API_KEY
+> export OPENAI_API_KEY
+> ```
+>
+> Save as `llm_secret.ts`:
+>
+> ```typescript llm_secret.ts theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> import { JsBoxlite } from '@boxlite-ai/boxlite';
+>
+> async function main() {
+>   const runtime = new JsBoxlite({ homeDir: '.boxlite-secrets-demo' });
+>   const token = process.env.OPENAI_API_KEY;
+>   if (!token) throw new Error('Set OPENAI_API_KEY on your workstation');
+>   let box: Awaited<ReturnType<typeof runtime.create>> | undefined;
+>   async function run(command: string, args: string[]) {
+>     const execution = await box!.exec(command, args);
+>     const stdout = await execution.stdout();
+>     let output = '';
+>     for (let chunk = await stdout.next(); chunk !== null; chunk = await stdout.next()) output += chunk;
+>     const result = await execution.wait();
+>     if (result.exitCode !== 0) throw new Error(`${command} failed: ${result.exitCode}`);
+>     return output;
+>   }
+>   try {
+>     box = await runtime.create({ image: 'python:alpine', autoStop: 0, autoDelete: 0,
+>       secrets: [{name: 'model', value: token, hosts: ['api.openai.com'],
+>         headers: { Authorization: 'Bearer {value}' }}],
+>     });
+>     console.log(`Created box: ${box.id}`);
+>     await box.start();
+>     const request = `
+> import json, ssl, urllib.request
+> payload = {
+>     "model": "gpt-4.1-mini",
+>     "messages": [{"role": "user", "content": "Say hello in one short sentence."}],
+>     "max_tokens": 64,
+> }
+> request = urllib.request.Request(
+>     "https://api.openai.com/v1/chat/completions",
+>     data=json.dumps(payload).encode(),
+>     headers={
+>         "Content-Type": "application/json",
+>         "Authorization": "Bearer <BOXLITE_SECRET:model>",
+>     },
+> )
+> context = ssl.create_default_context(cafile="/etc/ssl/certs/ca-certificates.crt")
+> with urllib.request.urlopen(request, context=context, timeout=60) as response:
+>     print(json.load(response)["choices"][0]["message"]["content"])
+> `;
+>     console.log((await run("python", ["-c", request])).trim());
+>   } finally {
+>     try { if (box) { await runtime.remove(box.id, true); console.log('Removed the test box'); } }
+>     finally { runtime.close(); }
+>   }
+> }
+> main().catch(error => { console.error(error); process.exitCode = 1; });
+>
+> ```
+>
+> ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> npx tsx llm_secret.ts
+> ```
+
+> [tab] CLI + REST
+>
+> The CLI has no Secret-creation flag. This shell workflow creates the box through the REST API, then uses `boxlite exec` to verify injection. Do not put the real credential in `boxlite create -e`.
+>
+> Install the latest CLI. You also need Bash, `curl`, and `jq` on your workstation:
+>
+> ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> curl -fsSL https://sh.boxlite.ai | sh
+> ```
+>
+> In another terminal, start a local REST server bound to loopback:
+>
+> ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> boxlite --home "$PWD/.boxlite-secrets-server" serve --port 18135
+> ```
+>
+> Keep it running while you execute the script below. Stop it with Ctrl-C afterward. The server manages the local VM; no Cloud account is used.
+>
+> Save as `llm_secret.sh`:
+>
+> ```bash llm_secret.sh theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> #!/usr/bin/env bash
+> set -euo pipefail
+> BASE='http://127.0.0.1:18135'
+> unset BOXLITE_API_KEY
+> WORK=$(mktemp -d)
+> BOX=''
+> api() {
+>   local route=$1
+>   shift
+>   curl -q --fail --silent --show-error "$BASE/v1$route" "$@"
+> }
+> cleanup() {
+>   if [[ -n "$BOX" ]]; then
+>     if api "/boxes/$BOX?force=true" -X DELETE >/dev/null; then
+>       printf 'Removed the test box\n'
+>     else
+>       printf 'Cleanup failed; remove box %s on the local server\n' "$BOX" >&2
+>     fi
+>   fi
+>   rm -rf "$WORK"
+> }
+> trap cleanup EXIT
+> read -r -s -p 'OpenAI API key: ' OPENAI_API_KEY
+> printf '\n'
+> export OPENAI_API_KEY
+> jq -n '{image:"python:alpine",auto_stop:0,auto_delete:0,
+>   secrets:[{name:"model",value:env.OPENAI_API_KEY,hosts:["api.openai.com"],
+>     headers:{Authorization:"Bearer {value}"}}]}' > "$WORK/create.json"
+> unset OPENAI_API_KEY
+> BOX=$(api /boxes -H 'Content-Type: application/json' \
+>   --data-binary @"$WORK/create.json" | jq -er '.box_id')
+> printf 'Created box: %s\n' "$BOX"
+> boxcli() { boxlite --home "$WORK/home" --url "$BASE" --path-prefix '' "$@"; }
+> boxcli start "$BOX" >/dev/null
+> REQUEST=$(cat <<'PY'
+> import json, ssl, urllib.request
+> payload = {
+>     "model": "gpt-4.1-mini",
+>     "messages": [{"role": "user", "content": "Say hello in one short sentence."}],
+>     "max_tokens": 64,
+> }
+> request = urllib.request.Request(
+>     "https://api.openai.com/v1/chat/completions",
+>     data=json.dumps(payload).encode(),
+>     headers={
+>         "Content-Type": "application/json",
+>         "Authorization": "Bearer <BOXLITE_SECRET:model>",
+>     },
+> )
+> context = ssl.create_default_context(cafile="/etc/ssl/certs/ca-certificates.crt")
+> with urllib.request.urlopen(request, context=context, timeout=60) as response:
+>     print(json.load(response)["choices"][0]["message"]["content"])
+> PY
+> )
+> boxcli exec "$BOX" -- python -c "$REQUEST"
+>
+> ```
+>
+> ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> bash llm_secret.sh
+> ```
+
+Expected output (the model's wording can vary):
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+Created box: <BOX_ID>
+Hello! How can I help you today?
+Removed the test box
+```
+
+A successful authenticated model response demonstrates that the proxy injected a usable credential. The model key is supplied only to `Secret.value`; it is not passed to the guest command or guest environment.
+
+## Connect your own API
+
+Keep the credential on the trusted host. Configure the API hostname in `hosts`, its authentication header in `headers`, and the real credential in `value`. Set the application's API key inside the box to a dummy value such as `<BOXLITE_SECRET:model>`.
+
+The Secret configuration is the same for local and Cloud runtimes. See [provider configuration examples in all three formats](/cloud/secrets#connect-your-own-api) and [authentication header formats](/cloud/secrets#choose-the-authentication-header). Continue using the local runtime shown above.
+
+The proxy replaces only configured headers already present in the request. Missing headers are not added. The placeholder is a dummy value, not an authorization boundary: code inside the box can exercise the credential's permissions at allowed hosts.
+
+For verification with a real credential, call an authenticated endpoint on its provider and check the expected result. Do not use an echo endpoint. To limit destinations as well as credential injection, configure [outbound network access](/manage-sandbox/network-access).
+
+## Optional: verify injection with a fake token
+
+Use this diagnostic when you want to check the mechanism without a provider account. It verifies both the guest environment and the header received by the upstream.
+
+> [!WARNING]
+>
+> Use only the generated fake token with this echo service. Its response returns the token to the box. Never substitute a real credential here; do not assume upstream responses are scrubbed.
+
+> [accordion] Run the fake-token diagnostic
+>
+> > [tab] Python
+> >
+> > ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> > python3 -m venv .venv
+> > source .venv/bin/activate
+> > python -m pip install --upgrade boxlite
+> > ```
+> >
+> > Save as `secret_demo.py`:
+> >
+> > ```python secret_demo.py theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> > import asyncio
+> > import json
+> > import secrets
+> >
+> > import boxlite
+> >
+> >
+> > async def main():
+> >     runtime = boxlite.Boxlite(boxlite.Options(home_dir=".boxlite-secrets-demo"))
+> >     token = "demo-not-a-real-key-" + secrets.token_hex(16)
+> >     box = None
+> >
+> >     async def run(command, args):
+> >         execution = await box.exec(command, args=args)
+> >         output = "".join([part async for part in execution.stdout()])
+> >         result = await execution.wait()
+> >         if result.exit_code != 0:
+> >             raise RuntimeError(f"{command} failed with exit code {result.exit_code}")
+> >         return output
+> >
+> >     try:
+> >         box = await runtime.create(boxlite.BoxOptions(
+> >             image="python:alpine",
+> >             auto_stop=0,
+> >             auto_delete=0,
+> >             secrets=[boxlite.Secret(
+> >                 name="demo",
+> >                 value=token,
+> >                 hosts=["httpbingo.org"],
+> >                 headers={"Authorization": "Bearer {value}"},
+> >             )],
+> >         ))
+> >         print(f"Created box: {box.id}")
+> >         await box.start()
+> >         environment = await run("env", [])
+> >         if not environment.strip() or token in environment:
+> >             raise RuntimeError("Guest environment check failed")
+> >         print("PASS: the test value is absent from the guest environment")
+> >
+> >         request = """
+> > import json, ssl, urllib.request
+> > request = urllib.request.Request(
+> >     "https://httpbingo.org/headers",
+> >     headers={"Authorization": "Bearer <BOXLITE_SECRET:demo>"},
+> > )
+> > context = ssl.create_default_context(cafile="/etc/ssl/certs/ca-certificates.crt")
+> > with urllib.request.urlopen(request, context=context, timeout=30) as response:
+> >     print(response.read().decode())
+> > """
+> >         echoed = json.loads(await run("python", ["-c", request]))
+> >         headers = {key.lower(): value for key, value in echoed["headers"].items()}
+> >         authorization = headers.get("authorization")
+> >         if isinstance(authorization, list):
+> >             authorization = authorization[0]
+> >         if authorization != "Bearer " + token:
+> >             raise RuntimeError("Upstream did not receive the injected test value")
+> >         print("PASS: the upstream received the injected Authorization header")
+> >     finally:
+> >         try:
+> >             if box is not None:
+> >                 await runtime.remove(box.id, force=True)
+> >                 print("Removed the test box")
+> >         finally:
+> >             runtime.close()
+> >
+> >
+> > asyncio.run(main())
+> >
+> > ```
+> >
+> > ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> > python secret_demo.py
+> > ```
+>
+> > [tab] TypeScript
+> >
+> > ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> > npm install @boxlite-ai/boxlite tsx
+> > ```
+> >
+> > Save as `secret_demo.ts`:
+> >
+> > ```typescript secret_demo.ts theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> > import { randomBytes } from 'node:crypto';
+> > import { JsBoxlite } from '@boxlite-ai/boxlite';
+> >
+> > async function main() {
+> >   const runtime = new JsBoxlite({ homeDir: '.boxlite-secrets-demo' });
+> >   const token = 'demo-not-a-real-key-' + randomBytes(16).toString('hex');
+> >   let box: Awaited<ReturnType<typeof runtime.create>> | undefined;
+> >   async function run(command: string, args: string[]) {
+> >     const execution = await box!.exec(command, args);
+> >     const stdout = await execution.stdout();
+> >     let output = '';
+> >     for (let chunk = await stdout.next(); chunk !== null; chunk = await stdout.next()) output += chunk;
+> >     const result = await execution.wait();
+> >     if (result.exitCode !== 0) throw new Error(`${command} failed: ${result.exitCode}`);
+> >     return output;
+> >   }
+> >   try {
+> >     box = await runtime.create({ image: 'python:alpine', autoStop: 0, autoDelete: 0,
+> >       secrets: [{name: 'demo', value: token, hosts: ['httpbingo.org'],
+> >         headers: { Authorization: 'Bearer {value}' }}],
+> >     });
+> >     console.log(`Created box: ${box.id}`);
+> >     await box.start();
+> >     const environment = await run('env', []);
+> >     if (!environment.trim() || environment.includes(token)) throw new Error('Guest environment check failed');
+> >     console.log('PASS: the test value is absent from the guest environment');
+> >     const request = `
+> > import ssl, urllib.request
+> > req = urllib.request.Request("https://httpbingo.org/headers",
+> >     headers={"Authorization": "Bearer <BOXLITE_SECRET:demo>"})
+> > ctx = ssl.create_default_context(cafile="/etc/ssl/certs/ca-certificates.crt")
+> > with urllib.request.urlopen(req, context=ctx, timeout=30) as response:
+> >     print(response.read().decode())
+> > `;
+> >     const echoed = JSON.parse(await run('python', ['-c', request]));
+> >     const headers = Object.fromEntries(Object.entries(echoed.headers).map(([k,v]) => [k.toLowerCase(), v]));
+> >     const auth = headers.authorization;
+> >     if ((Array.isArray(auth) ? auth[0] : auth) !== `Bearer ${token}`) throw new Error('Header injection failed');
+> >     console.log('PASS: the upstream received the injected Authorization header');
+> >   } finally {
+> >     try { if (box) { await runtime.remove(box.id, true); console.log('Removed the test box'); } }
+> >     finally { runtime.close(); }
+> >   }
+> > }
+> > main().catch(error => { console.error(error); process.exitCode = 1; });
+> >
+> > ```
+> >
+> > ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> > npx tsx secret_demo.ts
+> > ```
+>
+> > [tab] CLI + REST
+> >
+> > The CLI has no Secret-creation flag. This shell workflow creates the box through the REST API, then uses `boxlite exec` to verify injection. Do not put the real credential in `boxlite create -e`.
+> >
+> > Install the latest CLI. You also need Bash, `curl`, `jq`, and `openssl` on your workstation:
+> >
+> > ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> > curl -fsSL https://sh.boxlite.ai | sh
+> > ```
+> >
+> > In another terminal, start a local REST server bound to loopback:
+> >
+> > ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> > boxlite --home "$PWD/.boxlite-secrets-server" serve --port 18135
+> > ```
+> >
+> > Keep it running while you execute the script below. Stop it with Ctrl-C afterward. The server manages the local VM; no Cloud account is used.
+> >
+> > Save as `secret_demo.sh`:
+> >
+> > ```bash secret_demo.sh theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> > #!/usr/bin/env bash
+> > set -euo pipefail
+> > BASE='http://127.0.0.1:18135'
+> > unset BOXLITE_API_KEY
+> > WORK=$(mktemp -d)
+> > BOX=''
+> > api() {
+> >   local route=$1
+> >   shift
+> >   curl -q --fail --silent --show-error "$BASE/v1$route" "$@"
+> > }
+> > cleanup() {
+> >   if [[ -n "$BOX" ]]; then
+> >     if api "/boxes/$BOX?force=true" -X DELETE >/dev/null; then
+> >       printf 'Removed the test box\n'
+> >     else
+> >       printf 'Cleanup failed; remove box %s on the local server\n' "$BOX" >&2
+> >     fi
+> >   fi
+> >   rm -rf "$WORK"
+> > }
+> > trap cleanup EXIT
+> > TOKEN="demo-not-a-real-key-$(openssl rand -hex 16)"
+> > jq -n --arg token "$TOKEN" '{image:"python:alpine",auto_stop:0,auto_delete:0,
+> >   secrets:[{name:"demo",value:$token,hosts:["httpbingo.org"],
+> >     headers:{Authorization:"Bearer {value}"}}]}' > "$WORK/create.json"
+> > BOX=$(api /boxes -H 'Content-Type: application/json' \
+> >   --data-binary @"$WORK/create.json" | jq -er '.box_id')
+> > printf 'Created box: %s\n' "$BOX"
+> > boxcli() { boxlite --home "$WORK/home" --url "$BASE" --path-prefix '' "$@"; }
+> > boxcli start "$BOX" >/dev/null
+> > boxcli exec "$BOX" -- env > "$WORK/environment"
+> > test -s "$WORK/environment"
+> > if grep -Fq "$TOKEN" "$WORK/environment"; then
+> >   echo 'Guest environment contains the test value' >&2
+> >   exit 1
+> > fi
+> > echo 'PASS: the test value is absent from the guest environment'
+> > REQUEST=$(cat <<'PY'
+> > import ssl, urllib.request
+> > req = urllib.request.Request("https://httpbingo.org/headers",
+> >     headers={"Authorization": "Bearer <BOXLITE_SECRET:demo>"})
+> > ctx = ssl.create_default_context(cafile="/etc/ssl/certs/ca-certificates.crt")
+> > with urllib.request.urlopen(req, context=ctx, timeout=30) as response:
+> >     print(response.read().decode())
+> > PY
+> > )
+> > boxcli exec "$BOX" -- python -c "$REQUEST" > "$WORK/echo.json"
+> > jq -e --arg expected "Bearer $TOKEN" \
+> >   '(.headers | with_entries(.key |= ascii_downcase) | .authorization) |
+> >    (if type == "array" then .[0] else . end) == $expected' \
+> >   "$WORK/echo.json" >/dev/null
+> > echo 'PASS: the upstream received the injected Authorization header'
+> >
+> > ```
+> >
+> > ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> > bash secret_demo.sh
+> > ```
+>
+> Expected output includes both `PASS` checks and `Removed the test box`.
+
+## Troubleshooting
+
+| Symptom | What to check |
+| - | - |
+| The local VM cannot start | Check the platform and virtualization requirements in [Installation](/getting-started/installation). |
+| Secret construction fails | Install the latest SDK and provide explicit `headers`. |
+| The local server rejects `secrets[].headers` | Update the CLI that runs `boxlite serve`, not only the SDK or client CLI. |
+| The API receives a placeholder or rejects authentication | Check the destination hostname, header mapping, and whether the request actually contains that header. |
+| TLS validation fails | Configure the client to trust the system CA bundle; do not disable certificate verification. |
+| The REST example cannot connect | Keep the local server running on port `18135` and use its loopback URL. |
+
+Secret injection and OS-level sandbox hardening are independent. Configure both when running untrusted workloads.
+
+## Tighten isolation (SecurityOptions)
+
+For untrusted workloads, use the `maximum()` preset to enable all isolation. Note: `security` must be passed through `advanced=AdvancedBoxOptions(...)`; **there is no top-level `security=` keyword**, and `AdvancedBoxOptions` is exported only under the `boxlite.boxlite` submodule.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+
+from boxlite import SimpleBox, SecurityOptions
+# AdvancedBoxOptions is exported at the top level.
+from boxlite import AdvancedBoxOptions
+
+async def main() -> None:
+    advanced = AdvancedBoxOptions(security=SecurityOptions.maximum())
+
+    try:
+        # advanced= is passed through to the underlying BoxOptions via SimpleBox's **kwargs.
+        async with SimpleBox(image="alpine:latest", advanced=advanced) as box:
+            result = await box.exec("id")
+            if result.exit_code != 0:
+                print("command failed:", result.stderr)
+            else:
+                print(result.stdout)
+    except RuntimeError as e:
+        print("box failed to start:", e)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Combining the two (credentials plus isolation)
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+
+from boxlite import SimpleBox, Secret, SecurityOptions
+from boxlite import AdvancedBoxOptions
+
+async def main() -> None:
+    secret = Secret(
+        name="demo",
+        value="<YOUR_API_KEY>",  # TODO: replace with a real credential
+        hosts=["api.example.com"],
+    )
+    advanced = AdvancedBoxOptions(security=SecurityOptions.maximum())
+
+    try:
+        async with SimpleBox(
+            image="python:slim",
+            secrets=[secret],
+            advanced=advanced,
+        ) as box:
+            result = await box.exec("echo", "secrets + hardening ready")
+            print(result.stdout if result.exit_code == 0 else result.stderr)
+    except RuntimeError as e:
+        print("box failed to start:", e)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// the package name is @boxlite-ai/boxlite (not 'boxlite'). Pure ESM.
+import { SimpleBox } from "@boxlite-ai/boxlite";
+
+async function main(): Promise<void> {
+  try {
+    // SimpleBox implements AsyncDisposable; use `await using` for automatic release.
+    await using box = new SimpleBox({
+      image: "python:slim",
+      secrets: [
+        {
+          name: "demo",
+          value: "<YOUR_API_KEY>", // TODO: replace with a real credential
+          hosts: ["api.example.com"],
+          // when placeholder is omitted, it defaults to <BOXLITE_SECRET:demo>
+        },
+      ],
+      // Node has no maximum() preset; pass the object directly (seccomp takes effect on Linux only).
+      security: {
+        jailerEnabled: true,
+        seccompEnabled: true,
+        maxOpenFiles: 1024,
+        maxProcesses: 100,
+        closeFds: true,
+      },
+    });
+
+    const result = await box.exec("echo", "secrets + hardening ready");
+    console.log(result.exitCode === 0 ? result.stdout : result.stderr);
+  } catch (err) {
+    // a missing command / pull failure throws a bare Error, not necessarily BoxliteError.
+    console.error("box failed:", err);
+  }
+}
+
+main();
+```
+
+In the Node SDK, `secrets` and `security` are both direct fields of `SimpleBoxOptions` (there is no `advanced` wrapper layer), and `SecurityOptions` is expressed as a plain object (there is no `maximum()` static preset).
+
+## Parameters and Returns
+
+### `Secret(name, value, hosts=[], placeholder=None)`
+
+Constructor signature: see `sdks/python/src/options.rs`.
+
+| Parameter | Type | Required | Description |
+| - | - | - | - |
+| `name` | `str` | Required | Human-readable name for the credential (such as `"openai"`). When `placeholder` is not set explicitly, the placeholder is derived as `<BOXLITE_SECRET:{name}>`. |
+| `value` | `str` | Required | The real credential value. **It exists only on the host side and never enters the guest VM.** |
+| `hosts` | `list[str]` | **Set this** (default `[]`) | Restrict injection to these hosts. Exact matches (`api.openai.com`) and wildcards (`*.openai.com`). **Leaving it empty places no host restriction on injection** — with untrusted code in the sandbox, always scope it. |
+| `placeholder` | `str \| None` | Optional (default `None`) | The placeholder string that appears in guest HTTP headers. Defaults to `<BOXLITE_SECRET:{name}>`. |
+
+Injection entry point: `BoxOptions(secrets=[Secret(...)])`, or passed through via `SimpleBox(..., secrets=[...])`. Node uses `{ name, value, hosts?, placeholder? }`.
+
+### `SecurityOptions` (Python)
+
+Preset static methods (`sdks/python/src/advanced_options.rs`):
+
+| Preset | When to use | jailer | seccomp | Resource limits | close_fds |
+| - | - | - | - | - | - |
+| `SecurityOptions.development()` | Debugging (when isolation interferes with diagnosis) | off | off | none | off |
+| `SecurityOptions.standard()` | Most cases (recommended) | on for Linux/macOS | on for Linux | none | on |
+| `SecurityOptions.maximum()` | Untrusted workloads (AI sandboxes, multi-tenant) | on | on for Linux | see below | on |
+
+> Note: there is no `SecurityOptions.minimum()`; the weak-isolation preset is named `development()`.
+
+Resource limits set by `maximum()`: `max_open_files=1024`, `max_file_size=1 GiB`, `max_processes=100` (`max_memory`/`max_cpu_time` are left to the VM configuration).
+
+Custom constructor parameters (defaults per the source signature):
+
+| Parameter | Type | Default | Description |
+| - | - | - | - |
+| `jailer_enabled` | `bool` | `False` | Enable jailer isolation (Linux/macOS). |
+| `seccomp_enabled` | `bool` | `False` | Enable seccomp syscall filtering (**Linux only**). |
+| `max_open_files` | `int \| None` | `None` | Maximum number of open file descriptors. |
+| `max_file_size` | `int \| None` | `None` | Maximum file size (bytes). |
+| `max_processes` | `int \| None` | `None` | Maximum number of processes. |
+| `max_memory` | `int \| None` | `None` | Maximum virtual memory (bytes). |
+| `max_cpu_time` | `int \| None` | `None` | Maximum CPU time (seconds). |
+| `network_enabled` | `bool` | `True` | Whether network access is allowed in the sandbox (**macOS-relevant only**). |
+| `close_fds` | `bool` | `True` | Close file descriptors inherited from the host. |
+
+### Attaching `SecurityOptions` to a box
+
+| Entry point | Form |
+| - | - |
+| Python (recommended high-level) | `SimpleBox(image=..., advanced=AdvancedBoxOptions(security=SecurityOptions.maximum()))` |
+| Python (lower-level BoxOptions) | `BoxOptions(image=..., advanced=AdvancedBoxOptions(security=...))` |
+| Node | `new SimpleBox({ image, security: { jailerEnabled, seccompEnabled, ... } })` (no `advanced` wrapper, no `maximum()` preset) |
+
+`AdvancedBoxOptions(security=None, health_check=None)`: exported only under the `boxlite.boxlite` submodule; `import boxlite; boxlite.AdvancedBoxOptions` at the top level is not available.
+
+### `box.exec(...)` return value (`ExecResult`)
+
+| Field | Type | Description |
+| - | - | - |
+| `exit_code` | `int` | Process exit code. A non-zero value **does not raise**; check it yourself. |
+| `stdout` | `str` | Standard output. |
+| `stderr` | `str` | Standard error. |
+| `error_message` | `str \| None` | Non-`None` only when the process died abnormally. |
+
+## Troubleshooting
+
+### `AttributeError: module 'boxlite' has no attribute 'AdvancedBoxOptions'`
+
+`AdvancedBoxOptions` lives in the `boxlite.boxlite` submodule, not the top level.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Wrong
+# from boxlite import AdvancedBoxOptions
+
+# Correct
+from boxlite import AdvancedBoxOptions
+```
+
+### `AttributeError: type object 'SecurityOptions' has no attribute 'minimum'`
+
+There is no `minimum()` preset. Use `SecurityOptions.development()` for weak isolation, and `standard()` / `maximum()` otherwise.
+
+### Passing `security=` at the top level errors out
+
+`BoxOptions` / `SimpleBox` **do not** have a `security=` keyword. Security options must be wrapped in `advanced=AdvancedBoxOptions(security=...)`. Passing `security=` directly reports a `TypeError` due to the unknown keyword argument.
+
+### The secret was not injected (the request still contains the raw placeholder / authentication fails)
+
+* The proxy substitutes placeholders in **request headers** (typically `Authorization`), the **URL query string**, and the **request body**. It does not touch the **URL path** — a placeholder there is forwarded literally.
+* `hosts` must match the actual outbound target host. For example, requesting `api.openai.com` with `hosts=["openai.com"]` does not match: use the exact host or the `*.openai.com` wildcard.
+* Egress must be **HTTPS** and pass through the BoxLite proxy; if the sandbox network is fully disabled, injection cannot occur.
+
+### seccomp / jailer behave differently on macOS
+
+`seccomp_enabled`, `new_pid_ns`, `new_net_ns`, and chroot are **Linux-only**. Setting them on macOS does not error — the runtime logs a `warn` and ignores them. `seccomp_enabled` **takes effect only on Linux** (`standard()`/`maximum()` already guard it internally with `cfg!(target_os = "linux")`). On macOS, even setting it to `True` does not enable seccomp; this is a platform difference. The jailer is available on both Linux and macOS.
+
+### Isolation is blocking your program and you cannot tell which layer
+
+Downgrade temporarily to confirm it, then put it back — do not ship with isolation off:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+from boxlite import SecurityOptions
+
+debug_only = SecurityOptions.development()  # jailer and seccomp both off — diagnosis only
+```
+
+Once the interference is confirmed, return to `standard()` or `maximum()` and narrow the specific
+field instead. Which field touches which layer is on
+[Security and isolation](/architecture/security-and-isolation#what-each-switch-turns-off).
+
+### The box fails to start (`RuntimeError`) — virtualization unavailable
+
+BoxLite depends on hardware virtualization:
+
+* **Linux**: requires KVM (`/dev/kvm` accessible); WSL2 requires KVM enabled and the user in the `kvm` group.
+* **macOS**: uses Apple's Hypervisor.framework and **does not need `/dev/kvm`**.
+* Without virtualization support, the box fails to start and raises a standard `RuntimeError` (the process stays alive and can be caught with try/except).
+
+A network hiccup during image pull also raises a `RuntimeError`, which can be caught and retried.
+
+## See also
+
+* [Box types](/manage-sandbox/sandbox-types) — Box types and lifecycle
+* [Compute resources](/manage-sandbox/compute-resources) — CPU / memory / disk resource configuration

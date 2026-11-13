@@ -1,0 +1,392 @@
+# Run any language / command
+Source: https://docs.boxlite.ai/agent-tools/code-execution-any-language
+
+Run any shell command or executable — in any language — inside a disposable microVM, and read back a structured stdout / stderr / exit code.
+
+`SimpleBox.exec()` moves the execute step wholesale into the sandbox, so an agent's `rm -rf` or unknown package install leaves the host untouched. Anything present in the image runs: `python`, `node`, `go run`, `bash`, your own binary.
+
+## Quick Example (minimal happy path)
+
+The snippet below runs as-is. It starts an Alpine box, runs one command, and reads the result back.
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+
+from boxlite import SimpleBox
+
+async def main() -> None:
+    # The box is created lazily: the microVM actually starts on entering async with
+    async with SimpleBox(image="alpine:latest") as box:
+        # cmd is the program name; *args are its arguments
+        result = await box.exec("echo", "Hello from BoxLite!")
+
+        print("stdout:", result.stdout.strip())
+        print("stderr:", result.stderr.strip())
+        print("exit_code:", result.exit_code)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        # No virtualization / image pull failure raises a standard RuntimeError (see Troubleshooting)
+        print(f"BoxLite failed to run: {e}")
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { SimpleBox } from "@boxlite-ai/boxlite";
+
+async function main(): Promise<void> {
+  const box = new SimpleBox({ image: "alpine:latest" });
+  try {
+    // exec(cmd, ...args)
+    const result = await box.exec("echo", "Hello from BoxLite!");
+    console.log("stdout:", result.stdout.trim());
+    console.log("exitCode:", result.exitCode); // note the camelCase exitCode
+  } catch (err) {
+    console.error("BoxLite failed to run:", err);
+  } finally {
+    await box.stop(); // release resources (auto_remove defaults to true)
+  }
+}
+
+main();
+```
+
+To run a different language, change the program name. For example, have an agent run a piece of Python it generated (this variant has no separate Node translation — the pattern is identical, only the program name and arguments change):
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+
+from boxlite import SimpleBox
+
+async def main() -> None:
+    # Run any language: if the image has python you can exec python; node/go/bash work the same way
+    async with SimpleBox(image="python:alpine") as box:
+        agent_code = "import sys; print(sys.version.split()[0])"
+        result = await box.exec("python", "-c", agent_code)
+
+        if result.exit_code == 0:
+            print("Python version in box:", result.stdout.strip())
+        else:
+            # Note: a non-zero exit code does *not* raise; you must check exit_code
+            print("Command failed:", result.stderr.strip())
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        print(f"BoxLite failed to run: {e}")
+```
+
+***
+
+## Common Usage
+
+### Set environment variables, working directory, and run user
+
+Environment variables use a **dict** (not a list) and are injected for this `exec` call:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+
+from boxlite import SimpleBox
+
+async def main() -> None:
+    async with SimpleBox(image="python:alpine") as box:
+        # env uses a dict; user has the form "<name|uid>[:<group|gid>]", like docker exec --user
+        result = await box.exec(
+            "env",
+            env={"FOO": "bar", "BAZ": "qux"},  # must be a dict
+            cwd="/tmp",                          # working directory inside the container
+            user="nobody",                       # run as non-root
+        )
+        # The env command output contains only the injected variables (FOO/BAZ), not PWD.
+        # To confirm cwd took effect, run pwd separately (see below); it returns /tmp.
+        for line in result.stdout.splitlines():
+            if line.startswith(("FOO=", "BAZ=")):
+                print(line)
+        # Run pwd separately to confirm cwd
+        pwd = await box.exec("pwd", cwd="/tmp", user="nobody")
+        print("cwd:", pwd.stdout.strip())  # -> /tmp
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        print(f"BoxLite failed to run: {e}")
+```
+
+### Streaming / incremental output collection
+
+`SimpleBox.exec` already collects stdout and stderr concurrently internally (to avoid the deadlock of a full pipe buffer) and returns them together when done. If you want **truly line-by-line streaming** (consume output while it runs), drill down to the lower-level `Box` (the `SimpleBox` internal handle `box._box`) to get the async iterator streams of an `Execution`:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+
+from boxlite import SimpleBox
+
+async def main() -> None:
+    async with SimpleBox(image="alpine:latest") as box:
+        # Drill down to the underlying native Box handle for true streaming reads
+        native_box = box._box
+        # Native Box.exec: the parameter is named timeout_secs (not timeout)
+        execution = await native_box.exec(
+            "sh",
+            ["-c", "for i in 1 2 3; do echo line-$i; sleep 1; done"],
+            timeout_secs=30.0,
+        )
+
+        stdout = execution.stdout()  # async iterator
+        if stdout is not None:
+            async for chunk in stdout:
+                text = chunk.decode("utf-8", "replace") if isinstance(chunk, bytes) else chunk
+                print("streamed:", text.rstrip())
+
+        result = await execution.wait()  # get the exit code
+        print("exit_code:", result.exit_code)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        print(f"BoxLite failed to run: {e}")
+```
+
+> Note: `box._box` is an SDK-internal handle; the leading underscore signals "not public, but stable to use". For most cases, `await box.exec(...)` and its aggregated result are enough; drill down to `Execution` only when you need to consume output as it runs (long-running task progress, log following).
+
+### Timeout control
+
+`SimpleBox.exec`'s timeout parameter is **`timeout` (float, seconds)**. A timeout does not raise a Python exception; the process is killed with SIGTERM and returns a **negative exit code** (`-15`, that is `-SIGTERM`) — check `exit_code` (negative / non-zero means it was killed). On this path, `error_message` is `None`; to detect a timeout, inspect `exit_code`:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+
+from boxlite import SimpleBox
+
+async def main() -> None:
+    async with SimpleBox(image="alpine:latest") as box:
+        # Set a 2-second timeout on a long-running command
+        result = await box.exec("sleep", "10", timeout=2.0)
+        # After ~2 seconds the process is terminated by SIGTERM; exit_code is -15 (negative = killed by signal).
+        print("exit_code:", result.exit_code)        # -15 (terminated by the timeout SIGTERM)
+        # On the timeout path, error_message is None.
+        # To detect a timeout, check that exit_code is negative / non-zero.
+        print("error_message:", result.error_message)  # None
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        print(f"BoxLite failed to run: {e}")
+```
+
+> Naming reminder: the wrapper-layer `SimpleBox.exec` uses `timeout` (float); the lower-level native `Box.exec` uses `timeout_secs` (see the streaming example above); `CodeBox.run` uses `timeout` (int).
+
+***
+
+### Harden the box for untrusted code
+
+The microVM boundary is always on. Two further knobs narrow what the code inside can reach — tighten the OS-level sandbox around the VM, and restrict where it can talk to.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+from boxlite import NetworkSpec, OutboundNetworkSpec, SecurityOptions, SimpleBox
+from boxlite import AdvancedBoxOptions
+
+async def main():
+    try:
+        async with SimpleBox(
+            image="python:slim",
+            # Tightest OS-level sandbox: jailer + seccomp + rlimits
+            advanced=AdvancedBoxOptions(security=SecurityOptions.maximum()),
+            # Only these hosts resolve; everything else is DNS-sinkholed
+            network=NetworkSpec(outbound=OutboundNetworkSpec(mode="enabled", allow_net=["pypi.org", "files.pythonhosted.org"])),
+        ) as box:
+            result = await box.exec("python", "-c", "print('hello from a locked-down box')")
+            print(result.stdout, result.exit_code)
+    except RuntimeError as exc:
+        print(f"sandbox error: {exc}")
+
+asyncio.run(main())
+```
+
+| Goal | Pass this | Notes |
+| - | - | - |
+| Tightest OS-level sandbox | `advanced=AdvancedBoxOptions(security=SecurityOptions.maximum())` | Presets are `development()` / `standard()` / `maximum()`. There is no `minimum()` |
+| No network at all | `network=NetworkSpec(outbound=OutboundNetworkSpec(mode="disabled"))` | The box gets no network interface |
+| Allow specific hosts only | `network=NetworkSpec(outbound=OutboundNetworkSpec(mode="enabled", allow_net=[...]))` | `mode` is required; an empty `allow_net` means allow all |
+
+> `security=` is not a top-level keyword — passing it directly raises `TypeError: BoxOptions.__new__() got an unexpected keyword argument 'security'`. It must be wrapped in `advanced=AdvancedBoxOptions(security=...)`.
+
+Details: [Secrets and hardening](/manage-sandbox/secrets-and-security) and [Network access](/manage-sandbox/network-access).
+
+## Parameters and Returns
+
+### `SimpleBox.exec(cmd, *args, env=None, user=None, timeout=None, cwd=None)`
+
+Source: `SimpleBox.exec` in `sdks/python/boxlite/simplebox.py`
+
+| Parameter | Type | Required | Description |
+| - | - | - | - |
+| `cmd` | `str` | Yes | The program name to run, such as `"ls"`, `"python"`, `"node"`, `"bash"` |
+| `*args` | `str...` | No | Arguments passed to the program, such as `"-l"`, or `"-c", "..."` |
+| `env` | `dict[str, str]` | No | Environment variables for this execution; **must be a dict** (converted internally to a list for the native layer). Defaults to the container's default environment |
+| `user` | `str` | No | Run user, in the form `<name\|uid>[:<group\|gid>]`, such as `"nobody"`, `"1000:1000"`. Defaults to the image's configured user |
+| `timeout` | `float` (seconds) | No | Execution timeout; no timeout by default. A timeout does not raise; the process is killed and returns a non-zero exit code |
+| `cwd` | `str` | No | Working directory inside the container; defaults to the container's configured workdir |
+
+Returns `ExecResult` (a dataclass, `ExecResult` in `sdks/python/boxlite/exec.py`):
+
+| Field | Type | Description |
+| - | - | - |
+| `exit_code` | `int` | Process exit code. **A non-zero value does not raise** — check it yourself. When killed by a signal (such as the timeout SIGTERM) it is **negative** (timeout = `-15`); when the SDK's internal wait fails it is `-1` |
+| `stdout` | `str` | Standard output (aggregated and decoded) |
+| `stderr` | `str` | Standard error (aggregated and decoded) |
+| `error_message` | `str \| None` | Non-`None` only when the SDK's internal wait / spawn fails; `None` on both the timeout (SIGTERM) path and normal exit. To detect a timeout, check for a negative `exit_code` |
+
+### Node equivalent: `SimpleBox.exec(...)`
+
+Source: `sdks/node/lib/simplebox.ts`. Three overloads:
+
+| Call form | Description |
+| - | - |
+| `exec(cmd, ...args)` | Program name plus string arguments only |
+| `exec(cmd, args: string[], env: Record<string,string>)` | Explicit argument array + environment variables |
+| `exec(cmd, args, env?, options?: { cwd?; user?; timeoutSecs?; })` | Full form; the **timeout field is `timeoutSecs`** (different from the Python name) |
+
+Returns `ExecResult = { exitCode: number; stdout: string; stderr: string }` (**camelCase** `exitCode`). Node's `env` is also an object, `Record<string,string>`, not an array.
+
+***
+
+## Troubleshooting
+
+### Passing `env` as a list -> `AttributeError` / wrong behavior
+
+`SimpleBox.exec(env=...)` expects a **dict**; internally it converts via `env.items()` (simplebox.py:220). Passing a list errors at the `.items()` call.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Wrong: env passed as a list
+await box.exec("env", env=[("FOO", "bar")])   # a list has no .items()
+
+# Correct: env passed as a dict
+await box.exec("env", env={"FOO": "bar"})      # ok
+```
+
+> Note the distinction: the `SimpleBox(...)` constructor's box-level `env=` takes a list of tuples (for example `env=[("USER","alice")]`); whereas **`exec(env=...)` takes a dict**. The two layers differ — don't mix them up.
+
+### A command failed but raised nothing
+
+A non-zero exit code from `exec` **does not** raise — this is by design (so an agent can self-check and decide based on it). Always check `exit_code`:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+result = await box.exec("false")          # exit code 1, but does not raise
+if result.exit_code != 0:
+    print("command failed:", result.stderr)
+```
+
+Node behaves the same: `await box.exec("false")` returns `{ exitCode: 1 }` and does not reject.
+
+### Missing command / image pull failure -> standard `RuntimeError` / bare `Error` (not `BoxliteError`)
+
+A missing command or an image pull failure raises a standard `RuntimeError` (Python) / bare `Error` (Node), not `BoxliteError`. See [Error Handling](/guides/error-handling#troubleshooting).
+
+### Writing to `/tmp`, `/dev/shm` (tmpfs) and then not finding it
+
+This is unrelated to `exec` but often shows up alongside it: `copy_in` to a tmpfs mount point (the same limitation as `docker cp`) may not be readable afterward. To get a file into `/tmp`, pipe a tar through exec, or write to a non-tmpfs path. See [Moving files without a mount](/manage-sandbox/volumes#moving-files-without-a-mount).
+
+### Don't pack arguments into one string
+
+`exec("ls -l /")` looks for `"ls -l /"` as a **single program name** and will fail. Split it into `exec("ls", "-l", "/")`, or go through a shell explicitly: `exec("sh", "-c", "ls -l /")`.
+
+### Environment constraint: hardware virtualization required
+
+Each BoxLite box is a microVM and needs underlying virtualization:
+
+* Linux: requires KVM (`/dev/kvm` available); WSL2 needs KVM and the user in the `kvm` group.
+* macOS arm64: uses Apple's Hypervisor.framework and needs **no `/dev/kvm`**. macOS Intel is not supported.
+* Environments without virtualization (most CI containers) -> the box fails to start and raises a standard `RuntimeError` (the process does not crash; it can be caught).
+
+***
+
+## A tour: shell command and CodeBox side by side
+
+Moved here from the section index, which is now a summary and an index.
+
+The most fundamental agent tool is **exec** — running a command inside the sandbox and reading the result. Both snippets below run as-is.
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+from boxlite import SimpleBox, CodeBox
+
+async def main():
+    # ---- 1. Run an arbitrary shell command (the most general agent tool) ----
+    try:
+        # auto_remove=True is the wrapper-layer default: cleaned up on exiting async with
+        async with SimpleBox(image="alpine:latest") as box:
+            # exec takes (command, *args); returns ExecResult
+            result = await box.exec("echo", "hello from an agent")
+
+            # Important: a non-zero exit code does NOT raise; you must check exit_code
+            if result.exit_code != 0:
+                print("command failed:", result.stderr)
+            else:
+                print("stdout:", result.stdout.strip())
+    except RuntimeError as e:
+        # Image pull failure / no virtualization raises a standard RuntimeError (not BoxliteError)
+        print("startup or pull failed:", e)
+
+    # ---- 2. Run agent-generated Python code (CodeBox defaults to python:slim) ----
+    try:
+        async with CodeBox() as code_box:
+            # run() executes a code string and returns stdout (str)
+            generated_code = "print(sum(range(1, 11)))"
+            output = await code_box.run(generated_code)
+            print("code output:", output.strip())
+    except RuntimeError as e:
+        print("CodeBox failed:", e)
+
+asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// The package name is @boxlite-ai/boxlite (not 'boxlite', not '@boxlite/sdk')
+import { SimpleBox, CodeBox } from "@boxlite-ai/boxlite";
+
+async function main(): Promise<void> {
+  // ---- 1. Run an arbitrary shell command ----
+  try {
+    // await using: cleaned up automatically at end of scope per autoRemove (default true)
+    await using box = new SimpleBox({ image: "alpine:latest" });
+
+    const result = await box.exec("echo", "hello from an agent");
+
+    if (result.exitCode !== 0) {
+      console.error("command failed:", result.stderr);
+    } else {
+      console.log("stdout:", result.stdout.trim());
+    }
+  } catch (e) {
+    console.error("failed:", e);
+  }
+
+  // ---- 2. Run agent-generated code (CodeBox image defaults to python:slim) ----
+  try {
+    await using codeBox = new CodeBox();
+    const output = await codeBox.run("print(sum(range(1, 11)))");
+    console.log("code output:", output.trim());
+  } catch (e) {
+    console.error("CodeBox failed:", e);
+  }
+}
+
+main();
+```
+
+***
+
+## Related pages
+
+* [Agent Tools overview](/agent-tools/index)
+* [Runtime / lifecycle for running commands](/manage-sandbox/lifecycle)
+* [Custom resources / configuration (cpus / memory / env)](/manage-sandbox/environment)
+* [Secrets and security options](/manage-sandbox/secrets-and-security)

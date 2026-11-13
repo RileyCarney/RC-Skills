@@ -1,0 +1,584 @@
+# FAQ
+Source: https://docs.boxlite.ai/faq
+
+Short answers to what teams ask most when adopting BoxLite, with copy-runnable snippets.
+
+Every code block here is checked against the SDK, so pasting one will not land you in the classic wrong-package-name or wrong-field-name traps.
+
+## General Questions
+
+### What is BoxLite, and how is it different from Docker?
+
+BoxLite runs each sandbox as a separate microVM with its own kernel, embedded directly in your process — no daemon, no root. Docker shares the host kernel via namespaces/cgroups and needs a daemon.
+
+| Aspect | BoxLite | Docker |
+| - | - | - |
+| Isolation | Hardware microVM (separate kernel) | Container (shared kernel) |
+| Daemon | None (embedded library) | Requires daemon |
+| Root/sudo | Not required | Typically required |
+| Best for | Untrusted code, AI agents, embedded sandboxing | App deployment, CI/CD |
+| Startup (cached image) | \~1-2s | \~100-500ms |
+
+Choose BoxLite when you need hardware-level isolation for untrusted or agent-generated code without standing up infrastructure.
+
+### Do I need root or sudo?
+
+No. On macOS the virtualization stack is available to all users. On Linux you only need access to `/dev/kvm`, granted via group membership:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+sudo usermod -aG kvm $USER
+# Log out and back in (or `newgrp kvm`) for the change to take effect.
+```
+
+### Which platforms are supported?
+
+| Platform | Status |
+| - | - |
+| macOS ARM64 (Apple Silicon) | Supported |
+| Linux x86_64 | Supported |
+| Linux ARM64 | Supported |
+| Windows (WSL2 + KVM) | Supported |
+| macOS Intel | Not supported |
+
+Native Windows (without WSL2) is not supported.
+
+### What Python / Node versions are required?
+
+* Python **3.10+** (`python --version`).
+* Node.js **18+** (the package is ESM-only).
+
+### How do I check my installed version?
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Python
+import boxlite
+print(boxlite.__version__)  # prints the latest published version
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// Node — version comes from the package metadata
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+console.log(require("@boxlite-ai/boxlite/package.json").version);
+```
+
+## Configuration & Resources
+
+### How much memory does a box use, and what's the default?
+
+When you do not pass `memory_mib`/`cpus`, the wrapper forwards an **unset** value (`None`), and the actual VM allocation is decided by the libkrun runtime, **not** by the SDK constants. The runtime's own fallback is host-derived and can be larger than any of the SDK constants below.
+
+Each SDK also exports its own `DEFAULT_MEMORY_MIB` / `DEFAULT_CPUS` constants, but these are **not** the effective default — the wrappers do not substitute them when the value is unset, so don't rely on them:
+
+| SDK constant | `DEFAULT_MEMORY_MIB` | `DEFAULT_CPUS` |
+| - | - | - |
+| Python (`boxlite.constants`) | 1024 | 1 |
+| Node (`@boxlite-ai/boxlite` constants) | 512 | 1 |
+| Rust core (`constants.rs`) | 1024 | 1 |
+
+The safest approach is to always set resources explicitly:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Python — explicit resource sizing
+import asyncio
+from boxlite import SimpleBox, BoxliteError
+
+async def main() -> None:
+    try:
+        async with SimpleBox(
+            image="python:slim",
+            memory_mib=2048,  # MiB
+            cpus=4,
+        ) as box:
+            result = await box.exec("nproc")
+            print("cpus visible to guest:", result.stdout.strip())
+    except (BoxliteError, RuntimeError) as exc:
+        print(f"error: {exc}")
+
+asyncio.run(main())
+```
+
+### How do I mount a host directory into the box?
+
+Use the `volumes` parameter. The third element of each tuple is a **boolean `read_only`** (`True` = read-only, `False` = read-write) — **not** the string `"ro"`/`"rw"`. A 2-tuple defaults to read-write.
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Python — mount host dir read-only via SimpleBox(volumes=...)
+import asyncio
+from pathlib import Path
+from boxlite import SimpleBox, BoxliteError
+
+HOST_DIR = "<YOUR_PATH>"  # <-- replace with an absolute host directory
+
+async def main() -> None:
+    Path(HOST_DIR).mkdir(parents=True, exist_ok=True)
+    try:
+        # SimpleBox forwards volumes/secrets/advanced to BoxOptions, and its
+        # exec() takes varargs and returns an ExecResult (with .stdout / .exit_code).
+        async with SimpleBox(
+            image="alpine:latest",
+            volumes=[
+                (HOST_DIR, "/mnt/data", True),  # True = read-only
+                # (HOST_DIR, "/mnt/rw"),        # 2-tuple = read-write
+            ],
+        ) as box:
+            result = await box.exec("ls", "-la", "/mnt/data")
+            print(result.stdout)
+    except (BoxliteError, RuntimeError) as exc:
+        print(f"error: {exc}")
+
+asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// Node — readOnly is a boolean field on each volume entry
+import { SimpleBox } from "@boxlite-ai/boxlite";
+
+async function main(): Promise<void> {
+  try {
+    await using box = new SimpleBox({
+      image: "alpine:latest",
+      volumes: [
+        { hostPath: "<YOUR_PATH>", guestPath: "/mnt/data", readOnly: true },
+      ],
+    });
+    const result = await box.exec("ls", "-la", "/mnt/data");
+    console.log(result.stdout);
+  } catch (err) {
+    console.error("error:", err);
+  }
+}
+
+main();
+```
+
+> Why `SimpleBox` and not `runtime.create(opts)` here? `runtime.create()` returns the
+> **native** `Box`, whose `exec(command, args_list)` takes args as a **list** and returns a
+> streaming `Execution` (you then `await execution.wait()` for `exit_code`; stdout/stderr stream
+> off the `Execution`). The convenient `exec(cmd, *args) -> ExecResult` shown throughout this page
+> is the **`SimpleBox`/`CodeBox`** wrapper API. Don't mix the two: `nativeBox.exec("ls", "-la", "/x")`
+> raises `TypeError: argument 'args': Can't extract 'str' to 'Vec'`, and the returned `Execution`
+> has no `.exit_code` / `.stdout`.
+
+### How do I expose ports from a box?
+
+Use `ports`. Each entry is `(host_port, guest_port, protocol)` in Python or an object in Node. A `host_port` of `0`/omitted means "same as guest port".
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Python — publish guest port 80 on host port 8080
+from boxlite import BoxOptions
+
+opts = BoxOptions(
+    image="nginx:alpine",
+    ports=[(8080, 80, "tcp")],  # host 8080 -> guest 80
+)
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// Node — ports use {hostPort?, guestPort, protocol?}
+import { SimpleBox } from "@boxlite-ai/boxlite";
+
+const box = new SimpleBox({
+  image: "nginx:alpine",
+  ports: [{ hostPort: 8080, guestPort: 80, protocol: "tcp" }],
+});
+```
+
+### How do I pass secrets into a box?
+
+Secrets are the Vault entry point. Pass `Secret` objects via `BoxOptions(secrets=[...])`.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Python — inject a secret value scoped to specific hosts
+import asyncio
+from boxlite import SimpleBox, Secret, BoxliteError
+
+async def main() -> None:
+    try:
+        async with SimpleBox(
+            image="alpine:latest",
+            secrets=[
+                Secret(
+                    name="API_TOKEN",
+                    value="<YOUR_API_KEY>",  # <-- replace
+                    hosts=["api.example.com"],
+                    placeholder="{{API_TOKEN}}",
+                ),
+            ],
+        ) as box:
+            result = await box.exec("true")
+            print("exit_code:", result.exit_code)
+    except (BoxliteError, RuntimeError) as exc:
+        print(f"error: {exc}")
+
+asyncio.run(main())
+```
+
+### How do I enable stronger isolation / security?
+
+Security options go through `advanced`. There is **no top-level `security=` keyword** on `BoxOptions`, and `AdvancedBoxOptions` is exported at the top level: `from boxlite import AdvancedBoxOptions`.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Python — maximum isolation preset
+import asyncio
+from boxlite import SimpleBox, SecurityOptions, BoxliteError
+from boxlite import AdvancedBoxOptions
+
+async def main() -> None:
+    try:
+        async with SimpleBox(
+            image="alpine:latest",
+            advanced=AdvancedBoxOptions(
+                security=SecurityOptions.maximum(),
+            ),
+        ) as box:
+            result = await box.exec("id")
+            print(result.stdout.strip())
+    except (BoxliteError, RuntimeError) as exc:
+        print(f"error: {exc}")
+
+asyncio.run(main())
+```
+
+## Lifecycle & Inspection
+
+### How do I list, inspect, and remove boxes?
+
+These are **runtime** methods — `list_info()` (not `list()`) and `remove(id_or_name, force=False)`. There is no `box.remove()`.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Python — enumerate, inspect, and clean up
+import asyncio
+from boxlite import Boxlite, BoxliteError
+
+async def main() -> None:
+    try:
+        with Boxlite.default() as runtime:
+            # list_info() and remove() are async runtime methods — await them.
+            for info in await runtime.list_info():
+                # BoxInfo.state is a BoxStateInfo; its field is .status (a string).
+                print(info.id, info.state.status, info.image)
+                await runtime.remove(info.id, force=True)
+    except (BoxliteError, RuntimeError) as exc:
+        print(f"error: {exc}")
+
+asyncio.run(main())
+```
+
+### How do I read a box's state and metrics?
+
+`box.info()` is **async** — `await` it. State lives in `info().state.status`. Metric field names are `memory_bytes` and `cpu_percent` (not `memory_usage_bytes` / `cpu_time_ms`).
+
+> Note: `metrics()` lives on the **native** `Box` (the object returned by `runtime.create(opts)`),
+> not on the `SimpleBox`/`CodeBox` wrappers — `SimpleBox` exposes `info()` but **not** `metrics()`
+> (`AttributeError: 'SimpleBox' object has no attribute 'metrics'`). Use the native box for metrics.
+> On the native box, `exec(command, args_list)` returns an `Execution`; `await execution.wait()`
+> yields an `ExecResult` carrying only `exit_code` / `error_message` (stdout/stderr stream off the
+> `Execution`). both `info()` and `metrics()` are async.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Python — both info() and metrics() are async on the native Box
+import asyncio
+from boxlite import Boxlite, BoxOptions, BoxliteError
+
+async def main() -> None:
+    try:
+        # Boxlite runtime is a SYNCHRONOUS context manager.
+        with Boxlite.default() as runtime:
+            box = await runtime.create(BoxOptions(image="alpine:latest"))  # async — await it
+            try:
+                async with box:  # Box is an ASYNC context manager
+                    execution = await box.exec("true")  # native exec -> Execution
+                    await execution.wait()              # ensure the command ran
+
+                    info = await box.info()  # async — await it
+                    print("status:", info.state.status)
+
+                    metrics = await box.metrics()  # async
+                    if metrics.memory_bytes is not None:
+                        print(f"memory: {metrics.memory_bytes / 1024**2:.1f} MiB")
+                    if metrics.cpu_percent is not None:
+                        print(f"cpu: {metrics.cpu_percent:.1f}%")
+            finally:
+                # `async with box` already auto-removes on exit (auto_remove
+                # defaults to True), so a follow-up remove() may report
+                # "box not found" — that is expected, not an error.
+                try:
+                    await runtime.remove(box.id, force=True)  # async — await it
+                except RuntimeError:
+                    pass
+    except (BoxliteError, RuntimeError) as exc:
+        print(f"error: {exc}")
+
+asyncio.run(main())
+```
+
+### How do I see runtime-wide metrics (e.g. how many boxes are running)?
+
+The field is `num_running_boxes` (not `active_boxes`).
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Python — runtime metrics
+import asyncio
+from boxlite import Boxlite, BoxliteError
+
+async def main() -> None:
+    try:
+        # Boxlite is a SYNCHRONOUS context manager, but metrics() is async.
+        with Boxlite.default() as runtime:
+            m = await runtime.metrics()  # async — await it
+            print("running:", m.num_running_boxes)
+            print("created total:", m.boxes_created_total)
+            print("failed total:", m.boxes_failed_total)
+            print("commands executed:", m.total_commands_executed)
+            print("exec errors:", m.total_exec_errors)
+    except (BoxliteError, RuntimeError) as exc:
+        print(f"error: {exc}")
+
+asyncio.run(main())
+```
+
+### How do I set an execution timeout?
+
+The parameter name differs by layer:
+
+| Call | Parameter | Type |
+| - | - | - |
+| `SimpleBox.exec(...)` (Python) | `timeout` | `float` (seconds) |
+| `CodeBox.run(...)` (Python) | `timeout` | `int` (accepted but not enforced) |
+| native `Box.exec(...)` (Python) | `timeout_secs` | `float` |
+| `SimpleBox.exec(...)` (Node) | `options.timeoutSecs` | `number` |
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Python — SimpleBox.exec timeout (seconds, float); env is a dict
+import asyncio
+from boxlite import SimpleBox, BoxliteError
+
+async def main() -> None:
+    try:
+        async with SimpleBox(image="alpine:latest") as box:
+            result = await box.exec(
+                "sh", "-c", "echo $GREETING",
+                env={"GREETING": "hi"},  # dict, NOT a list
+                timeout=30.0,            # seconds
+            )
+            print(result.stdout.strip())
+    except (BoxliteError, RuntimeError) as exc:
+        print(f"error: {exc}")
+
+asyncio.run(main())
+```
+
+## Networking
+
+### Do boxes have internet access?
+
+Yes, by default. Outbound HTTP/HTTPS, DNS, and arbitrary TCP/UDP work out of the box.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Python — verify outbound connectivity
+import asyncio
+from boxlite import SimpleBox, BoxliteError
+
+async def main() -> None:
+    try:
+        async with SimpleBox(image="alpine:latest") as box:
+            result = await box.exec(
+                "wget", "-qO-", "https://api.github.com/zen", timeout=30.0
+            )
+            print(result.stdout.strip() if result.exit_code == 0 else result.stderr)
+    except (BoxliteError, RuntimeError) as exc:
+        print(f"error: {exc}")
+
+asyncio.run(main())
+```
+
+### Can I restrict which hosts a box can reach?
+
+Yes, via `NetworkSpec`. The default is "enabled with an empty egress allowlist", which permits general egress. To lock it down, list allowed hosts.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Python — restrict egress to an allowlist
+from boxlite import BoxOptions, NetworkSpec, OutboundNetworkSpec
+
+# OutboundNetworkSpec(mode, allow_net=[]): `mode` is REQUIRED ("enabled" or "disabled").
+# mode="enabled" with a non-empty allow_net = only those hosts are reachable.
+opts = BoxOptions(
+    image="alpine:latest",
+    network=NetworkSpec(outbound=OutboundNetworkSpec(mode="enabled", allow_net=["api.github.com"])),
+)
+```
+
+### Can two boxes talk to each other directly?
+
+No. Boxes are isolated. Share data through host volumes, expose a port and connect through the host, or use an external service (Redis/DB) both can reach.
+
+## Troubleshooting
+
+### `TypeError: 'str' object cannot be cast as 'bool'` when mounting a volume
+
+A volume's third element is the boolean `read_only`; the strings `"ro"`/`"rw"` are CLI-only and raise `TypeError` here. See [Volumes](/manage-sandbox/volumes#troubleshooting).
+
+The CLI is the only place that uses `:ro`/`:rw` strings (`-v host:box:ro`); that is the CLI parser, not the SDK API.
+
+### `AttributeError: module 'boxlite' has no attribute 'AdvancedBoxOptions'`
+
+`AdvancedBoxOptions` lives in the `boxlite.boxlite` submodule, not the top level — see [Inject secrets and harden a box](/manage-sandbox/secrets-and-security#troubleshooting).
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Wrong
+# from boxlite import AdvancedBoxOptions   # AttributeError
+
+# Right
+from boxlite import AdvancedBoxOptions
+```
+
+Also note `SecurityOptions` (with presets `development()/standard()/maximum()`) **is** at the top level; only `AdvancedBoxOptions` lives in `boxlite.boxlite`.
+
+### `AttributeError` on `memory_usage_bytes` / `active_boxes` / `box.info().status`
+
+These names changed (or never existed). Use the real ones:
+
+| Wrong | Right |
+| - | - |
+| `metrics.memory_usage_bytes` | `metrics.memory_bytes` |
+| `metrics.cpu_time_ms` | `metrics.cpu_percent` |
+| `runtime.metrics().active_boxes` | `runtime.metrics().num_running_boxes` |
+| `box.info().status` | `box.info().state.status` |
+| `runtime.list()` | `runtime.list_info()` |
+| `box.remove()` | `runtime.remove(id, force=True)` |
+
+### `await box.info()` raises / behaves oddly
+
+`info()` is async in every SDK — `await` it. In Node both `info()` and `getInfo()` return a Promise.
+
+### A failing command did not raise an exception
+
+`exec()` does **not** raise on a non-zero exit code — it returns a result with `exit_code != 0` (Python) / `exitCode !== 0` (Node). Check it yourself. Truly broken invocations behave differently:
+
+* A missing command or image pull failure surfaces as a builtin `RuntimeError` (Python) or a bare `Error` (Node) — **not** a `BoxliteError` subclass. Catch the standard exception too.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+result = await box.exec("false")
+assert result.exit_code != 0      # no exception was raised
+```
+
+### Wrong package name on Node
+
+The npm package is `@boxlite-ai/boxlite`. `import { Boxlite } from "boxlite"` or `from "@boxlite/sdk"` will fail — both the package name and the class name are wrong. The runtime class is `JsBoxlite`; for everyday use prefer the `SimpleBox` / `CodeBox` wrappers.
+
+### "Image pull failed" / network errors during startup
+
+First runs pull the image and can take 5-30s; transient network issues surface as a `RuntimeError`. Retry, verify the image reference (`python:slim`, not `python/slim`), and authenticate for private registries.
+
+### "Timeout waiting for guest ready" on Linux / WSL2
+
+Your shell cannot open `/dev/kvm` (often `root:kvm` mode `660` and your user not in the `kvm` group):
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+sudo usermod -aG kvm $USER
+# WSL2: restart with `wsl.exe --shutdown` from PowerShell, or `newgrp kvm`.
+python3 -c "open('/dev/kvm','rb').close(); print('kvm ok')"
+```
+
+### Ubuntu 24.04: box only starts with `sudo`
+
+Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor but doesn't ship the `bwrap-userns-restrict` profile (Ubuntu 25.04+ does). Diagnose and pick a fix:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+dmesg | grep apparmor   # look for DENIED ... comm="bwrap"
+aa-status | grep bwrap
+```
+
+Quick (less secure) workaround:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+echo "kernel.apparmor_restrict_unprivileged_userns=0" | \
+  sudo tee /etc/sysctl.d/99-boxlite-userns.conf
+```
+
+Or, in a development environment where you do not need full sandbox isolation, relax the security preset:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+from boxlite import BoxOptions, SecurityOptions
+from boxlite import AdvancedBoxOptions
+
+opts = BoxOptions(
+    image="alpine:latest",
+    advanced=AdvancedBoxOptions(security=SecurityOptions.development()),
+)
+```
+
+### Environment requirement: no virtualization available
+
+BoxLite needs hardware virtualization. On Linux that means KVM; on macOS the built-in virtualization stack (no `/dev/kvm` required); on Windows, WSL2 with KVM. Without it, box startup fails — the exception is catchable and your process stays alive, but the box cannot run.
+
+## Getting Help
+
+If this page did not answer your question, the project is developed in the open on GitHub:
+
+* [GitHub Issues](https://github.com/boxlite-ai/boxlite/issues) — bug reports and feature requests.
+* [GitHub Discussions](https://github.com/boxlite-ai/boxlite/discussions) — questions and community support.
+
+Before opening an issue or a discussion, work through this checklist so the report is actionable:
+
+1. Re-read this FAQ for an existing answer.
+2. Search existing [issues](https://github.com/boxlite-ai/boxlite/issues) and [discussions](https://github.com/boxlite-ai/boxlite/discussions) — your question may already be answered.
+3. Reproduce with debug logging enabled: `RUST_LOG=debug python your_script.py`.
+4. Include the following in your report:
+   * BoxLite version: `python -c "import boxlite; print(boxlite.__version__)"`.
+   * Platform: `uname -a` (and Python/Node version where relevant).
+   * A minimal reproduction and the full error message / stack trace.
+
+## Is it working? A 20-second check
+
+The fastest "is it working?" check. Run a command in a throwaway sandbox and print the result.
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Python — requires: pip install boxlite
+import asyncio
+from boxlite import SimpleBox, BoxliteError
+
+async def main() -> None:
+    try:
+        # SimpleBox is an async context manager; the box is created on enter.
+        async with SimpleBox(image="alpine:latest") as box:
+            result = await box.exec("echo", "hello from boxlite")
+            # exec() does NOT raise on non-zero exit — always check exit_code.
+            if result.exit_code != 0:
+                print(f"command failed ({result.exit_code}): {result.stderr}")
+            else:
+                print(result.stdout.strip())
+    except BoxliteError as exc:
+        print(f"BoxLite error: {exc}")
+    except RuntimeError as exc:
+        # Image pull / virtualization failures surface as builtin RuntimeError.
+        print(f"runtime error (image pull or virtualization?): {exc}")
+
+asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// Node — requires: npm install @boxlite-ai/boxlite
+import { SimpleBox } from "@boxlite-ai/boxlite";
+
+async function main(): Promise<void> {
+  try {
+    // `await using` disposes the box automatically on scope exit.
+    await using box = new SimpleBox({ image: "alpine:latest" });
+    const result = await box.exec("echo", "hello from boxlite");
+    // exec() does NOT throw on non-zero exit — check exitCode yourself.
+    if (result.exitCode !== 0) {
+      console.error(`command failed (${result.exitCode}): ${result.stderr}`);
+    } else {
+      console.log(result.stdout.trim());
+    }
+  } catch (err) {
+    // Missing commands / pull failures may surface as a bare Error.
+    console.error("boxlite error:", err);
+  }
+}
+
+main();
+```

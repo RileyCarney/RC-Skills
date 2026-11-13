@@ -1,0 +1,181 @@
+# Compute resources
+Source: https://docs.boxlite.ai/manage-sandbox/compute-resources
+
+Allocate CPU (cpus), memory (memory_mib), and disk (disk_size_gb) so a workload is neither starved nor wasteful.
+
+A test suite needs CPU, a large build needs disk, a long-lived service needs stable memory. Set all three explicitly in production rather than relying on defaults.
+
+## Quick Example
+
+The following uses Python to create a sandbox with **2 cores / 1024 MiB of memory / 8 GB of disk** and prints the configuration that actually takes effect.
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Python 3.10+; requires pip install boxlite
+import asyncio
+from boxlite import SimpleBox
+
+async def main() -> None:
+    try:
+        # SimpleBox is an async context manager; the sandbox is only created and started on entry
+        async with SimpleBox(
+            image="alpine:latest",
+            cpus=2,            # 2 vCPUs
+            memory_mib=1024,   # 1024 MiB of memory
+            # disk_size_gb is not a direct SimpleBox parameter;
+            # it is passed through to the underlying BoxOptions via **kwargs (see notes below)
+            disk_size_gb=8,    # 8 GB disk
+        ) as box:
+            # a non-zero exit code does not raise; check exit_code yourself
+            result = await box.exec("nproc")
+            print("vCPU:", result.stdout.strip())
+
+            mem = await box.exec("sh", "-c", "free -m | awk '/Mem:/{print $2}'")
+            print("Memory (MiB):", mem.stdout.strip())
+
+            # busybox df: use -h for human-readable total (alpine lacks GNU df's -BG)
+            disk = await box.exec("sh", "-c", "df -h / | awk 'NR==2{print $2}'")
+            print("Disk:", disk.stdout.strip())
+    except RuntimeError as exc:
+        # no virtualization / image pull failure raises a standard RuntimeError
+        print("startup failed:", exc)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// Node 18+; requires npm install @boxlite-ai/boxlite
+import { SimpleBox } from "@boxlite-ai/boxlite";
+
+async function main(): Promise<void> {
+  try {
+    // SimpleBox supports await using (asyncDispose); cleanup happens automatically on leaving scope
+    await using box = new SimpleBox({
+      image: "alpine:latest",
+      cpus: 2, // 2 vCPUs
+      memoryMib: 1024, // 1024 MiB of memory
+      diskSizeGb: 8, // 8 GB disk
+    });
+
+    const result = await box.exec("nproc");
+    console.log("vCPU:", result.stdout.trim());
+  } catch (err) {
+    // no virtualization / missing command throws a standard Error (not necessarily BoxliteError)
+    console.error("startup failed:", err);
+  }
+}
+
+main();
+```
+
+## Parameters and Returns
+
+### Resource parameters (core)
+
+| Parameter | Python (`SimpleBox` / `BoxOptions`) | Node (`SimpleBoxOptions`) | Type | Required | Description |
+| - | - | - | - | - | - |
+| CPU cores | `cpus` | `cpus` | Integer (Rust `u8`, max 255) | Optional | Number of vCPUs allocated to the sandbox |
+| Memory | `memory_mib` | `memoryMib` | Integer (MiB, Rust `u32`) | Optional | Memory limit, in **MiB** (not bytes, not MB) |
+| Disk | `disk_size_gb` | `diskSizeGb` | Integer (GB, Rust `u64`) | Optional | Sandbox root disk size, in **GB** |
+
+> `SimpleBox` exposes `cpus` / `memory_mib` (Python) / `cpus` / `memoryMib` (Node) directly. Python's `disk_size_gb` is not an explicit `SimpleBox` parameter but is forwarded through `**kwargs` to the underlying `BoxOptions` (which explicitly supports `disk_size_gb`). Node's `SimpleBoxOptions` includes `diskSizeGb` explicitly.
+
+### Defaults
+
+When `cpus` / `memory_mib` are not specified, the VM is provisioned with **1 vCPU / 1024 MiB**. Both values come from one place — `vm_defaults::DEFAULT_CPUS` / `DEFAULT_MEMORY_MIB` in `src/boxlite/src/runtime/constants.rs` — which the VM engine and the stored box config both read, so `box.info()` and the real allocation agree. To confirm the resources from inside the Box, query `nproc` (CPU) and `MemTotal` from `/proc/meminfo` (memory).
+
+When `disk_size_gb` is not specified, the disk is sparse and grows on demand (default cap 10 GB).
+
+> **Practical advice: for predictability and cost control, always set `cpus` / `memory_mib` / `disk_size_gb` explicitly in production; do not rely on implicit defaults.**
+
+### Specialized Box resource defaults (reference)
+
+Some specialized sandboxes have their own higher resource defaults that override the general defaults above:
+
+| Box type | CPU default | Memory default (MiB) | Disk default (GB) | Evidence |
+| - | - | - | - | - |
+| `ComputerBox` | 2 | 2048 | — (general default 10) | `COMPUTERBOX_CPUS`/`COMPUTERBOX_MEMORY_MIB` in `sdks/node/lib/constants.ts`, `sdks/python/boxlite/constants.py` |
+| `SkillBox` | — (inherits the general default) | 4096 | 10 | `SKILLBOX_*` in `sdks/node/lib/constants.ts`, `SkillBox.__init__` in `sdks/python/boxlite/skillbox.py` (`SKILLBOX_MEMORY_MIB`/`SKILLBOX_DISK_SIZE_GB`) |
+| `BrowserBox` | 2 | 2048 | — (general default 10) | `BrowserBoxOptions` in `sdks/python/boxlite/browserbox.py` (`BrowserBoxOptions.cpu=2` / `memory=2048`) |
+| `CodeBox` | — (general default) | — (general default) | — (general default 10) | `sdks/python/boxlite/codebox.py` — passes `cpus` / `memory_mib` through unchanged, so the general defaults above apply |
+
+> The `DEFAULT_CPUS` / `DEFAULT_MEMORY_MIB` constants exported by the Python and Node SDKs are reference values only — they are not applied on the box-creation path, and the Node one does not match the runtime. Treat `src/boxlite/src/runtime/constants.rs` as the single source of truth.
+
+### Return value
+
+`SimpleBox.exec(...)` returns an `ExecResult`:
+
+| Field | Type | Description |
+| - | - | - |
+| `exit_code` / `exitCode` | Integer | Command exit code; a non-zero value **does not raise**, check it yourself |
+| `stdout` | String | Standard output |
+| `stderr` | String | Standard error |
+| `error_message` (Python) | String \| None | Non-`None` only when the process died abnormally |
+
+## Troubleshooting
+
+### How much is allocated when cpus/memory are not passed (1 vCPU / 1024 MiB)
+
+Symptom: you need to confirm how much a sandbox actually gets when `cpus` / `memory_mib` / `memoryMib` are not passed.
+
+Explanation: when not passed, the VM is provisioned with **1 vCPU / 1024 MiB**. To query the resources from inside the Box, read `nproc` (CPU) and `MemTotal` from `/proc/meminfo` (memory). See the "Defaults" subsection above.
+
+Fix: for deterministic resources, **specify the parameters explicitly**; production code should not rely on implicit defaults:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Python: explicit specification, deterministic result (does not rely on any implicit default)
+import asyncio
+from boxlite import SimpleBox
+
+async def main() -> None:
+    try:
+        async with SimpleBox(image="alpine:latest", cpus=2, memory_mib=1024) as box:
+            print((await box.exec("nproc")).stdout.strip())
+    except RuntimeError as exc:
+        print("startup failed:", exc)
+
+asyncio.run(main())
+```
+
+### Unit confusion (MB vs MiB, bytes vs MiB)
+
+Symptom: you want to allocate 2 GB of memory but write `memory_mib=2000000000` (filling in bytes), so the requested amount far exceeds the host and startup fails.
+
+Cause: `memory_mib` is in **MiB**, and `disk_size_gb` is in **GB**.
+
+Fix: write 2 GB of memory as `memory_mib=2048`; write 10 GB of disk as `disk_size_gb=10`.
+
+### CPU count exceeds 255
+
+Symptom:
+
+* The SDK (Python/Node) passing `cpus=300` raises `OverflowError` directly when constructing `BoxOptions` (Python: `out of range integral type conversion attempted`), because the field is `u8` on the Rust side.
+* The CLI passing `--cpus 300` does not error; it prints a warning (`CPU limit capped at 255`) and truncates the value to 255.
+
+Cause: the CPU count is `u8` (max 255) on the Rust side. The SDK path overflows during the PyO3/napi integer conversion; the CLI path explicitly applies `min(255)` and warns in the `cpus > 255` guard in `src/cli/src/cli.rs`.
+
+Fix: use a reasonable core count (typically 1-8), not exceeding the host's physical cores, and not exceeding 255.
+
+### Startup fails in a no-virtualization environment
+
+Symptom: creating a sandbox in a Linux container/CI without KVM raises a `RuntimeError` (Python) or a bare `Error` (Node).
+
+Cause: BoxLite is a microVM and requires hardware virtualization. Linux requires `/dev/kvm`, macOS (Apple Silicon) uses Hypervisor.framework, and Windows requires WSL2 + KVM.
+
+Fix: confirm the environment supports virtualization; in CI, enable nested virtualization or use a KVM-capable runner. Catch with `try/except` (Python) / `try/catch` (Node); the process does not crash, only that sandbox fails to start.
+
+### A process is killed due to insufficient resources
+
+Symptom: a build/test running inside the sandbox suddenly exits, with a non-zero `exit_code` or a non-empty `error_message`.
+
+Cause: `memory_mib` is set too small, triggering OOM.
+
+Fix: raise `memory_mib` (e.g. 2048-4096 for building a large project), and check `ExecResult.exit_code` / `error_message` rather than assuming the command succeeded — **a non-zero exec exit does not raise**.
+
+### An image pull failure mistaken for a resource error
+
+Symptom: creating a sandbox for the first time errors with a message related to networking/images.
+
+Cause: the first run pulls the image over the network, and network flakiness raises a standard `RuntimeError` (Python) / a bare `Error` (Node), **not** a `BoxliteError`.
+
+Fix: catch the standard exception and retry; pulling the image ahead of time reduces first-create latency.

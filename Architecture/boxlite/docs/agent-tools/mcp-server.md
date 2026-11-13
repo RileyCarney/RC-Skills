@@ -1,0 +1,121 @@
+# Wrap a sandbox as an MCP tool handler
+Source: https://docs.boxlite.ai/agent-tools/mcp-server
+
+Expose sandboxed command execution to any Model Context Protocol (MCP) client by wrapping BoxLite in a small MCP server of your own.
+
+You write the MCP server; BoxLite supplies the sandbox behind it. An MCP tool handler calls `SimpleBox.exec(...)` and returns the result — nothing in the pattern is BoxLite-specific except the two lines that start the box.
+
+## Quick Example
+
+This is the sandbox half — the function you register as an MCP tool. It is complete and runnable on its own.
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+
+from boxlite import SimpleBox, BoxliteError
+
+async def run_in_sandbox(command: str, *args: str) -> dict:
+    """Run one command in an isolated sandbox and return a serializable result."""
+    try:
+        # auto_remove=True tears the box down on exit; image is required
+        async with SimpleBox(image="alpine:latest", auto_remove=True) as box:
+            result = await box.exec(command, *args, timeout=30.0)
+            # A non-zero exit code does NOT raise — return it as data
+            return {
+                "exit_code": result.exit_code,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }
+    except BoxliteError as exc:
+        # Wrapper-layer errors (e.g. ExecError) subclass BoxliteError
+        return {"error": str(exc)}
+    except RuntimeError as exc:
+        # Image pull failures and missing virtualization surface as RuntimeError
+        return {"error": f"runtime failure: {exc}"}
+
+async def main() -> None:
+    print(await run_in_sandbox("echo", "hello from the box"))
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { BoxliteError, SimpleBox } from "@boxlite-ai/boxlite";
+
+interface RunResult {
+  exitCode?: number;
+  stdout?: string;
+  stderr?: string;
+  error?: string;
+}
+
+// Run one command in an isolated sandbox and return a serializable result.
+async function runInSandbox(command: string, ...args: string[]): Promise<RunResult> {
+  try {
+    // autoRemove: true tears the box down on exit; image is required
+    await using box = new SimpleBox({ image: "alpine:latest", autoRemove: true });
+    const result = await box.exec(command, args, {}, { timeoutSecs: 30 });
+    // A non-zero exit code does NOT throw — return it as data
+    return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+  } catch (err) {
+    if (err instanceof BoxliteError) {
+      // Wrapper-layer errors (e.g. ExecError) subclass BoxliteError
+      return { error: err.message };
+    }
+    // Image pull failures and missing virtualization surface as a standard Error
+    return { error: `runtime failure: ${err instanceof Error ? err.message : err}` };
+  }
+}
+
+async function main(): Promise<void> {
+  console.log(await runInSandbox("echo", "hello from the box"));
+}
+
+main();
+```
+
+Verified: real run prints `{ exitCode: 0, stdout: 'hello from the box\n', stderr: '' }`.
+
+To make it an actual MCP tool, register it with a standalone MCP framework — for example `FastMCP` from the official `mcp` Python package, installed separately. The full build, including a client that performs the handshake, is in the use cases: [Expose a sandbox as an MCP tool](/use-cases/mcp-tool-server).
+
+## Parameters and Returns
+
+The MCP layer has no BoxLite-specific parameters. The table below covers the `SimpleBox.exec` surface used above so this page stands alone.
+
+| Parameter | Required | Type | Notes |
+| - | - | - | - |
+| `image` (constructor) | Yes (or `rootfs_path`) | `str` | Container image to boot, e.g. `"alpine:latest"` |
+| `auto_remove` (constructor) | No | `bool` | Default `True`. Remove the box on exit |
+| `cmd` (first arg to `exec`) | Yes | `str` | Executable to run |
+| `*args` | No | `str` | Command arguments |
+| `timeout` | No | `float` | Seconds. `SimpleBox.exec` uses `timeout`; the native `Box.exec` uses `timeout_secs` |
+| `env` | No | `dict[str, str]` | A **dict**, not a list |
+
+`exec` returns an `ExecResult`:
+
+| Field | Type | Notes |
+| - | - | - |
+| `exit_code` | `int` | A non-zero value does **not** raise — check it yourself |
+| `stdout` | `str` | Captured standard output |
+| `stderr` | `str` | Captured standard error |
+| `error_message` | `str \| None` | Set only when the process died abnormally |
+
+## Related capability: MCP inside the box
+
+`SkillBox` starts the in-box Claude CLI with an MCP config file, so the *agent inside the sandbox* can talk to MCP servers. That path configures the agent, not a host-side endpoint — see [Run Claude Code](/agent-in-box/run-claude-code).
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| - | - | - |
+| `ModuleNotFoundError: No module named 'boxlite.mcp'` | The MCP layer lives in your own code, not in the SDK | Use your MCP framework and wrap `SimpleBox.exec` as shown above |
+| The tool returned `exit_code: 1` with no exception | `exec` does not raise on a non-zero exit | Inspect `result.exit_code` and pass it back to the client |
+| `RuntimeError` instead of `BoxliteError` | Missing virtualization or an image pull failure | Catch `RuntimeError` separately and retry |
+| `Error: Cannot find module '@boxlite-ai/boxlite'` (Node) | Wrong package name | The Node package is `@boxlite-ai/boxlite`, not `boxlite` |
+
+## Related
+
+* [Expose a sandbox as an MCP tool](/use-cases/mcp-tool-server) — the end-to-end build with a real client handshake.
+* [Run Python code in a box](/agent-tools/code-execution-python) — the execution primitives behind the tools.
+* [Secrets and hardening](/manage-sandbox/secrets-and-security) — inject an MCP server's API key safely.

@@ -1,0 +1,298 @@
+# Run untrusted code on BoxLite Cloud
+Source: https://docs.boxlite.ai/cloud/quickstart
+
+Create an API key, point the SDK at BoxLite Cloud, and run a command inside a hardware-isolated box — no local virtualization, no daemon, three steps.
+
+BoxLite Cloud runs your boxes on BoxLite's own resource pool, so the machine that calls the API needs nothing but a URL and an API key. Untrusted code still lands inside a microVM with hardware-level isolation — you no longer operate the hypervisor underneath it.
+
+## Prerequisites
+
+| Prerequisite | Notes |
+| - | - |
+| A BoxLite Cloud account | Sign in to the console at `https://app.boxlite.ai`. |
+| An API key | Created in the console — step 1 below. |
+| Python 3, Node, or `curl` + `jq` | Whichever tab you follow in step 3. |
+
+**1. Create an API key**
+
+In the console, open **API Keys** and click **Create Key**. Give it a name such as `sdk-quickstart` and leave **Expires** at its default of `No expiration` while you are exploring.
+
+The key looks like `blk_live_...` and is shown in full exactly once, at creation. Copy it then — the list view only ever shows a masked form afterwards. A key grants access to the Boxes API: it can create and manage boxes, and shared Linux base images are available to it automatically.
+
+For key rotation, per-environment keys, and the CLI credential store, see [API keys and authentication](/cloud/api-keys).
+
+**2. Install the SDK or CLI**
+
+> [tab] Python
+>
+> ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> pip install boxlite
+> ```
+
+> [tab] Node
+>
+> ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> npm install @boxlite-ai/boxlite tsx
+> ```
+>
+> The Node client construction for Cloud is shown in [Give the key to your code](/cloud/api-keys#give-the-key-to-your-code).
+
+> [tab] CLI
+>
+> ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> curl -fsSL https://sh.boxlite.ai | sh
+> ```
+
+> [tab] REST (curl)
+>
+> ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> # The REST tab needs no SDK — only curl and jq
+> curl --version
+> jq --version
+> ```
+
+Then export your credentials. Read the key interactively so it never lands in your shell history:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+read -rs BOXLITE_API_KEY   # prompts without echoing; paste your blk_live_... key
+export BOXLITE_API_KEY
+export BOXLITE_REST_URL="https://api.boxlite.ai"
+```
+
+**3. Create a box and run code in it**
+
+> [tab] Python
+>
+> ```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> # cloud_quickstart.py — create a box on BoxLite Cloud, run a command, tear it down
+> # Run: python cloud_quickstart.py
+> import asyncio
+> import os
+> import time
+>
+> from boxlite import (
+>     ApiKeyCredential,
+>     Boxlite,
+>     BoxOptions,
+>     BoxliteRestOptions,
+> )
+>
+> api_key = os.environ.get("BOXLITE_API_KEY")
+> if not api_key:
+>     raise SystemExit("Set BOXLITE_API_KEY to your blk_live_... key before running this.")
+>
+>
+> async def main() -> None:
+>     # Boxlite.rest(...) is a synchronous constructor; every runtime method below is awaited
+>     rt = Boxlite.rest(
+>         BoxliteRestOptions(
+>             url=os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
+>             credential=ApiKeyCredential(api_key),
+>         )
+>     )
+>
+>     box = None
+>     try:
+>         # name is an argument of rt.create(), not a field of BoxOptions
+>         box = await rt.create(
+>             BoxOptions(image="ghcr.io/boxlite-ai/boxlite-agent-base:v0.1.0"),
+>             name=f"sdk-quickstart-python-{int(time.time())}",
+>         )
+>         await box.start()
+>         print(f"Created box: {box.id}")
+>
+>         # Over REST, exec takes the command plus an args list
+>         execution = await box.exec("echo", args=["Hello from BoxLite SDK"])
+>
+>         output = ""
+>         async for line in execution.stdout():
+>             output += line
+>
+>         result = await execution.wait()
+>         print(f"Exit code: {result.exit_code}")
+>         print(output)
+>     except Exception as exc:
+>         # Authentication failures, network errors and creation failures all surface here
+>         print(f"Cloud run failed: {exc!r}")
+>     finally:
+>         # Teardown lives on the runtime. Putting it in finally means a failure above
+>         # cannot leave a box running and billing.
+>         if box is not None:
+>             await rt.remove(box.id, force=True)
+>             print(f"Removed {box.id}")
+>
+>
+> if __name__ == "__main__":
+>     asyncio.run(main())
+> ```
+
+> [tab] Node
+>
+> ```typescript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> // cloud_quickstart.ts — create a box on BoxLite Cloud, run a command, tear it down
+> // Run: npx tsx cloud_quickstart.ts
+> import {
+>   ApiKeyCredential,
+>   BoxliteRestOptions,
+>   JsBoxlite,
+> } from "@boxlite-ai/boxlite";
+>
+> async function main(): Promise<void> {
+>   const apiKey = process.env.BOXLITE_API_KEY;
+>   if (!apiKey) {
+>     throw new Error("Set BOXLITE_API_KEY to your blk_live_... key before running this.");
+>   }
+>
+>   // JsBoxlite.rest(...) is a synchronous constructor; every runtime method below is awaited
+>   const rt = JsBoxlite.rest(
+>     new BoxliteRestOptions({
+>       url: process.env.BOXLITE_REST_URL ?? "https://api.boxlite.ai",
+>       credential: new ApiKeyCredential(apiKey),
+>     }),
+>   );
+>
+>   let boxId: string | null = null;
+>   try {
+>     // The box name is the second argument of create(), not a field of the options object
+>     const box = await rt.create(
+>       { image: "ghcr.io/boxlite-ai/boxlite-agent-base:v0.1.0" },
+>       `sdk-quickstart-node-${Math.floor(Date.now() / 1000)}`,
+>     );
+>     boxId = box.id;
+>     await box.start();
+>     console.log(`Created box: ${box.id}`);
+>
+>     // Over REST, exec takes the command plus an args array
+>     const execution = await box.exec("echo", ["Hello from BoxLite SDK"]);
+>
+>     // A stream is consumed once; iterate until next() returns null
+>     const stdout = await execution.stdout();
+>     let output = "";
+>     while (true) {
+>       const line = await stdout.next();
+>       if (line === null) break;
+>       output += line;
+>     }
+>
+>     const result = await execution.wait();
+>     console.log(`Exit code: ${result.exitCode}`);
+>     console.log(output);
+>   } catch (err) {
+>     // Authentication failures, network errors and creation failures all surface here
+>     console.error("Cloud run failed:", err);
+>   } finally {
+>     // Teardown lives on the runtime, so a failure above cannot leave a box running
+>     if (boxId !== null) {
+>       await rt.remove(boxId, true);
+>       console.log(`Removed ${boxId}`);
+>     }
+>     rt.close();
+>   }
+> }
+>
+> main();
+> ```
+>
+> Two call shapes differ from Python: `exec` takes its argument list positionally (`box.exec("echo", ["hi"])`), and a stdout stream is pulled with `next()` until it returns `null` rather than iterated with `for await`. Field names are camelCase throughout — `result.exitCode`, and `diskSizeGb` / `memoryMib` on the options object.
+
+> [tab] CLI
+>
+> ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> # One disposable box, one command, automatic teardown.
+> # --rm removes the box once the command exits.
+> boxlite run --rm --name "sdk-quickstart-cli-$(date +%s)" \
+>   ghcr.io/boxlite-ai/boxlite-agent-base:v0.1.0 \
+>   echo "Hello from BoxLite CLI"
+> ```
+>
+> `boxlite` talks to Cloud whenever REST configuration is present in the environment, which the `BOXLITE_REST_URL` and `BOXLITE_API_KEY` exports from step 2 provide. The CLI exit code is the exit code of the command you ran. To store credentials once instead of exporting them per shell, see [API keys and authentication](/cloud/api-keys#persist-credentials-for-the-cli).
+
+> [tab] REST (curl)
+>
+> ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> #!/usr/bin/env bash
+> # cloud_quickstart.sh — create a box on BoxLite Cloud, run a command, tear it down
+> set -euo pipefail
+>
+> BOXLITE_REST_URL="${BOXLITE_REST_URL:-https://api.boxlite.ai}"
+> : "${BOXLITE_API_KEY:?Set BOXLITE_API_KEY to your blk_live_... key before running this}"
+>
+> auth=(-H "Authorization: Bearer ${BOXLITE_API_KEY}")
+> json=(-H "Content-Type: application/json")
+> name="sdk-quickstart-rest-$(date +%s)"
+>
+> # Create — the response carries the new box in the box_id field
+> box_id="$(curl -fsS -X POST "${BOXLITE_REST_URL}/v1/boxes" \
+>   "${auth[@]}" "${json[@]}" \
+>   -d "{\"name\":\"${name}\",\"image\":\"ghcr.io/boxlite-ai/boxlite-agent-base:v0.1.0\"}" \
+>   | jq -r '.box_id')"
+> echo "Created box: ${box_id}"
+>
+> # Remove the box on any exit, so a failure below cannot leave it running
+> trap 'curl -fsS -X DELETE "${BOXLITE_REST_URL}/v1/boxes/${box_id}?force=true" "${auth[@]}" >/dev/null' EXIT
+>
+> curl -fsS -X POST "${BOXLITE_REST_URL}/v1/boxes/${box_id}/start" "${auth[@]}"
+>
+> # Exec — the response carries the execution in the execution_id field
+> exec_id="$(curl -fsS -X POST "${BOXLITE_REST_URL}/v1/boxes/${box_id}/exec" \
+>   "${auth[@]}" "${json[@]}" \
+>   -d '{"command":"echo","args":["Hello from BoxLite REST"]}' \
+>   | jq -r '.execution_id')"
+>
+> # Read the execution record back
+> curl -fsS "${BOXLITE_REST_URL}/v1/boxes/${box_id}/executions/${exec_id}" "${auth[@]}"
+> ```
+>
+> Run it with `bash cloud_quickstart.sh`. Every path is relative to `BOXLITE_REST_URL`, so the create call above resolves to `https://api.boxlite.ai/v1/boxes`.
+
+## What just happened
+
+The five calls in that script are the whole Cloud lifecycle. Every language binding and the REST API expose the same five, in the same order:
+
+1. **Authenticate.** `Boxlite.rest(...)` wraps your key in an `ApiKeyCredential` and points every later call at `https://api.boxlite.ai`. Nothing is sent at construction time — the object is just a configured client.
+2. **Create.** `rt.create(BoxOptions(image=...), name=...)` allocates a box from a shared Linux base image and returns a handle. On Cloud the box is already running by the time this returns — `POST /v1/boxes` answers with `status: running`, and reading the box back before any other call reports the same.
+3. **Start.** `box.start()` is what boots the microVM on a self-hosted runtime. On Cloud the box is up already, so the call confirms that state rather than changing it: it is safe to repeat, and returns the box still `running`. Keeping it in the script is what lets the same five calls run against either runtime.
+4. **Exec.** `box.exec("echo", args=[...])` launches one process inside the VM and hands you an execution handle. `execution.wait()` blocks until that process exits and returns its exit code.
+5. **Remove.** `rt.remove(box.id, force=True)` destroys the box and its disk. Removal is a **runtime** method, not a box method — the box handle you hold is a pointer, and the runtime owns the fleet.
+
+Step 5 is the one to internalize. A box you forget to remove keeps running, and a running box is what BoxLite Cloud charges for — see [What a box costs](/cloud/box-costs). Putting teardown in a `finally` block, as the script above does, is the difference between an exception costing you a stack trace and an exception costing you a box.
+
+## Expected output
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+Created box: <box-id>
+Exit code: 0
+Hello from BoxLite SDK
+Removed <box-id>
+```
+
+The `Exit code` line comes from `execution.wait()` and is the authoritative success signal. The `Hello from BoxLite SDK` line is what the box wrote to stdout, collected by iterating `execution.stdout()`.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| - | - | - |
+| `401 Unauthorized` on the first call | The key is missing, mistyped, or was deleted in the console. | Confirm the value starts with `blk_live_` and matches a live key in **API Keys**. See [API keys and authentication](/cloud/api-keys#troubleshooting). |
+| `SystemExit: Set BOXLITE_API_KEY ...`, or the CLI uses your local runtime instead of Cloud | The key never reached the process — a new shell, a different terminal tab, or a service manager that does not inherit your exports. | Re-run the `read -rs` and `export` pair from step 2 in that shell. For anything long-lived, store the credential with `boxlite auth login` instead of exporting it. |
+| A box from an earlier run is still listed as running | The script exited before teardown — an exception outside `try`, a `Ctrl-C`, or a crash. | Remove it explicitly with `await rt.remove("<BOX_ID_OR_NAME>", force=True)` (CLI: `boxlite rm`), then move teardown into a `finally` block as shown above. |
+| A long job stops part-way through with no error from your code | The box was stopped for being idle, and work running *inside* the box does not count as activity. | Adjust **STOP WHEN IDLE** when you create the box in the console — see [Stop when idle](/cloud/box-lifecycle#stop-when-idle). |
+| `execution.stdout()` finishes without yielding lines | Streamed output is a separate channel from the exit code. Only `execution.wait()` is guaranteed to report the process result. | Treat `result.exit_code` as the success signal and collect output as a bonus. When you need output you can depend on, redirect it to a file in the box and read the file back. |
+| An HTML page comes back instead of JSON, and the status is `200` | The base URL points at the console host `https://app.boxlite.ai` instead of the API host. The console answers unrecognised paths with the dashboard page, so a wrong base URL returns markup rather than an error. | Set `BOXLITE_REST_URL` to exactly `https://api.boxlite.ai`. |
+
+## Next steps
+
+> [card] [Boxes](/cloud/boxes)
+>
+> Pick an image and a size, and learn the three lifecycle controls Cloud applies while a box runs.
+
+> [card] [Volumes](/cloud/volumes)
+>
+> Storage that outlives a box, so the next box can mount it and read the data back.
+
+> [card] [Plans, wallet, and usage](/cloud/billing)
+>
+> What a running box costs against your included quota and wallet, plus the per-box ceilings.
+
+> [card] [Cloud vs open source](/cloud/vs-opensource)
+>
+> Every difference between a self-hosted box and a Cloud box, in one table.

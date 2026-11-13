@@ -1,0 +1,691 @@
+# Python SDK reference
+Source: https://docs.boxlite.ai/reference/python
+
+Complete class / method / parameter / return / exception reference. All signatures and defaults follow the latest published BoxLite source (pip install boxlite; check the installed version with pip show boxlite).
+
+Optional extras:
+
+| Extra | Install |
+| - | - |
+| Sync API | `pip install "boxlite[sync]"` (depends on greenlet) |
+| Orchestration API | `pip install "boxlite[orchestration]"` (depends on cloudpickle) |
+
+## What the Python SDK gives you
+
+The BoxLite Python SDK lets you run any command, Python code, browser session, or desktop session inside an isolated microVM sandbox in a few lines of code, combining Docker-like ergonomics with VM-level isolation boundaries. This page is the authoritative, user-facing **API reference** — use it to look up how a class is constructed, what parameters a method accepts, what it returns, and which exceptions it may raise.
+
+Typical use cases: running untrusted code, giving an AI agent a disposable execution environment, isolating CI jobs, and automating a browser or desktop.
+
+## Quick Example (minimal happy path)
+
+The following can be copied and run directly. `SimpleBox` is the recommended entry path and supports lazy creation and automatic cleanup.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# pip install boxlite
+import asyncio
+
+from boxlite import SimpleBox, ExecError
+
+async def main() -> None:
+    try:
+        # The sandbox is created and started only when entering the async with block
+        async with SimpleBox(image="alpine:latest") as box:
+            result = await box.exec("echo", "hello from boxlite")
+            # A non-zero exit code does not raise; check exit_code yourself
+            if result.exit_code != 0:
+                raise ExecError("echo", result.exit_code, result.stderr)
+            print(result.stdout.strip())  # -> hello from boxlite
+    except RuntimeError as e:
+        # Environment issues such as image pull failure / missing virtualization raise a standard RuntimeError
+        print(f"box failed to start: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+## Parameters & Returns (core API reference)
+
+### Package entry and exports
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import boxlite
+
+print(boxlite.__version__)  # reads importlib.metadata.version("boxlite")
+```
+
+The main symbols importable via the top-level `from boxlite import ...`:
+
+| Category | Symbols |
+| - | - |
+| Runtime / options (native PyO3) | `Boxlite`, `Options`, `BoxOptions`, `ImageRegistry`, `NetworkSpec`, `SecurityOptions`, `Secret`, `BoxliteRestOptions`, `ApiKeyCredential`, `AccessToken`, `Credential` |
+| Box handle / execution (native) | `Box`, `Execution`, `ExecStdout`, `ExecStderr`, `BoxInfo`, `BoxStateInfo`, `BoxMetrics`, `RuntimeMetrics`, `HealthState`, `HealthStatus` |
+| High-level wrappers (Python layer) | `SimpleBox`, `CodeBox`, `BrowserBox`, `BrowserBoxOptions`, `ComputerBox`, `InteractiveBox`, `SkillBox`, `ExecResult` |
+| Exceptions | `BoxliteError`, `ExecError`, `TimeoutError`, `ParseError` |
+| Snapshot / export | `SnapshotHandle`, `SnapshotInfo`, `SnapshotOptions`, `CloneOptions`, `ExportOptions`, `CopyOptions`, `HealthCheckOptions` |
+
+> Note: `AdvancedBoxOptions` is exported at the top level — `from boxlite import AdvancedBoxOptions` (see [4.7 Security options](#security-options-securityoptions-advancedboxoptions)).
+
+### `Boxlite` (runtime handle)
+
+The runtime is responsible for creating, querying, and removing sandboxes. It is a **synchronous context manager** (`with`, not `async with`), but its **data methods are asynchronous** — `create` / `get` / `get_info` / `list_info` / `remove` / `metrics` / `shutdown` and similar return an `_asyncio.Future` and **must be awaited inside an event loop** (a plain `for info in runtime.list_info()` raises `RuntimeError: no running event loop`). Only `close()` releases the runtime synchronously.
+
+> Note: call `await runtime.list_info()` inside an `async def`. In addition, **only one runtime instance can exist for a given `BOXLITE_HOME` (default `~/.boxlite`) at a time** — constructing a second one (for example, calling `Boxlite.default()` and then `Boxlite(Options(...))` without first calling `close()` on the former) raises `RuntimeError: ... Another BoxliteRuntime is already using directory`.
+
+Constructors and factories:
+
+| Factory | Signature | Notes |
+| - | - | - |
+| Constructor | `Boxlite(options: Options)` | Custom runtime |
+| `Boxlite.default()` | `() -> Boxlite` | Default configuration (data directory `~/.boxlite`) |
+| `Boxlite.init_default(options)` | `(Options) -> Boxlite` | Initialize the global default runtime |
+| `Boxlite.rest(options)` | `(BoxliteRestOptions) -> Boxlite` | Connect to a remote BoxLite REST service |
+
+Instance methods:
+
+| Method | Signature | Returns | Notes |
+| - | - | - | - |
+| `create` | `(options: BoxOptions, name: str = None)` | `Box` | Create a new sandbox |
+| `get_or_create` | `(options: BoxOptions, name: str = None)` | `(Box, bool)` | Returns `(box, created)`; `created=False` means an existing sandbox with the same name was reused |
+| `get` | `(id_or_name: str)` | `Box \| None` | Reattach by ID or name |
+| `get_info` | `(id_or_name: str)` | `BoxInfo` | Query metadata for a single sandbox |
+| `list_info` | `(_state=None)` | `list[BoxInfo]` | List all sandboxes (newest first). **Not `list()`** |
+| `remove` | `(id_or_name: str, force: bool = False)` | `None` | Remove a sandbox. **Called on the runtime, not `box.remove()`** |
+| `import_box` | `(archive_path: str, name: str = None, *, untrusted: bool = False)` | `Box` | Import from an archive. Server implementations handling uploaded bytes must pass `untrusted=True`, which rejects host-only features and filesystem paths |
+| `metrics` | `()` | `RuntimeMetrics` | Runtime-level metrics |
+| `shutdown` | `(timeout: int = None)` | `None` | Graceful shutdown (None = 10s, -1 = wait indefinitely) |
+| `close` | `()` | `None` | Release the runtime |
+
+Property: `images` (image handle: `images.list()` / `images.pull(reference)`).
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+from boxlite import Boxlite, Options, ImageRegistry
+
+async def main() -> None:
+    # Note: data methods are async and must be awaited inside an event loop.
+    # Only one runtime can exist per BOXLITE_HOME at a time -- pick one of the two below; do not construct both.
+
+    # (A) Default runtime (data directory ~/.boxlite)
+    runtime = Boxlite.default()
+
+    # (B) Custom runtime + private registry (host without the http:// prefix);
+    #     to use this, comment out the default() above or call runtime.close() on it first.
+    # runtime = Boxlite(Options(
+    #     image_registries=[
+    #         ImageRegistry(
+    #             host="registry.example.com",
+    #             username="<YOUR_REGISTRY_USER>",     # TODO: replace
+    #             password="<YOUR_REGISTRY_PASSWORD>",  # TODO: replace
+    #         )
+    #     ]
+    # ))
+
+    try:
+        # List all sandboxes: list_info() is async and must be awaited;
+        # BoxInfo.state is a BoxStateInfo whose field name is status
+        for info in await runtime.list_info():
+            print(info.id, info.state.status)
+    except Exception as e:
+        print(f"runtime error: {e}")
+    finally:
+        runtime.close()  # close() is synchronous
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### `Options` (runtime configuration)
+
+`Options` configures the runtime itself (not an individual sandbox) and is passed to `Boxlite(...)` / `Boxlite.init_default(...)`.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+Options(home_dir=None, image_registries=[])
+```
+
+| Parameter | Type | Default | Notes |
+| - | - | - | - |
+| `home_dir` | `str \| None` | `~/.boxlite` | Base directory for all BoxLite runtime data. Passing a value overrides the runtime base directory in code; when `None`, the default applies (and the `BOXLITE_HOME` environment variable, if set, is honored). |
+| `image_registries` | `list[ImageRegistry]` | `[]` | Private registries to authenticate against and search for unqualified image references |
+
+The `home_dir` directory holds the on-disk state for the runtime:
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+~/.boxlite/
+├── images/   # OCI image cache (blobs, index.json)
+├── boxes/    # Per-box data (config.json, disk image)
+├── init/     # Shared guest rootfs
+├── logs/     # Runtime logs
+├── db/       # SQLite databases (boxes.db, images.db)
+└── lock      # Filesystem lock file
+```
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+from boxlite import Boxlite, Options
+
+async def main() -> None:
+    # Override the runtime base directory in code (takes precedence over the default ~/.boxlite).
+    runtime = Boxlite(Options(home_dir="/custom/path"))
+    try:
+        for info in await runtime.list_info():
+            print(info.id)
+    finally:
+        runtime.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+> `home_dir` set in `Options` takes precedence over the default location. The `BOXLITE_HOME` environment variable provides the same override without code changes; use one or the other.
+
+### `Box` (native sandbox handle, async context manager)
+
+`Box` is the low-level handle. It is an **async context manager** (`async with`); every method must be awaited, `info()` included.
+
+| Method | Signature | Notes |
+| - | - | - |
+| `start` / `stop` | `() -> None` | async; start is idempotent |
+| `exec` | `(command, args=None, env=None, tty=False, user=None, timeout_secs=None, cwd=None)` | async, returns `Execution`. **The timeout parameter is `timeout_secs`**; `env` is a `list[tuple[str,str]]` |
+| `copy_in` | `(host_path, container_dest, copy_options=None)` | async |
+| `copy_out` | `(container_src, host_dest, copy_options=None)` | async |
+| `clone_box` | `(*, options=None, name=None)` | async, returns a new `Box` |
+| `export` | `(*, options=None, dest)` | async |
+| `attach` | `(execution_id=None)` | async. **With no argument, attaches to the init session** — the `entrypoint + cmd` process — which is the only way to read its exit code. With an `execution_id`, reattaches to that exec session. Not available on `SimpleBox` or the sync API |
+| `info` | `() -> BoxInfo` | async — `await` it |
+| `metrics` | `() -> BoxMetrics` | async |
+
+Properties: `id`, `name`, `snapshot` (`SnapshotHandle`).
+
+> For most cases, prefer a high-level wrapper such as `SimpleBox` over the bare `Box`; the wrapper handles the env dict→list conversion, stdout/stderr collection, and timeout conversion automatically.
+
+### `BoxOptions` (sandbox configuration)
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+BoxOptions(
+    image=None, rootfs_path=None,
+    cpus=None, memory_mib=None, disk_size_gb=None,
+    working_dir=None, env=[], volumes=[], network=None, ports=[],
+    auto_remove=None, detach=None,
+    auto_stop=None, auto_delete=None, auto_resume=None,
+    entrypoint=None, cmd=None, user=None,
+    advanced=None, secrets=[],
+)
+```
+
+| Parameter | Type | Required | Default | Notes |
+| - | - | - | - | - |
+| `image` | `str` | one of image/rootfs_path | — | OCI image reference, e.g. `"alpine:latest"` |
+| `rootfs_path` | `str` | one of image/rootfs_path | — | Path to a local OCI image layout directory (the on-disk form of a container image); an alternative to `image` |
+| `cpus` | `int` | optional | `None` (see note) | Number of CPU cores. When unset, the runtime allocates 1 vCPU |
+| `memory_mib` | `int` | optional | `None` (see note) | Memory in MiB. When unset, the runtime allocates 1024 MiB |
+| `disk_size_gb` | `int` | optional | `None` | Persistent disk size (None = ephemeral) |
+| `working_dir` | `str` | optional | image config | Working directory inside the container |
+| `env` | `list[tuple[str,str]]` | optional | `[]` | Environment variables (list of (key, value) tuples) |
+| `volumes` | `list[tuple]` | optional | `[]` | Volume mounts; see [4.6](#volumes) |
+| `network` | `NetworkSpec` | optional | enabled, no outbound restriction | Network configuration |
+| `ports` | `list[tuple]` | optional | `[]` | Port forwarding `(host_port, guest_port, protocol)` |
+| `auto_remove` | `bool` | optional | `True` (in the high-level wrappers) | Auto-clean on stop |
+| `detach` | `bool` | optional | `False` | Survive parent-process exit |
+| `advanced` | `AdvancedBoxOptions` | optional | `None` | **Security / health-check container**; see [4.7](#security-options-securityoptions-advancedboxoptions) |
+| `secrets` | `list[Secret]` | optional | `[]` | Outbound HTTP(S) credential substitution; see [4.8](#secrets-vault) |
+
+> **On the `cpus` / `memory_mib` defaults**: when unset, the SDK passes `None` and the runtime applies **1 vCPU / 1024 MiB** (`vm_defaults` in `src/boxlite/src/runtime/constants.rs`). The module-level `DEFAULT_CPUS` / `DEFAULT_MEMORY_MIB` constants are reference values and are not applied on this path. Production code should pass these values explicitly. See [Compute resources](/manage-sandbox/compute-resources).
+
+`NetworkSpec`:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+from boxlite import NetworkSpec, OutboundNetworkSpec
+
+# Enable networking, allowing only the specified hosts
+network = NetworkSpec(outbound=OutboundNetworkSpec(mode="enabled", allow_net=["api.openai.com"]))
+# Fully disable networking (removes the guest network interface)
+network_off = NetworkSpec(outbound=OutboundNetworkSpec(mode="disabled"))
+```
+
+### Volumes
+
+The third element is a **bool `read_only`** (`True` = read-only / `False` = read-write), **not the string `"ro"` / `"rw"`**. A 2-tuple also works (defaults to read-write).
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+from boxlite import BoxOptions
+
+opts = BoxOptions(
+    image="alpine:latest",
+    volumes=[
+        ("/host/config", "/etc/app/config", True),   # read-only
+        ("/host/data", "/mnt/data", False),           # read-write
+        ("/host/cache", "/mnt/cache"),                 # 2-tuple = read-write by default
+    ],
+)
+```
+
+> The CLI's `-v host:box:ro` string syntax belongs to the CLI parsing layer and differs from the SDK's bool. Do not mix the two.
+
+### Security options (`SecurityOptions` + `AdvancedBoxOptions`)
+
+Security configuration is passed via the `advanced` parameter; there is **no** top-level `security=` keyword. `AdvancedBoxOptions` is only available under the `boxlite.boxlite` module.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+from boxlite import BoxOptions, SecurityOptions
+from boxlite import AdvancedBoxOptions
+
+opts = BoxOptions(
+    image="alpine:latest",
+    advanced=AdvancedBoxOptions(security=SecurityOptions.maximum()),
+)
+```
+
+`SecurityOptions` presets (staticmethods):
+
+| Preset | Notes |
+| - | - |
+| `SecurityOptions.development()` | Weakest isolation (for development) |
+| `SecurityOptions.standard()` | Standard isolation |
+| `SecurityOptions.maximum()` | Strongest isolation |
+
+> There is no `SecurityOptions.minimum()`; the weak preset is called `development()`.
+
+`AdvancedBoxOptions(security=None, health_check=None)` also accepts a `HealthCheckOptions`.
+
+### Secrets (vault)
+
+`secrets` is the real entry point for outbound credential substitution. For requests the sandbox sends to the specified `hosts`, BoxLite replaces `placeholder` with the real `value`, keeping plaintext credentials out of the sandbox filesystem.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+from boxlite import BoxOptions, Secret
+
+opts = BoxOptions(
+    image="alpine:latest",
+    secrets=[
+        Secret(
+            name="openai",
+            value="<YOUR_OPENAI_API_KEY>",   # TODO: replace
+            hosts=["api.openai.com"],
+            # placeholder defaults to "<BOXLITE_SECRET:openai>"
+        )
+    ],
+)
+```
+
+### `SimpleBox` (recommended entry, async context manager)
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+SimpleBox(
+    image=None, rootfs_path=None,
+    memory_mib=None, cpus=None,
+    runtime=None, name=None,
+    auto_remove=True, reuse_existing=False,
+    **kwargs,   # forwarded to BoxOptions: env, volumes, ports, working_dir, network, secrets...
+)
+```
+
+| Parameter | Type | Required | Default | Notes |
+| - | - | - | - | - |
+| `image` | `str` | one of image/rootfs_path | — | Image |
+| `rootfs_path` | `str` | one of image/rootfs_path | — | Path to a local OCI image layout directory (the on-disk form of a container image); an alternative to `image` |
+| `memory_mib` | `int` | optional | system default | Memory in MiB |
+| `cpus` | `int` | optional | system default | Number of CPU cores |
+| `runtime` | `Boxlite` | optional | global default | Runtime instance |
+| `name` | `str` | optional | `None` | Unique name |
+| `auto_remove` | `bool` | optional | `True` | Clean up on stop |
+| `reuse_existing` | `bool` | optional | `False` | Reuse instead of erroring when a same-named sandbox exists |
+
+> Validation on construction: at least one of `image` and `rootfs_path` must be provided, otherwise it raises `ValueError`. The sandbox is **created lazily** — create/start happens only when you enter the `async with`.
+
+Methods:
+
+| Method | Signature | Returns | Notes |
+| - | - | - | - |
+| `start` | `()` | `Self` | async, equivalent to entering the CM |
+| `exec` | `(cmd, *args, env=None, user=None, timeout=None, cwd=None)` | `ExecResult` | async. **The timeout parameter is `timeout` (float seconds)**; `env` takes a **dict** |
+| `copy_in` | `(host_path, container_dest, copy_options=None)` | — | async. `CopyOptions(recursive=True, overwrite=True, follow_symlinks=False)` |
+| `copy_out` | `(container_src, host_dest, copy_options=None)` | — | async. End `container_src` with `/.` for a directory's contents |
+| `stop` / `shutdown` | `()` | `None` | async (`shutdown` is an alias for `stop`) |
+| `info` | `() -> BoxInfo` | `BoxInfo` | async — `await` it |
+
+Properties: `id` (accessing before start raises `RuntimeError`), `created` (whether newly created; `None` before start).
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+from boxlite import SimpleBox, ExecError
+
+async def main() -> None:
+    try:
+        async with SimpleBox(image="python:slim", memory_mib=1024) as box:
+            result = await box.exec("python", "-c", "print('Hello!')")
+            print(result.stdout)       # "Hello!\n"
+            print(result.exit_code)    # 0
+
+            # Per-command options: env takes a dict, timeout is a float in seconds
+            result = await box.exec("env", env={"FOO": "bar"})
+            result = await box.exec("pwd", cwd="/tmp")
+            result = await box.exec("whoami", user="nobody")
+            result = await box.exec("sleep", "30", timeout=2.0)
+            if result.exit_code != 0:
+                raise ExecError("sleep", result.exit_code, result.stderr)
+    except RuntimeError as e:
+        print(f"box error: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### `CodeBox` (Python code execution, subclass of SimpleBox)
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+CodeBox(image="python:slim", memory_mib=None, cpus=None, runtime=None, **kwargs)
+```
+
+Default image `python:slim`. Additional methods:
+
+| Method | Signature | Returns | Notes |
+| - | - | - | - |
+| `run` | `(code: str, timeout: int = None)` | `str` (stdout) | async. Internally runs `/usr/local/bin/python -c <code>`. **`timeout` is accepted but not enforced** |
+| `run_script` | `(script_path: str)` | `str` | async, reads a host script and runs it |
+| `install_package` | `(package: str)` | `str` | async, `pip install` output |
+| `install_packages` | `(*packages: str)` | `str` | async |
+
+> Also inherits all of `SimpleBox`'s exec/copy/start/stop/info. `CodeBox.run`'s `timeout` is an `int`, whereas `SimpleBox.exec`'s `timeout` is a `float` (inconsistent name/type).
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+from boxlite import CodeBox
+
+async def main() -> None:
+    try:
+        async with CodeBox() as cb:
+            await cb.install_package("requests")
+            out = await cb.run(
+                "import requests; print(requests.get('https://api.github.com/zen').text)"
+            )
+            print(out)
+    except RuntimeError as e:
+        print(f"codebox error: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Specialized box cheat sheet
+
+All inherit from `SimpleBox` and are async context managers. See the dedicated topic pages for full method lists.
+
+| Class | Default image | Default resources | Key methods |
+| - | - | - | - |
+| `BrowserBox` | `mcr.microsoft.com/playwright:v1.58.0-jammy` | mem 2048 / cpu 2 | `playwright_endpoint(timeout=60)`, `endpoint(timeout=60)`, `connect(timeout=60)` |
+| `ComputerBox` | `lscr.io/linuxserver/webtop:ubuntu-xfce` | mem 2048 / cpu 2, GUI ports 3000/3001 | `wait_until_ready`, `screenshot`, `mouse_move`, `left_click`, `type`, `key`, `scroll`, `get_screen_size` |
+| `InteractiveBox` | set via the required `image` argument | — | `wait()` (bidirectional PTY forwarding; with `tty=None`, auto-detects `sys.stdin.isatty()`) |
+| `SkillBox` | `ghcr.io/boxlite-ai/boxlite-skillbox:0.1.0` | mem 4096 / disk 10GB | `wait_until_ready`, `call(prompt)`, `install_skill(skill_id)`. Requires `oauth_token` or `CLAUDE_CODE_OAUTH_TOKEN` |
+
+> `BrowserBox`'s `playwright_endpoint()` (Playwright Server, all browsers) and `endpoint()` (direct CDP/BiDi, WebKit not supported) are two mutually exclusive modes.
+
+#### `ComputerBox` desktop methods
+
+All are `async`. Coordinates are in screen pixels; call `get_screen_size()` first if you need bounds.
+
+| Method | Signature | Returns | Description |
+| - | - | - | - |
+| `wait_until_ready` | `(timeout: int = 60)` | `None` | Block until the desktop and its GUI ports are reachable |
+| `screenshot` | `()` | `dict` | `data` (base64 PNG) plus `width` / `height` / `format` |
+| `get_screen_size` | `()` | `tuple[int, int]` | Desktop resolution |
+| `cursor_position` | `()` | `tuple[int, int]` | Current pointer position |
+| `mouse_move` | `(x: int, y: int)` | `None` | Move the pointer |
+| `left_click` / `right_click` / `middle_click` / `double_click` / `triple_click` | `()` | `None` | Click at the current pointer position — move first |
+| `left_click_drag` | `(start_x: int, start_y: int, end_x: int, end_y: int)` | `None` | Press, drag, release |
+| `type` | `(text: str)` | `None` | Type a string |
+| `key` | `(text: str)` | `None` | Press a key or chord, e.g. `"ctrl+c"` |
+| `scroll` | `(x: int, y: int, direction: str, amount: int = 3)` | `None` | Scroll at a position; `direction` is `up` / `down` / `left` / `right` |
+
+#### `InteractiveBox` and `SkillBox` methods
+
+| Class | Method | Signature | Returns | Description |
+| - | - | - | - | - |
+| `InteractiveBox` | `wait` | `()` | `None` | Forward stdin/stdout until the in-box shell exits. Forwards only when the host stdin is a real TTY |
+| `SkillBox` | `wait_until_ready` | `(timeout: int = 60)` | `None` | Block until the in-container CLI is ready |
+| `SkillBox` | `call` | `(prompt: str)` | `str` | Run one turn; the session keeps context across calls |
+| `SkillBox` | `install_skill` | `(skill_id: str)` | `bool` | Install an additional skill |
+
+> Every other Box type also inherits `exec` / `copy_in` / `copy_out` / `start` / `stop` / `shutdown` / `info` from `SimpleBox`.
+
+### `Execution` / streaming output (returned by the low-level `Box.exec`)
+
+Using `Box.exec` directly (not the SimpleBox wrapper) returns an `Execution`, which can be read as a stream:
+
+| Method | Signature | Notes |
+| - | - | - |
+| `stdout()` / `stderr()` | `() -> ExecStdout/ExecStderr` | async iterator, **can be iterated only once** |
+| `stdin()` | `() -> ExecStdin` | stdin writer |
+| `wait()` | `() -> ExecResult` | async, waits for completion |
+| `kill()` | `() -> None` | async, forcibly terminates the execution (**no arguments**) |
+| `signal()` | `(signal: int)` | async, sends a POSIX signal to the process (e.g. `signal(15)` sends SIGTERM) |
+| `resize_tty()` | `(rows, cols)` | async, only for executions with `tty=True` |
+| `id()` | `() -> str` | execution ID (for reconnecting via `box.attach(execution_id)`) |
+
+### `ExecResult` (returned by the high-level wrapper)
+
+The dataclass returned by `SimpleBox.exec` / `CodeBox.exec`:
+
+| Field | Type | Notes |
+| - | - | - |
+| `exit_code` | `int` | Exit code (negative when terminated by a signal) |
+| `stdout` | `str` | Standard output |
+| `stderr` | `str` | Standard error |
+| `error_message` | `str \| None` | Diagnostic info when the process died abnormally; `None` on normal exit |
+
+> The low-level native `Execution.wait()` `ExecResult` only has `exit_code` (stdout/stderr must be read as streams); the high-level wrapper additionally fills in `stdout`/`stderr`.
+
+### `BoxInfo` / `BoxStateInfo` (state access)
+
+`box.info()` is **async** and returns `BoxInfo` when awaited. State lives in a two-level structure:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+info = await box.info()     # async
+print(info.state.status)    # correct path: BoxInfo.state -> BoxStateInfo.status (str)
+print(info.state.running)   # bool
+print(info.id, info.image, info.cpus, info.memory_mib)
+```
+
+| `BoxInfo` field | Type | Notes |
+| - | - | - |
+| `id` | `str` | Sandbox ID |
+| `name` | `str \| None` | Name |
+| `state` | `BoxStateInfo` | **State object (not a string)** |
+| `created_at` | — | Creation time |
+| `image` | `str` | Image |
+| `cpus` / `memory_mib` | `int` | The configured resource values. To read the real allocation, run `nproc` / read `/proc/meminfo` inside the box |
+| `health_status` | `HealthStatus` | Health status |
+
+| `BoxStateInfo` field | Type | Notes |
+| - | - | - |
+| `status` | `str` | **State string** (the field name is `status`, not `state`) |
+| `running` | `bool` | Whether running |
+| `pid` | `int \| None` | Process ID |
+
+### Metrics (`BoxMetrics` / `RuntimeMetrics`)
+
+Field names follow the source.
+
+`BoxMetrics` (`await box.metrics()`):
+
+| Field | Type | Notes |
+| - | - | - |
+| `memory_bytes` | `int \| None` | Current memory in bytes (**not** `memory_usage_bytes`) |
+| `cpu_percent` | `float \| None` | CPU usage percentage (**not** `cpu_time_ms`) |
+| `commands_executed_total` / `exec_errors_total` | `int` | Command counts |
+| `bytes_sent_total` / `bytes_received_total` | `int` | Cumulative byte throughput |
+| `network_bytes_sent` / `network_bytes_received` | `int \| None` | Network bytes |
+| `guest_boot_duration_ms` / `total_create_duration_ms` | `int \| None` | Boot / create duration (milliseconds) |
+
+`RuntimeMetrics` (`runtime.metrics()`):
+
+| Field | Type | Notes |
+| - | - | - |
+| `num_running_boxes` | `int` | Number of running sandboxes (**not** `active_boxes`) |
+| `boxes_created_total` | `int` | Cumulative created |
+| `boxes_failed_total` | `int` | Cumulative failed |
+| `total_commands_executed` | `int` | Cumulative commands |
+| `total_exec_errors` | `int` | Cumulative execution errors |
+
+> `metrics()` exists only on the **native `Box`** (`from boxlite import Box`); **`SimpleBox` has no `metrics()` method**. A wrapper holds a native `Box` internally, so you can reach through with `await box._box.metrics()` — or use the native `Box` directly. For runtime-level metrics, use `await runtime.metrics()`.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# box must be a native Box; for the SimpleBox wrapper, use box._box.metrics()
+metrics = await box.metrics()        # native Box; for SimpleBox use await box._box.metrics()
+if metrics.memory_bytes is not None:
+    print(f"Memory: {metrics.memory_bytes / (1024**2):.2f} MB")
+if metrics.cpu_percent is not None:
+    print(f"CPU: {metrics.cpu_percent:.1f}%")
+```
+
+### Exception types
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+BoxliteError (base class, inherits Exception)
+├── ExecError      # fields: command, exit_code, stderr
+├── TimeoutError
+└── ParseError
+```
+
+| Exception | Fields | Notes |
+| - | - | - |
+| `BoxliteError` | — | Base class for all BoxLite exceptions |
+| `ExecError` | `command`, `exit_code`, `stderr` | Command failure (you **construct/raise it yourself**; see below) |
+| `TimeoutError` | — | Operation timed out |
+| `ParseError` | — | Output parsing failed |
+
+> Important: `exec` does **not** automatically raise `ExecError` on a non-zero exit — it returns `ExecResult(exit_code != 0)` and leaves the check to the caller. `ExecError` is a convenience exception you raise yourself after checking. Image pull failures, missing virtualization, and **command not found (spawn failure)** raise a standard `RuntimeError` (**not** `BoxliteError`; the message looks like `internal error: spawn_failed: ... executable '...' not found in $PATH`). When the sync/orchestration extras are missing: `from boxlite import SyncSimpleBox` raises **`ImportError`**, while attribute access `boxlite.SyncSimpleBox` raises **`AttributeError`**.
+
+### Sync API (`boxlite[sync]`)
+
+After `pip install "boxlite[sync]"`, synchronous wrapper classes are available, suitable for Jupyter / existing synchronous code bases / a REPL. They **cannot** be used inside an existing event loop (inside an async function).
+
+| Async | Sync |
+| - | - |
+| `Boxlite` | `SyncBoxlite` |
+| `Box` | `SyncBox` |
+| `SimpleBox` | `SyncSimpleBox` |
+| `CodeBox` | `SyncCodeBox` |
+| `SkillBox` | `SyncSkillBox` |
+
+> Note: when the `[sync]` extras are missing, **`from boxlite import SyncSimpleBox` raises `ImportError`** (`cannot import name 'SyncSimpleBox' from 'boxlite'`), **not** `AttributeError`. Only *attribute access* (`boxlite.SyncSimpleBox`) raises `AttributeError`. So when using the `from ... import` form, put the import in a `try` and catch `ImportError`:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# pip install "boxlite[sync]"
+try:
+    from boxlite import SyncSimpleBox  # raises ImportError when [sync] is missing
+    with SyncSimpleBox(image="python:slim") as box:
+        result = box.exec("python", "-c", "print('Hello!')")
+        print(result.stdout)
+except ImportError:
+    print("Sync API unavailable; install with: pip install 'boxlite[sync]'")
+except RuntimeError as e:
+    print(f"box error: {e}")
+```
+
+### REST client (connect to a remote BoxLite service)
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import os
+from boxlite import Boxlite, BoxliteRestOptions, ApiKeyCredential
+
+try:
+    runtime = Boxlite.rest(BoxliteRestOptions(
+        url="<YOUR_BOXLITE_REST_URL>",  # TODO: e.g. https://api.boxlite.ai
+        credential=ApiKeyCredential(os.environ["BOXLITE_API_KEY"]),  # TODO: set the environment variable
+    ))
+    for info in await runtime.list_info():
+        print(info.id, info.state.status)
+except KeyError:
+    print("Please set the BOXLITE_API_KEY environment variable")
+except Exception as e:
+    print(f"REST error: {e}")
+```
+
+`BoxliteRestOptions(url, credential=None, path_prefix=None)`. `path_prefix` is an opaque, deployment-defined routing segment inserted as `{url}/v1/{path_prefix}/…`; leave it `None` for single-tenant deployments such as the local `boxlite serve` reference server. See the [Node.js SDK reference](/reference/nodejs) for the full routing-prefix model.
+
+## Troubleshooting
+
+### Passing a string for a volume causes a TypeError
+
+Wrong: writing the third volume element as the string `"ro"` / `"rw"`.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Wrong
+BoxOptions(volumes=[("/host", "/mnt", "ro")])
+# -> TypeError: 'str' object cannot be cast as 'bool'
+```
+
+Fix: use the bool `read_only` for the third element (`True` = read-only / `False` = read-write), or use a 2-tuple (defaults to read-write).
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+BoxOptions(volumes=[("/host", "/mnt", True)])   # read-only
+```
+
+### `AttributeError: module 'boxlite' has no attribute 'AdvancedBoxOptions'`
+
+`AdvancedBoxOptions` lives in the `boxlite.boxlite` submodule, not the top level — see [Inject secrets and harden a box](/manage-sandbox/secrets-and-security#troubleshooting).
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Wrong
+import boxlite
+boxlite.AdvancedBoxOptions(...)   # AttributeError
+
+# Correct
+from boxlite import AdvancedBoxOptions
+```
+
+### `AttributeError: ... 'security'` (passing security= at the top level)
+
+`BoxOptions` has no top-level `security=` keyword. Security options must go through `advanced`:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+from boxlite import BoxOptions, SecurityOptions
+from boxlite import AdvancedBoxOptions
+
+BoxOptions(image="alpine:latest",
+           advanced=AdvancedBoxOptions(security=SecurityOptions.maximum()))
+```
+
+### `AttributeError: ... 'minimum'`
+
+`SecurityOptions.minimum()` does not exist. The available presets are `development()` / `standard()` / `maximum()`.
+
+### `exec` reports a failed command but does not raise
+
+A non-zero exit from `exec` returns `ExecResult(exit_code != 0)` and does not raise. Always check it yourself:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+result = await box.exec("false")
+if result.exit_code != 0:
+    print(result.stderr)  # handle the failure yourself
+```
+
+### A metric field does not exist (AttributeError on memory_usage_bytes / cpu_time_ms / active_boxes)
+
+The old field names are deprecated. Use `BoxMetrics.memory_bytes`, `BoxMetrics.cpu_percent`, and `RuntimeMetrics.num_running_boxes` instead.
+
+### `box.info()` raises a coroutine error / `await` fails
+
+`info()` is **async**; `await` it. Access state via `box.info().state.status` (not `.status`, not `.state.state`).
+
+### `RuntimeError` on box start (environment constraint)
+
+The sandbox requires hardware virtualization:
+
+| Platform | Requirement |
+| - | - |
+| Linux x86_64 / ARM64 | KVM (`/dev/kvm` accessible) |
+| macOS Apple Silicon | Built-in Hypervisor.framework, no `/dev/kvm` needed |
+| Windows | WSL2 + KVM, user in the `kvm` group |
+| macOS Intel | Not supported |
+
+Without virtualization, startup fails and raises `RuntimeError` (the process stays alive; handle it with try/except). A flaky network during image pull also raises `RuntimeError` and can be retried.
+
+### `ImportError` / `AttributeError` on sync classes
+
+Sync/orchestration classes are exported on demand; when the extras are missing (with no friendly message):
+
+* `from boxlite import SyncSimpleBox` → **`ImportError`** (`cannot import name 'SyncSimpleBox' from 'boxlite'`)
+* `boxlite.SyncSimpleBox` (attribute access) → **`AttributeError`** (`module 'boxlite' has no attribute 'SyncSimpleBox'`)
+
+Install the matching extras: `pip install "boxlite[sync]"` or `pip install "boxlite[orchestration]"`.

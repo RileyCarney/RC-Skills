@@ -1,0 +1,96 @@
+# What a box costs
+Source: https://docs.boxlite.ai/cloud/box-costs
+
+The three metered rates, the formula they combine into, what the standard sizes come to per hour and per month, and exactly which hours are counted.
+
+A box rents three things by the hour: vCPU, memory, and disk. This page turns those rates into the numbers you can plan against.
+
+## Rates
+
+| Resource | Unit | Rate |
+| - | - | - |
+| vCPU | per vCPU-hour | **\$0.0504** |
+| Memory | per GiB-hour | **\$0.0144** |
+| Disk | per GiB-hour | **\$0.00018** |
+
+A box's hourly price is the plain sum, with no tiers and no rounding:
+
+```
+hourly = vCPU × $0.0504  +  memory_GiB × $0.0144  +  disk_GiB × $0.00018
+```
+
+Nothing else is metered. There is no charge for network traffic, API requests, mounted volumes, preview URLs, or the time a box spends booting.
+
+## What the standard sizes cost
+
+The three sizes in the **New Box** dialog, plus the largest box your organization can request:
+
+| Size | vCPU / memory / disk | Per hour | 30 days running | 30 days stopped |
+| - | - | - | - | - |
+| **Small** | 1 / 1 GiB / 10 GiB | \$0.0666 | \$47.95 | \$1.30 |
+| **Medium** | 2 / 4 GiB / 20 GiB | \$0.1620 | \$116.64 | \$2.59 |
+| **Large** | 4 / 8 GiB / 50 GiB | \$0.3258 | \$234.58 | \$6.48 |
+| Organization ceiling | 4 / 32 GiB / 120 GiB | \$0.6840 | \$492.48 | \$15.55 |
+
+Two readings of that table matter.
+
+**Per invocation, boxes are almost free.** A 30-second code-interpreter run on a Small box costs $0.00056 — ten thousand of them come to $5.55. Per-run cost is not where Cloud bills get large.
+
+**Per month left running, they are not.** The gap between the last two columns is the whole cost story, and the next section is why it exists. [Cost controls](/cloud/cost-controls) is how you close it.
+
+To make a box cheaper, cut vCPU first: one vCPU-hour costs as much as **3.5 GiB-hours of memory** or **280 GiB-hours of disk**. Trimming disk is not worth the thought — it is 2–3% of a running box.
+
+## What each box state costs
+
+| Box state | vCPU | Memory | Disk |
+| - | - | - | - |
+| **Running** | charged | charged | charged |
+| **Stopped** | — | — | **charged** |
+| Creating or starting | — | — | — |
+| **Deleted** | — | — | — |
+
+A stopped box has given back its compute but still occupies its disk, and it is billed for that disk until the box is deleted.
+
+One forgotten box is loose change. A hundred of them is $130–$650 a month for nothing, and nothing clears them for you.
+
+### How the hours are counted
+
+Compute and disk are charged over different intervals. The two clocks start together and stop at different moments:
+
+| Moment | vCPU + memory | Disk |
+| - | - | - |
+| Box created but never started | not charged | not charged |
+| Box reaches **running** | clock starts | clock starts |
+| You **request a stop** | **clock stops** | keeps running |
+| Box is stopped, however long | not charged | keeps running |
+| You **request deletion** | not charged | **clock stops** |
+
+Two of those moments are earlier than you might expect, and both are in your favor:
+
+* **Compute stops billing when the stop is requested**, not when the box has finished shutting down. You do not pay vCPU or memory for the shutdown itself.
+* **Disk stops billing when deletion is requested**, not when teardown completes.
+
+There is **no minimum billable duration and no rounding up to a whole hour**. The platform records the exact moment of each transition, so a box that runs for four minutes is charged for four minutes at the hourly rate. A box you create and never start costs nothing at all.
+
+## Estimates and settlement
+
+The **New Box** dialog quotes what your chosen size costs to run for one hour. Treat it as an estimate — your actual charge is settled from recorded usage, and the **Usage** tab is the authority on what you were charged. See [Managing billing](/cloud/billing#read-the-usage-chart).
+
+## Troubleshooting
+
+| Situation | Why it happens | What to do |
+| - | - | - |
+| A box you stopped days ago is still adding to your bill | A stopped box keeps its disk and is charged for it until deleted | Delete it, or set `auto_delete` so it clears itself. See [Cost controls](/cloud/cost-controls) |
+| Cost is far higher than the size suggests | Something keeps the box busy, so it never goes idle and `auto_stop` never fires. A busy box is not an idle box | Check what is running inside it, or stop the box explicitly when the work finishes |
+| Creation fails with `auto_delete must be greater than auto_stop` | Both are non-zero but `auto_delete` is not larger | Raise `auto_delete` above `auto_stop`, or set `auto_delete=0` to disable deletion |
+| A request for more than 4 vCPU, 32 GiB of memory, or 120 GiB of disk is rejected | Those are per-box ceilings for the whole organization, enforced before the box is created | Lower the request or split the work across boxes. See [Per-box resource ceilings](/cloud/billing#per-box-resource-ceilings) |
+
+## Next steps
+
+> [card] [Cost controls](/cloud/cost-controls)
+>
+> The two lifecycle controls that stop a finished box from charging you.
+
+> [card] [Wallet or a plan?](/cloud/plans)
+>
+> The usage level at which a subscription starts costing less.

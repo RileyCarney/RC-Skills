@@ -1,0 +1,160 @@
+# Read and write raw bytes over a tunnel
+Source: https://docs.boxlite.ai/cloud/raw-streams
+
+Drive a tunnel as a bidirectional byte stream when you are speaking a protocol of your own rather than HTTP.
+
+A tunnel moves bytes and interprets nothing along the way. When your service speaks a protocol of its own, take the connection directly and read and write it yourself.
+
+## Prerequisites
+
+* An API key from the console, exported as `BOXLITE_API_KEY`. See [API keys](/cloud/api-keys).
+* `pip install boxlite`, and the REST URL exported as `BOXLITE_REST_URL`. See [Quickstart](/cloud/quickstart).
+* A box you can start, and a service inside it that listens on a TCP port.
+* **The box must be created with inbound enabled.** A tunnel against a private
+  box is refused, and inbound has defaulted to `disabled` since 0.10.5 — see
+  [Network policy](/cloud/network-policy#a-new-box-is-private).
+
+Every example reads both values from the environment, so nothing hard-codes a credential.
+
+## Take the connection yourself
+
+`connect()` hands you the byte stream directly. This is the level you work at for a
+protocol that is not HTTP — a line protocol, a binary framing, a database wire
+protocol — or when you want full control over what goes on the wire.
+
+> [!NOTE]
+>
+> **`connect()` spends the tunnel.** So does `forward()`. Build a fresh
+> `await box.network.tunnel(port)` for each connection you need; only `uri()` leaves a
+> tunnel reusable.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# cloud_tunnel_bytes.py — talk to a non-HTTP TCP service inside a box
+# Run: python cloud_tunnel_bytes.py
+import asyncio
+import os
+import shlex
+import time
+
+from boxlite import (
+    ApiKeyCredential,
+    Boxlite,
+    BoxliteRestOptions,
+    BoxOptions,
+    InboundNetworkSpec,
+    NetworkSpec,
+)
+
+GUEST_PORT = 18090
+IMAGE = "ghcr.io/boxlite-ai/boxlite-agent-base:v0.1.0"
+
+# A line protocol: read one newline-terminated line, reply with it upper-cased.
+SERVER_CODE = f"""
+import socketserver
+
+class Handler(socketserver.StreamRequestHandler):
+    def handle(self):
+        line = self.rfile.readline()
+        self.wfile.write(line.upper())
+
+class Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+
+Server(("0.0.0.0", {GUEST_PORT}), Handler).serve_forever()
+"""
+
+
+async def main() -> None:
+    # export BOXLITE_API_KEY=<YOUR_API_KEY> before running
+    rt = Boxlite.rest(BoxliteRestOptions(
+        url=os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
+        credential=ApiKeyCredential(os.environ["BOXLITE_API_KEY"]),
+    ))
+
+    box_id = None
+    connection = None
+    try:
+        box = await rt.create(
+            BoxOptions(
+                image=IMAGE,
+                # Required for a tunnel: inbound is disabled by default,
+                # and a tunnel against a private box is refused.
+                network=NetworkSpec(inbound=InboundNetworkSpec(mode="enabled")),
+            ),
+            name=f"tunnel-bytes-{int(time.time())}",
+        )
+        box_id = box.id
+        await box.start()
+
+        launch = await box.exec("sh", args=[
+            "-c",
+            f"nohup python3 -u -c {shlex.quote(SERVER_CODE)} "
+            "> /tmp/line-server.log 2>&1 & echo launched",
+        ])
+        await launch.wait()
+        await asyncio.sleep(2)  # give the server time to bind
+
+        tunnel = await box.network.tunnel(GUEST_PORT)
+        connection = await tunnel.connect()
+
+        await connection.write(b"ping over a raw tunnel\n")
+
+        # Signals that you have finished sending. This server replies to the
+        # newline, so it does not depend on seeing the half-close -- see Limits.
+        await connection.shutdown_write()
+
+        reply = bytearray()
+        while b"\n" not in reply:
+            chunk = await connection.read(4096)  # max_bytes must be non-zero
+            if not chunk:  # empty read: the far side closed the stream
+                break
+            reply.extend(chunk)
+
+        print(f"reply: {bytes(reply)!r}")
+    except Exception as exc:
+        print(f"byte stream demo failed: {type(exc).__name__}: {exc}")
+    finally:
+        if connection is not None:
+            try:
+                await connection.close()
+            except Exception as exc:
+                print(f"connection close failed: {exc}")
+        if box_id:
+            try:
+                await rt.remove(box_id, force=True)
+            except Exception as exc:
+                print(f"remove failed: {exc}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+## Read until the far side closes
+
+`read(max_bytes)` returns up to `max_bytes` bytes, and an **empty `bytes` object once
+the far side has closed** — that empty read is the end-of-stream signal the loop above
+breaks on. There is no separate EOF flag to check.
+
+| What you do | What happens |
+| - | - |
+| `read(n)` with data available | Up to `n` bytes |
+| `read(n)` after the far side closed | `b""` — stop reading |
+| `read(0)` | `ValueError: max_bytes must be non-zero` |
+| `read(n)` after your own `close()` | A BoxLite error carrying `connection is closed` |
+
+> [!NOTE]
+>
+> **Not using asyncio?** `SyncBox.network` and `SyncBox.tunnel(port)` return
+> `SyncNetworkHandle` and `SyncTunnelForwarder`, the synchronous equivalents of
+> everything on this page.
+
+## Next steps
+
+> [card] [Network](/cloud/network)
+>
+> How tunnels work, the full parameter reference, and the outbound boundary.
+
+> [card] [Network policy](/cloud/network-policy)
+>
+> Control what the box itself is allowed to reach.

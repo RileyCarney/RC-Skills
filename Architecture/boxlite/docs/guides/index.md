@@ -1,0 +1,40 @@
+# From demo to production
+Source: https://docs.boxlite.ai/guides/index
+
+What breaks between a working demo and a service other people depend on: error handling, concurrency, deployment, and image supply.
+
+A demo creates one box and prints a result. A service creates thousands, handles their failures, cleans up after them, and runs somewhere other than your laptop.
+
+The mental model that carries through all of it: **one agent session, one sandbox.** Everything here follows from taking that seriously.
+
+## In this section
+
+> [card] [Error handling](/guides/error-handling)
+>
+> Tell command failure, timeout, parse failure, and runtime errors apart. **Start here.**
+
+> [card] [Running at scale](/guides/at-scale)
+>
+> What breaks with many long-lived sandboxes, and the four controls that fix it.
+
+> [card] [Deployment](/guides/deployment)
+>
+> Docker and Kubernetes, where each sandbox still needs virtualization.
+
+> [card] [Agent service endpoint](/guides/agent-service-endpoint)
+>
+> One REST endpoint over a fleet — your code needs a URL and a key.
+
+> [card] [Image registry](/guides/image-registry-configuration)
+>
+> Pull agent images from a private or corporate registry.
+
+## Which page do I want?
+
+| You are asking | Page |
+| - | - |
+| My code works but fails in odd ways | [error handling](/guides/error-handling) |
+| I need hundreds of concurrent sandboxes | [at scale](/guides/at-scale) |
+| I need this in Docker or Kubernetes | [deployment](/guides/deployment) |
+| I want a hosted fleet instead of running one | [index](/cloud/index) |
+| My images live in a private registry | [image registry configuration](/guides/image-registry-configuration) |

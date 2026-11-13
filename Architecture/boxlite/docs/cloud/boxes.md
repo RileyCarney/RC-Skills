@@ -1,0 +1,41 @@
+# Boxes
+Source: https://docs.boxlite.ai/cloud/boxes
+
+A box on BoxLite Cloud is a microVM you address by name or id from anywhere your API key reaches — choose its image and size, and know when the platform stops it.
+
+A box on BoxLite Cloud is a microVM you address by name or id from anywhere your API key reaches. You choose its image and its size when you create it, and the platform decides when it stops and whether it wakes again.
+
+> [!WARNING]
+>
+> **A Cloud box stops itself after 15 idle minutes by default**, and work running *inside* the box does not count as activity. A long unattended job can be stopped mid-run. See [Lifecycle](/cloud/box-lifecycle#stop-when-idle) before you start one.
+
+## In this section
+
+> [card] [Images](/cloud/images)
+>
+> The three images the console offers, and what an image reference looks like from code.
+
+> [card] [Sizes](/cloud/box-sizes)
+>
+> The preset sizes, the per-box ceilings for your organization, and the SDK sizing fields.
+
+> [card] [Lifecycle](/cloud/box-lifecycle)
+>
+> Stop when idle, wake on access, delete after stopping. **The settings most likely to surprise you.**
+
+> [card] [From code](/cloud/box-from-code)
+>
+> The full create-start-use-remove cycle, reusing a box by name, and environment variables.
+
+## Which page do I want?
+
+| You are asking | Page |
+| - | - |
+| Which image should I start from? | [Images](/cloud/images) |
+| How much CPU and memory can one box have? | [Sizes](/cloud/box-sizes#per-organization-ceilings) |
+| Why did my box stop on its own? | [Lifecycle](/cloud/box-lifecycle#stop-when-idle) |
+| How do I keep a box alive through a long job? | [Lifecycle](/cloud/box-lifecycle#stop-when-idle) |
+| How do I get a box deleted automatically? | [Lifecycle](/cloud/box-lifecycle#delete-after-stopping) |
+| Show me the whole cycle in one script | [From code](/cloud/box-from-code) |
+| How do I reuse a box I created earlier? | [From code](/cloud/box-from-code) |
+| What does a box cost per hour? | [What a box costs](/cloud/box-costs) |

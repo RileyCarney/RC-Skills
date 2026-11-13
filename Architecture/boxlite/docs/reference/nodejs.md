@@ -1,0 +1,684 @@
+# Node.js SDK reference
+Source: https://docs.boxlite.ai/reference/nodejs
+
+The complete API surface of @boxlite-ai/boxlite: runtime, box handle, box types, errors, metrics, and the errors people hit most.
+
+The package is **`@boxlite-ai/boxlite`** — not `boxlite`, not `@boxlite/sdk` — and it is ESM-only, so use `import`, never `require`.
+
+## What the Node.js SDK gives you
+
+The BoxLite Node SDK runs untrusted code, crash-prone processes, and browser or desktop automation — all inside a lightweight microVM. Compared with containers, it provides VM-level isolation; compared with traditional VMs, it starts quickly and has a concise API.
+
+Typical scenarios:
+
+* Safely execute user-submitted code snippets on the server (AI-agent tool execution, online judges, data processing).
+* Run a real Chromium/Firefox/WebKit for scraping or end-to-end tests, with the main process connecting remotely via Playwright.
+* Give an AI a virtual desktop it can screenshot, click, and type into.
+
+***
+
+## Prerequisites
+
+* The `@boxlite-ai/boxlite` Node package and a machine with hardware virtualization — see [Installation](/getting-started/installation#platform-and-virtualization-requirements-common-to-all-sdks).
+
+| Requirement | Notes |
+| - | - |
+| Optional dependency | Only `BrowserBox` needs `playwright-core >= 1.58.0` (an optional peerDependency) |
+
+Install:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Core SDK
+npm install @boxlite-ai/boxlite
+# Required only when connecting to a remote browser via BrowserBox
+npm install playwright-core
+```
+
+> The first run pulls the OCI image (such as `alpine:latest`) from the registry, which requires network access.
+
+***
+
+## Quick Example
+
+Minimal path: run one command with `SimpleBox` and clean up automatically afterward. Save the following as `quickstart.mjs`, then run `node quickstart.mjs`.
+
+```typescript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// quickstart.mjs  —  run: node quickstart.mjs
+import { SimpleBox } from "@boxlite-ai/boxlite";
+
+async function main() {
+  // Box is created lazily: the image is pulled and the micro-VM started only on the first exec()
+  const box = new SimpleBox({ image: "alpine:latest" });
+  try {
+    const result = await box.exec("echo", "Hello from BoxLite!");
+
+    // Note: a non-zero exit code does not raise; check exitCode yourself
+    if (result.exitCode !== 0) {
+      console.error("command failed:", result.stderr);
+    } else {
+      console.log("stdout:", result.stdout.trim());
+    }
+  } catch (err) {
+    // Startup failures (no virtualization, image pull failure, etc.) are thrown here
+    console.error("Box runtime error:", err instanceof Error ? err.message : err);
+  } finally {
+    await box.stop(); // autoRemove defaults to true; stopping cleans up
+  }
+}
+
+main();
+```
+
+A more concise form (TypeScript 5.2+ / Node 20+ supports `await using`, which calls `[Symbol.asyncDispose]` automatically):
+
+```typescript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// Requires Node >= 20 and tsconfig target >= ES2022 / explicit resource management enabled
+import { SimpleBox } from "@boxlite-ai/boxlite";
+
+async function main() {
+  try {
+    await using box = new SimpleBox({ image: "alpine:latest" });
+    const result = await box.exec("uname", "-a");
+    console.log(result.stdout.trim());
+  } catch (err) {
+    console.error("error:", err instanceof Error ? err.message : err);
+  }
+  // Automatically stops and cleans up on scope exit
+}
+
+main();
+```
+
+***
+
+## Parameters & Returns
+
+### Top-level exports
+
+```typescript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import {
+  // Wrapper-layer Box types (recommended entry points)
+  SimpleBox, CodeBox, BrowserBox, ComputerBox, InteractiveBox, SkillBox,
+  // Runtime and REST
+  JsBoxlite, BoxliteRestOptions, ApiKeyCredential,
+  // Error types
+  BoxliteError, ExecError, TimeoutError, ParseError,
+  // Low-level access
+  getJsBoxlite, getNativeModule,
+} from "@boxlite-ai/boxlite";
+
+// Constants (DEFAULT_CPUS, SKILLBOX_IMAGE, etc.) are exposed via export *
+import { DEFAULT_CPUS, DEFAULT_MEMORY_MIB } from "@boxlite-ai/boxlite";
+```
+
+> The runtime class is **`JsBoxlite`**; there is no bare `Boxlite`. In most cases you do not need to use `JsBoxlite` directly — the wrapper layers (`SimpleBox`, etc.) manage a default runtime internally.
+
+### `SimpleBox` — general command execution
+
+`new SimpleBox(options?: SimpleBoxOptions)`. The box is created lazily: construction does not start it; the first `exec()` pulls the image and starts the VM.
+
+`SimpleBoxOptions` fields:
+
+| Field | Type | Required | Default | Notes |
+| - | - | - | - | - |
+| `image` | `string` | one of the two | — | OCI image (such as `alpine:latest`). At least one of `image` / `rootfsPath` must be given |
+| `rootfsPath` | `string` | one of the two | — | A prepared rootfs directory (in place of `image`) |
+| `cpus` | `number` | no | `undefined` (see note) | CPU cores. When unset, the runtime allocates 1 vCPU |
+| `memoryMib` | `number` | no | `undefined` (see note) | Memory in MiB. When unset, the runtime allocates 1024 MiB |
+| `diskSizeGb` | `number` | no | — | Persistent disk size in GB |
+| `runtime` | `JsBoxlite` | no | built-in default runtime | Reuse a custom runtime |
+| `name` | `string` | no | auto | Box name |
+| `autoRemove` | `boolean` | no | `true` | Auto-clean on stop |
+| `reuseExisting` | `boolean` | no | `false` | Reuse if a same-named box already exists |
+| `detach` | `boolean` | no | `false` | Survive parent-process exit |
+| `workingDir` | `string` | no | — | Working directory inside the container |
+| `env` | `Record<string, string>` | no | `{}` | Environment variables (an **object**, not an array) |
+| `volumes` | `{hostPath; guestPath; readOnly?}[]` | no | `[]` | Volume mounts (see section 4.7) |
+| `ports` | `{hostPort?; guestPort; protocol?; hostIp?}[]` | no | `[]` | Port mappings |
+| `network` | `NetworkSpec` | no | `{mode:"enabled"}` | Network configuration |
+| `secrets` | `Secret[]` | no | `[]` | Outbound HTTP(S) secret substitution rules |
+| `entrypoint` | `string[]` | no | — | Override the image entrypoint |
+| `cmd` | `string[]` | no | — | Override the image cmd |
+| `user` | `string` | no | — | User to run as |
+| `security` | `SecurityOptions` | no | — | Security options (see 4.7) |
+
+> **On the `cpus` / `memoryMib` defaults**: when unset, the SDK passes `undefined` and the runtime applies **1 vCPU / 1024 MiB** (`vm_defaults` in `src/boxlite/src/runtime/constants.rs`). The exported constants `DEFAULT_CPUS` / `DEFAULT_MEMORY_MIB` are not part of the creation path — `DEFAULT_MEMORY_MIB` in particular does not match the runtime value, so do not read it as the default. Production code should pass these values explicitly. See [Compute resources](/manage-sandbox/compute-resources).
+
+`SimpleBox` methods:
+
+| Method | Signature | Sync/async | Notes |
+| - | - | - | - |
+| `exec` | `(cmd, ...args) => Promise<ExecResult>` | async | Variadic form |
+| `exec` | `(cmd, args[], env?, options?) => Promise<ExecResult>` | async | Array form, `options = {cwd?; user?; timeoutSecs?}` |
+| `copyIn` | `(hostPath, containerDest, options?) => Promise<void>` | async | Copy into the box |
+| `copyOut` | `(containerSrc, hostDest, options?) => Promise<void>` | async | Copy out of the box |
+| `metrics` | `() => Promise<JsBoxMetrics>` | async | Resource metrics |
+| `stop` | `() => Promise<void>` | async | Stop |
+| `getId` | `() => Promise<string>` | async | Get the ID asynchronously |
+| `getInfo` | `() => Promise<JsBoxInfo>` | async | Get info asynchronously |
+| `info` | `() => JsBoxInfo` | **sync** | Get info (throws if called before creation) |
+| `id` / `name` / `created` | getter | **sync** | Accessing before creation throws |
+| `[Symbol.asyncDispose]` | `() => Promise<void>` | async | Supports `await using` |
+
+The `ExecResult` returned by `exec`:
+
+```typescript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+interface ExecResult {
+  exitCode: number; // 0 = success; a non-zero code does not raise, check it yourself
+  stdout: string;
+  stderr: string;
+}
+```
+
+`exec` with options (array form):
+
+```typescript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { SimpleBox } from "@boxlite-ai/boxlite";
+
+async function main() {
+  const box = new SimpleBox({ image: "alpine:latest" });
+  try {
+    // exec(cmd, args[], env, options)
+    const r1 = await box.exec("pwd", [], undefined, { cwd: "/tmp" });
+    console.log("cwd:", r1.stdout.trim());
+
+    // Inject environment variables (env is an object, not an array)
+    const r2 = await box.exec("env", [], { FOO: "bar" });
+    console.log(r2.stdout);
+
+    // Per-command timeout (seconds)
+    const r3 = await box.exec("sleep", ["60"], undefined, { timeoutSecs: 5 });
+    console.log("exit:", r3.exitCode);
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : err);
+  } finally {
+    await box.stop();
+  }
+}
+
+main();
+```
+
+### `CodeBox` — Python code sandbox
+
+Inherits `SimpleBox` with a fixed image (`CodeBoxOptions` is `Omit<SimpleBoxOptions, "image">`, default image `python:slim`).
+
+| Method | Signature | Notes |
+| - | - | - |
+| `run` | `(code: string) => Promise<string>` | Run Python code, return stdout |
+| `runScript` | `(scriptPath: string) => Promise<string>` | Run a host script file |
+| `installPackage` | `(pkg: string) => Promise<string>` | `pip install <pkg>` |
+| `installPackages` | `(...pkgs: string[]) => Promise<string>` | Install multiple |
+
+```typescript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { CodeBox } from "@boxlite-ai/boxlite";
+
+async function main() {
+  const codebox = new CodeBox({ memoryMib: 1024 });
+  try {
+    await codebox.installPackage("requests");
+    const out = await codebox.run(
+      "import requests; print(requests.get('https://api.github.com/zen').text)"
+    );
+    console.log(out);
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : err);
+  } finally {
+    await codebox.stop();
+  }
+}
+
+main();
+```
+
+### `BrowserBox` — browser automation
+
+Inherits `SimpleBox`, default image `mcr.microsoft.com/playwright:v1.58.0-jammy` (bundles chromium/firefox/webkit, Playwright 1.58.0). `BrowserBoxOptions` extends `Omit<SimpleBoxOptions, "image"|"cpus"|"memoryMib">` and adds:
+
+| Field | Type | Default | Notes |
+| - | - | - | - |
+| `browser` | `"chromium"\|"firefox"\|"webkit"` | `"chromium"` | Browser type |
+| `memoryMib` | `number` | `2048` | Memory |
+| `cpus` | `number` | `2` | CPU |
+| `port` | `number` | `3000` | Playwright Server host port |
+| `cdpPort` | `number` | `9222` | CDP/Puppeteer host port |
+
+The two connection modes are mutually exclusive (they share forwarded ports):
+
+| Method | Signature | Notes |
+| - | - | - |
+| `start` | `(timeout?=60) => Promise<void>` | Start the browser |
+| `playwrightEndpoint` | `(timeout?) => Promise<string>` | Playwright Server WS endpoint (**all browsers**) |
+| `endpoint` | `(timeout?) => Promise<string>` | Direct CDP (**WebKit not supported**) |
+
+Prefer the Playwright Server mode (supports all browsers):
+
+```typescript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// Requires: npm install playwright-core
+import { BrowserBox } from "@boxlite-ai/boxlite";
+import { chromium } from "playwright-core";
+
+async function main() {
+  const box = new BrowserBox({ browser: "chromium" });
+  try {
+    const ws = await box.playwrightEndpoint(); // returns a ws:// endpoint
+    const browser = await chromium.connect(ws);
+    const page = await browser.newPage();
+    await page.goto("https://example.com");
+    console.log(await page.title());
+    await browser.close();
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : err);
+  } finally {
+    await box.stop();
+  }
+}
+
+main();
+```
+
+### `ComputerBox` — desktop automation
+
+Inherits `SimpleBox`, fixed image `lscr.io/linuxserver/webtop:ubuntu-xfce`. `ComputerBoxOptions` is `Omit<SimpleBoxOptions, "image">`, with dedicated defaults: `cpus=2`, `memoryMib=2048`, `guiHttpPort=3000`, `guiHttpsPort=3001`, display 1024x768.
+
+| Category | Methods |
+| - | - |
+| Ready / display | `waitUntilReady(timeout?=60)`, `screenshot() => Screenshot`, `getScreenSize() => [number, number]` |
+| Mouse | `mouseMove(x,y)`, `leftClick()`, `rightClick()`, `middleClick()`, `doubleClick()`, `tripleClick()`, `leftClickDrag(sx,sy,ex,ey)`, `cursorPosition() => [number, number]` |
+| Keyboard | `type(text)`, `key(keySequence)` (xdotool syntax, such as `"ctrl+c"`, `"Return"`) |
+| Scroll | `scroll(x, y, direction, amount?)` (direction: `"up"` \| `"down"` \| `"left"` \| `"right"`) |
+
+`Screenshot`: `{ data: string /* base64 PNG */; width: number; height: number; format: "png" }`.
+
+```typescript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { ComputerBox } from "@boxlite-ai/boxlite";
+
+async function main() {
+  const desktop = new ComputerBox({ cpus: 4, memoryMib: 4096 });
+  try {
+    await desktop.waitUntilReady(60);
+    const shot = await desktop.screenshot();
+    console.log(`screen: ${shot.width}x${shot.height}`);
+    await desktop.mouseMove(100, 200);
+    await desktop.leftClick();
+    await desktop.type("Hello, World!");
+    await desktop.key("Return");
+    // Open http://localhost:3000 in a browser to view the live desktop
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : err);
+  } finally {
+    await desktop.stop();
+  }
+}
+
+main();
+```
+
+### `InteractiveBox` / `SkillBox`
+
+* **`InteractiveBox`** (PTY interactive terminal): `InteractiveBoxOptions extends SimpleBoxOptions`, and options are **required** at construction. Methods: `start()`, `wait()`, `stop()`, `[Symbol.asyncDispose]`.
+* **`SkillBox`** (runs AI CLIs such as Claude Code): default image `ghcr.io/boxlite-ai/boxlite-skillbox:0.1.0`, memory 4096, disk 10GB. Methods: `start()`, `stop()`, `waitUntilReady(timeout?=60)`, `call(prompt) => Promise<string>`, `installSkill(skillId) => Promise<boolean>`. Requires an OAuth token (`CLAUDE_CODE_OAUTH_TOKEN` or a constructor argument).
+
+### Security, network, volumes, ports, secrets
+
+`SimpleBoxOptions.security` accepts a `SecurityOptions` object (on the Node side, pass an object directly; there are no preset static methods as in Python):
+
+```typescript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+interface SecurityOptions {
+  jailerEnabled?: boolean;
+  seccompEnabled?: boolean;
+  maxOpenFiles?: number;
+  maxFileSize?: number;
+  maxProcesses?: number;
+  maxMemory?: number;
+  maxCpuTime?: number;
+  networkEnabled?: boolean;
+  closeFds?: boolean;
+}
+```
+
+`NetworkSpec`: `{ mode: "enabled" | "disabled"; allowNet?: string[] }`. `mode:"enabled"` with `allowNet` empty/omitted = all outbound allowed; with an array = an allowlist; `mode:"disabled"` removes the network interface.
+
+`Secret`: `{ name: string; value: string; hosts?: string[]; placeholder?: string }`. `placeholder` defaults to `<BOXLITE_SECRET:${name}>` and is replaced with `value` only in outbound HTTP(S) requests matching `hosts`.
+
+Volume and port example (`readOnly` is a **boolean**):
+
+```typescript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { SimpleBox } from "@boxlite-ai/boxlite";
+
+async function main() {
+  const box = new SimpleBox({
+    image: "alpine:latest",
+    volumes: [
+      { hostPath: "<YOUR_HOST_PATH>", guestPath: "/data", readOnly: true }, // read-only
+    ],
+    ports: [{ hostPort: 8080, guestPort: 80 }],
+    network: { outbound: { mode: "enabled", allowNet: ["example.com"] } },
+    secrets: [
+      { name: "API_KEY", value: "<YOUR_API_KEY>", hosts: ["api.example.com"] },
+    ],
+  });
+  try {
+    const r = await box.exec("ls", "/data");
+    console.log(r.stdout);
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : err);
+  } finally {
+    await box.stop();
+  }
+}
+
+main();
+```
+
+### `JsBoxlite` — runtime (when you need to manage multiple boxes)
+
+| Member | Signature | Notes |
+| - | - | - |
+| Constructor | `new JsBoxlite(options)` | Custom home dir, etc. |
+| `JsBoxlite.withDefaultConfig()` | `() => JsBoxlite` | Default configuration (`~/.boxlite`) |
+| `JsBoxlite.rest(url, credential?)` | `(string, Credential?) => JsBoxlite` | Connect to a remote REST service (see 4.11) |
+| `create` | `(opts, name?) => Promise<JsBox>` | Create a box |
+| `getOrCreate` | `(opts, name?) => Promise<{created, box}>` | Get or create |
+| `get` | `(idOrName) => Promise<JsBox\|null>` | Get a handle |
+| `getInfo` | `(idOrName) => Promise<JsBoxInfo\|null>` | Get info |
+| `listInfo` | `() => Promise<JsBoxInfo[]>` | List all boxes (newest first) |
+| `metrics` | `() => Promise<JsRuntimeMetrics>` | Runtime metrics |
+| `remove` | `(idOrName, force?) => Promise<void>` | **Remove on the runtime** (not `box.remove()`) |
+| `importBox` | `(archivePath, name?) => Promise<JsBox>` | Import an archive |
+| `shutdown` | `(timeout?) => Promise<void>` | Shut down the runtime |
+| `close` | `() => void` | **Sync** close |
+| `images` | getter | Image handle (`pull` / `list`); see 4.10 |
+
+> List with `listInfo()` (not `list()`); remove with `runtime.remove(idOrName, force?)` (not `box.remove()`).
+
+### `JsBox` / `JsExecution` (low-level handle and streaming)
+
+`JsBoxlite.create()` / `get()` returns a `JsBox`, the low-level box handle. Its `exec()` returns a `JsExecution`, which exposes the raw stdin/stdout/stderr streams — useful for streaming long-running output or feeding interactive input. The high-level `SimpleBox` collects stdout/stderr into strings for you; use `JsExecution` directly only when you need streaming or stdin.
+
+`JsBox` methods:
+
+| Method | Signature | Notes |
+| - | - | - |
+| `info` | `() => JsBoxInfo` | sync |
+| `exec` | `(cmd, args?, env?, tty?) => Promise<JsExecution>` | Execute a command |
+| `stop` | `() => Promise<void>` | Stop the box |
+| `metrics` | `() => Promise<JsBoxMetrics>` | Resource metrics |
+
+`JsExecution` methods:
+
+| Method | Signature | Notes |
+| - | - | - |
+| `id` | `() => Promise<string>` | Execution ID |
+| `stdin` | `() => Promise<JsExecStdin>` | Get the stdin writer (rejects if stdin is unavailable / already consumed) |
+| `stdout` | `() => Promise<JsExecStdout>` | Get the stdout reader |
+| `stderr` | `() => Promise<JsExecStderr>` | Get the stderr reader |
+| `wait` | `() => Promise<JsExecResult>` | Wait for completion |
+| `kill` | `() => Promise<void>` | Send SIGKILL |
+| `signal` | `(signal: number) => Promise<void>` | Send a POSIX signal (e.g. `signal(15)` for SIGTERM) |
+| `resizeTty` | `(rows: number, cols: number) => Promise<void>` | Resize the TTY window (TTY-enabled executions only) |
+
+`JsExecStdin` — writer for sending input to a running process:
+
+| Method | Signature | Notes |
+| - | - | - |
+| `write` | `(data: Buffer) => Promise<void>` | Write raw bytes (accepts a `Buffer` or `Uint8Array`) |
+| `writeString` | `(text: string) => Promise<void>` | Write a UTF-8 string |
+| `close` | `() => Promise<void>` | Close stdin, signaling EOF (needed by commands such as `tar xf -`) |
+
+`JsExecStdout` / `JsExecStderr` — readers for streaming output:
+
+| Method | Signature | Notes |
+| - | - | - |
+| `next` | `() => Promise<string \| null>` | Read the next line; resolves to `null` at EOF |
+
+> **Each stream can only be consumed once.** After iterating to EOF, subsequent `next()` calls return `null`. Acquire each of stdout/stderr exactly once per execution.
+
+`JsExecResult` (returned by `wait()`):
+
+| Field | Type | Notes |
+| - | - | - |
+| `exitCode` | `number` | Process exit code (0 = success) |
+| `errorMessage` | `string \| undefined` | Diagnostic message when the process died unexpectedly; `undefined` on a normal exit |
+
+```typescript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { JsBoxlite } from "@boxlite-ai/boxlite";
+
+async function main() {
+  const runtime = JsBoxlite.withDefaultConfig();
+  const box = await runtime.create({ image: "alpine:latest" });
+  try {
+    const execution = await box.exec("sh", ["-c", "echo line1; echo line2"]);
+
+    // A stream can be consumed only once; iterate to EOF
+    const stdout = await execution.stdout();
+    while (true) {
+      const line = await stdout.next();
+      if (line === null) break; // EOF
+      console.log(line);
+    }
+
+    const result = await execution.wait();
+    console.log("exit code:", result.exitCode);
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : err);
+  } finally {
+    await box.stop();
+    runtime.close();
+  }
+}
+
+main();
+```
+
+Writing to stdin:
+
+```typescript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+const execution = await box.exec("cat", []);
+const stdin = await execution.stdin();
+await stdin.writeString("hello\n");
+await stdin.write(Buffer.from([10])); // a newline byte
+await stdin.close();                  // signal EOF so cat returns
+const result = await execution.wait();
+```
+
+### `images` — runtime image management
+
+`runtime.images` is a runtime-scoped handle for cache operations. Both methods are async.
+
+| Method | Signature | Returns |
+| - | - | - |
+| `pull` | `(reference: string) => Promise<JsImagePullResult>` | Pull an image and return metadata about the cached result |
+| `list` | `() => Promise<JsImageInfo[]>` | List cached images for this runtime |
+
+`JsImagePullResult` (from `pull`):
+
+| Field | Type | Notes |
+| - | - | - |
+| `reference` | `string` | The resolved image reference |
+| `configDigest` | `string` | The image config digest |
+| `layerCount` | `number` | Number of layers |
+
+`JsImageInfo` (from `list`):
+
+| Field | Type | Notes |
+| - | - | - |
+| `reference` | `string` | Full image reference |
+| `repository` | `string` | Repository part of the reference |
+| `tag` | `string` | Tag part of the reference |
+| `id` | `string` | Cached image ID |
+| `cachedAt` | `string` | When it was cached (ISO 8601) |
+| `sizeBytes` | `number \| undefined` | Total size in bytes, if known |
+
+```typescript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { JsBoxlite } from "@boxlite-ai/boxlite";
+
+async function main() {
+  const runtime = JsBoxlite.withDefaultConfig();
+
+  const pulled = await runtime.images.pull("alpine:latest");
+  console.log(pulled.reference, pulled.configDigest, pulled.layerCount);
+
+  const images = await runtime.images.list();
+  for (const image of images) {
+    console.log(image.repository, image.tag, image.id);
+  }
+  runtime.close();
+}
+
+main();
+```
+
+### Remote BoxLite server (REST) and the routing prefix
+
+Connect to a remote BoxLite server instead of the local runtime. `JsBoxlite.rest` takes a single `BoxliteRestOptions` bag — not `(url, credential)` positionally.
+
+```typescript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { ApiKeyCredential, BoxliteRestOptions, JsBoxlite } from "@boxlite-ai/boxlite";
+
+const rt = JsBoxlite.rest(
+  new BoxliteRestOptions({
+    url: "http://localhost:8100",
+    credential: new ApiKeyCredential("<YOUR_API_KEY>"), // TODO: replace
+  }),
+);
+const boxes = await rt.listInfo();
+
+// Env discovery -- returns null when BOXLITE_API_KEY is unset:
+const cred = ApiKeyCredential.fromEnv();
+const rt2 = JsBoxlite.rest(new BoxliteRestOptions({ url: "http://localhost:8100", credential: cred ?? undefined }));
+```
+
+`ApiKeyCredential` structurally satisfies the exported `Credential` interface, so functions can type their parameter as `Credential` and accept any future credential kind without a signature change.
+
+**Routing prefix (vendor-agnostic).** Box-scoped requests resolve to `{url}/v1/{pathPrefix}/…`. The `v1` segment is hardcoded; `pathPrefix` is an opaque, deployment-defined routing value that the server tells the client to use, surfaced as `Principal.path_prefix` from `GET /v1/me`. Its semantics are vendor-specific: BoxLite cloud uses it for the organization ID; another deployment may use a workspace name, a region+team pair, or any other multi-segment value such as `us-east/team-42`.
+
+```typescript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { JsBoxlite, BoxliteRestOptions, ApiKeyCredential } from "@boxlite-ai/boxlite";
+
+const rt = JsBoxlite.rest(new BoxliteRestOptions({
+  url: "https://api.boxlite.ai",
+  credential: new ApiKeyCredential("<YOUR_API_KEY>"), // TODO: replace
+  pathPrefix: "acme",   // -> requests hit /v1/acme/boxes
+}));
+```
+
+When `pathPrefix` is unset, the client builds URLs without the segment (`/v1/boxes/…`) — the canonical shape for single-tenant deployments such as the local `boxlite serve` reference server. (The CLI captures `Principal.path_prefix` at login and caches it under the active profile, so subsequent `boxlite` commands route correctly without an extra flag.)
+
+### Metric fields (note: named differently from Python/C/Go)
+
+`JsRuntimeMetrics`:
+
+| Field | Type | Notes |
+| - | - | - |
+| `boxesCreatedTotal` | `number` | Cumulative created |
+| `boxesFailedTotal` | `number` | Creation failures |
+| `numRunningBoxes` | `number` | Currently running (**not** `activeBoxes`) |
+| `totalCommandsExecuted` | `number` | Cumulative commands |
+| `totalExecErrors` | `number` | Cumulative execution errors |
+
+`JsBoxMetrics` (partial):
+
+| Field | Type | Notes |
+| - | - | - |
+| `commandsExecutedTotal` / `execErrorsTotal` | `number` | Per-box counts |
+| `bytesSentTotal` / `bytesReceivedTotal` | `number` | stdin/stdout bytes |
+| `cpuPercent` | `number?` | CPU percentage |
+| `memoryBytes` | `number?` | Memory bytes (**not** `memoryUsageBytes`) |
+| `networkBytesSent` / `networkBytesReceived` | `number?` | Network bytes |
+| `guestBootDurationMs` / `totalCreateDurationMs` | `number?` | Timings (milliseconds) |
+
+### `JsBoxInfo` / state
+
+`await box.info()` returns `JsBoxInfo`: `{ id, name?, state: JsBoxStateInfo, createdAt, image, cpus, memoryMib, healthStatus }`.
+
+> `cpus` / `memoryMib`: the configured resource values. To read the real allocation, run `nproc` / read `/proc/meminfo` inside the box.
+
+State lives in `JsBoxStateInfo`: `{ status: string; running: boolean; pid?: number }`. Correct access: `box.info().state.status`.
+
+***
+
+## Troubleshooting
+
+### Package name / import error
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+Error: Cannot find module 'boxlite'
+```
+
+Cause: wrong package name. The correct name is `@boxlite-ai/boxlite`. Likewise, `import { Boxlite } from '@boxlite/sdk'` is entirely wrong (neither the package nor the class name exists) — the runtime class is `JsBoxlite`.
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+SyntaxError: Cannot use import statement outside a module
+```
+
+Cause: the SDK is ESM-only. Rename the file to `.mjs`, or add `"type": "module"` to `package.json`; CommonJS projects should use a dynamic `import()`.
+
+### Passing a string for a volume's `readOnly`
+
+If you carry over the CLI's `ro`/`rw` syntax or write `readOnly` as a string, the native layer's type conversion fails (a napi error, thrown as a **bare `Error`**):
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+Error: Failed to convert napi value into rust type `bool` on JsVolumeSpec.readOnly on JsBoxOptions.volumes
+```
+
+> Note: the Node-side error is the napi message above, **not** the Python-side `TypeError: 'str' object cannot be cast as 'bool'` (that one is the Python binding's message).
+
+Fix: `readOnly` is a **boolean** — `{ hostPath, guestPath, readOnly: true }` (read-only) or `false`/omitted (read-write). `ro`/`rw` is only the CLI's syntax (`boxlite -v host:box:ro`) and is unrelated to the SDK's boolean field.
+
+### A non-zero exit code does not raise
+
+`exec` reports a non-zero exit through `exit_code` / `exitCode`, not by raising. See [Error Handling](/guides/error-handling#troubleshooting).
+
+### Command not found / startup failure throws a bare `Error`
+
+When a command is not found, the thrown value is a **bare `Error`** (`instanceof BoxliteError === false`), with a message like `internal error: spawn_failed: ...`; image pull failures and missing virtualization also throw a standard `Error`. So you should **not** rely solely on `catch (e) { if (e instanceof ExecError) ... }` — that misses these cases. Use a general fallback:
+
+```typescript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+try {
+  await box.exec("this-command-does-not-exist");
+} catch (err) {
+  // May be an ExecError/TimeoutError, or a bare Error
+  console.error("execution error:", err instanceof Error ? err.message : String(err));
+}
+```
+
+`ExecError`/`TimeoutError`/`ParseError` are still thrown by some wrapper-layer APIs (for example, `ComputerBox.cursorPosition` throws `ParseError` on a parse failure) and can be handled specifically; but the low-level exec path mostly throws bare `Error`.
+
+### Accessing a sync getter before creation
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+Error: Box not yet created. Call exec() first or use getId() async method.
+```
+
+Cause: the box is created lazily, so the sync `box.id` getter is unavailable before the first `exec()`/`start`. Use `await box.getId()` / `await box.getInfo()` instead, or run one command first. (`box.info()` is itself async — `await` it.)
+
+### Startup failure in a non-virtualization environment
+
+On Linux without KVM, or on macOS Intel, the VM cannot start, and `exec()` throws (the process does not crash; the error can be caught).
+
+* Linux: confirm `/dev/kvm` exists and the current user is in the `kvm` group (`ls -l /dev/kvm`).
+* macOS: requires Apple Silicon (uses Hypervisor.framework, no KVM needed); Intel Macs are not supported.
+* Windows: runs via WSL2 + KVM; native Windows is not supported.
+
+### BrowserBox connection needs `playwright-core`
+
+`playwright-core` is an optional peerDependency; without it, `import { chromium } from "playwright-core"` fails. Only BrowserBox needs it: `npm install playwright-core`. Also, `endpoint()` (direct CDP) does not support WebKit; use `playwrightEndpoint()` for WebKit.
+
+***
+
+### `Cannot find package 'boxlite'` / module not found
+
+The package name has a scope. Both install and import must use `@boxlite-ai/boxlite`:
+
+```javascript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// Wrong
+import { SimpleBox } from "boxlite"; // does not exist
+// Correct
+import { SimpleBox } from "@boxlite-ai/boxlite";
+```
+
+## See Also
+
+* [Python SDK reference](/reference/python)
+* [SDK reference overview](/reference/index)

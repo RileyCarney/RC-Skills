@@ -1,0 +1,403 @@
+# Box types
+Source: https://docs.boxlite.ai/manage-sandbox/sandbox-types
+
+Six one-line constructors, each returning an isolated environment tuned for one job: commands, code, a browser, a desktop, an interactive terminal, or an AI agent.
+
+Pick by what the sandbox has to do. Every type inherits from `SimpleBox`, so `exec()` / `copy_in()` / `copy_out()` remain available whichever you choose, and all six are **async context managers** that create and start the microVM on entry.
+
+## Which type do you need?
+
+| Type | Use case | When to choose it | Default image | Key specialized methods (Python) |
+| - | - | - | - | - |
+| `SimpleBox` | General-purpose sandbox: run any command or executable | You need a fully custom image, ports, or volumes, or you run a non-Python program | You must specify `image` or `rootfs_path` yourself | `exec()` / `copy_in()` / `copy_out()` |
+| `CodeBox` | Securely execute Python code snippets | Running untrusted code, AI-generated code, or doing data computation | `python:slim` | `run()` / `run_script()` / `install_package(s)()` |
+| `BrowserBox` | Remote browser automation | Use Playwright/CDP to scrape pages or run end-to-end browser tasks | `mcr.microsoft.com/playwright:v1.58.0-jammy` | `playwright_endpoint()` / `endpoint()` / `connect()` |
+| `ComputerBox` | Desktop GUI automation (mouse/keyboard/screenshot) | A computer-use agent operating a real Linux desktop | `lscr.io/linuxserver/webtop:ubuntu-xfce` | `screenshot()` / `left_click()` / `type()` / `key()` |
+| `InteractiveBox` | Interactive terminal (PTY forwarding) | Manually entering a shell to debug, like `docker exec -it` | You must specify `image` yourself | `wait()` (stdin/stdout are forwarded automatically on entry) |
+| `SkillBox` | Run the Claude Code CLI inside a sandbox, with a noVNC desktop | Host an AI agent, install and invoke skills, observe visually | `ghcr.io/boxlite-ai/boxlite-skillbox:0.1.0` | `call()` / `install_skill()` / `wait_until_ready()` |
+
+> Selection summary: **choose `SimpleBox` to run commands; `CodeBox` to run Python; `BrowserBox` for a browser; `ComputerBox` for a desktop; `InteractiveBox` for a manual terminal; `SkillBox` for an AI agent.**
+>
+> The high-level wrappers for `ComputerBox` and `InteractiveBox` are **provided only in Python and Node**; the other language SDKs (C / Go / Rust) currently expose only the lower-level `exec(tty=...)`.
+>
+> Node uses the same six names with `new` and camelCase options, and `await using` in place of `async with` — `await using box = new CodeBox()`. A verified Node example is on the same tab group as each type's Python example below; full signatures are in the [Node.js SDK reference](/reference/nodejs#parameters-returns).
+
+***
+
+### SimpleBox — the general-purpose base class
+
+Use it to run any command, use your own image, or get fine-grained control over resources, volumes, ports, and networking. It is also the parent class of the other five types.
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+from boxlite import SimpleBox, BoxliteError
+
+async def main() -> None:
+    try:
+        # at least one of image and rootfs_path must be provided, otherwise construction raises ValueError
+        async with SimpleBox(image="alpine:latest") as box:
+            # the exec timeout parameter is timeout (float, seconds); env is a dict
+            result = await box.exec("echo", "hi", env={"FOO": "bar"}, timeout=30.0)
+            # a non-zero exit code does not raise; check exit_code yourself
+            if result.exit_code != 0:
+                print(f"command failed ({result.exit_code}): {result.stderr}")
+            else:
+                print(result.stdout.strip())  # -> hi
+    except RuntimeError as exc:
+        print(f"startup failed: {exc}")
+    except BoxliteError as exc:
+        print(f"BoxLite error: {exc}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { BoxliteError, SimpleBox } from "@boxlite-ai/boxlite";
+
+async function main(): Promise<void> {
+  try {
+    // at least one of image / rootfsPath must be provided, otherwise the constructor throws
+    await using box = new SimpleBox({ image: "alpine:latest" });
+    // args is always an array; the exec timeout option is timeoutSecs; env is Record<string,string>
+    const result = await box.exec("echo", ["hi"], { FOO: "bar" }, { timeoutSecs: 30 });
+    // a non-zero exit code does not throw; check exitCode yourself
+    if (result.exitCode !== 0) {
+      console.error(`command failed (${result.exitCode}): ${result.stderr}`);
+    } else {
+      console.log(result.stdout.trim()); // -> hi
+    }
+  } catch (err) {
+    console.error(`${err instanceof BoxliteError ? "BoxLite error" : "startup failed"}: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+main();
+```
+
+Key `SimpleBox` constructor arguments: `image` / `rootfs_path` (at least one required), `memory_mib`, `cpus`, `name`, `auto_remove` (default `True`), `reuse_existing` (default `False`). Other advanced options (`volumes` / `ports` / `network` / `secrets` / `advanced`, etc.) are forwarded through `**kwargs` to the underlying `BoxOptions`.
+
+Verified: real run prints `hi`.
+
+***
+
+### CodeBox — Python code execution
+
+Use it to execute untrusted or AI-generated Python code, or to run computation or scripting tasks.
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+from boxlite import CodeBox, BoxliteError
+
+async def main() -> None:
+    try:
+        async with CodeBox() as cb:
+            await cb.install_package("requests")  # pip install requests
+            out = await cb.run("import requests; print(requests.__version__)")
+            print(out.strip())
+    except RuntimeError as exc:
+        print(f"startup failed: {exc}")
+    except BoxliteError as exc:
+        print(f"BoxLite error: {exc}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { BoxliteError, CodeBox } from "@boxlite-ai/boxlite";
+
+async function main(): Promise<void> {
+  try {
+    await using cb = new CodeBox();
+    await cb.installPackage("requests"); // pip install requests
+    const out = await cb.run("import requests; print(requests.__version__)");
+    console.log(out.trim());
+  } catch (err) {
+    console.error(`error: ${err instanceof BoxliteError ? err.message : err}`);
+  }
+}
+
+main();
+```
+
+> Note: the `timeout` of `CodeBox.run(code, timeout=...)` is an `int` and is not enforced. For reliable timeout control, use `exec(..., timeout=<float>)` inherited from `SimpleBox` instead. `run()` returns only stdout; if you also need stderr, use `exec()`.
+
+Verified: real run prints the installed `requests` version (`2.34.2` at time of writing).
+
+***
+
+### BrowserBox — browser automation
+
+Use it to run Playwright in an isolated environment or connect over CDP for browser automation. BrowserBox exposes a browser endpoint to the host, and the host-side Playwright connects to it.
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# pip install boxlite playwright
+import asyncio
+from boxlite import BrowserBox, BrowserBoxOptions, BoxliteError
+
+async def main() -> None:
+    try:
+        # the browser type is passed via BrowserBoxOptions (BrowserBox's first positional argument is options)
+        async with BrowserBox(BrowserBoxOptions(browser="chromium")) as bb:
+            # Playwright Server mode (port defaults to 3000, supports all browser types)
+            endpoint = await bb.playwright_endpoint(timeout=60)
+            print(f"Playwright endpoint: {endpoint}")
+
+            # connect into the in-sandbox browser using the host's playwright
+            from playwright.async_api import async_playwright
+            async with async_playwright() as p:
+                browser = await p.chromium.connect(endpoint)
+                page = await browser.new_page()
+                await page.goto("https://example.com")
+                print(await page.title())  # -> Example Domain
+                await browser.close()
+    except RuntimeError as exc:
+        print(f"startup failed: {exc}")
+    except BoxliteError as exc:
+        print(f"BoxLite error: {exc}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// npm install @boxlite-ai/boxlite playwright-core
+import { BoxliteError, BrowserBox } from "@boxlite-ai/boxlite";
+import { chromium } from "playwright-core";
+
+async function main(): Promise<void> {
+  try {
+    // the browser type is passed via BrowserBoxOptions
+    await using bb = new BrowserBox({ browser: "chromium" });
+    // Playwright Server mode (port defaults to 3000, supports all browser types)
+    const endpoint = await bb.playwrightEndpoint(60);
+    console.log(`Playwright endpoint: ${endpoint}`);
+
+    // connect into the in-sandbox browser using the host's playwright-core
+    const browser = await chromium.connect(endpoint);
+    const page = await browser.newPage();
+    await page.goto("https://example.com");
+    console.log(await page.title()); // -> Example Domain
+    await browser.close();
+  } catch (err) {
+    console.error(`error: ${err instanceof BoxliteError ? err.message : err}`);
+  }
+}
+
+main();
+```
+
+> `playwright_endpoint()` (Playwright Server mode) supports chromium / firefox / webkit; `endpoint()` (direct CDP/BiDi) **does not support WebKit**. The two modes are mutually exclusive — pick one as needed.
+
+***
+
+### ComputerBox — desktop automation
+
+Use it for a computer-use agent that drives a real Linux desktop (XFCE) through mouse, keyboard, and screenshots. You can watch it live in a browser via noVNC.
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+from boxlite import ComputerBox, BoxliteError
+
+async def main() -> None:
+    try:
+        async with ComputerBox() as cb:
+            await cb.wait_until_ready(timeout=60)   # wait for the desktop to be ready
+            print(f"screen resolution: {await cb.get_screen_size()}")
+
+            await cb.mouse_move(400, 300)
+            await cb.left_click()
+            await cb.type("hello desktop")
+
+            shot = await cb.screenshot()             # returns a dict (contains screenshot data)
+            print(f"screenshot fields: {list(shot.keys())}")
+    except RuntimeError as exc:
+        print(f"startup failed: {exc}")
+    except BoxliteError as exc:
+        print(f"BoxLite error: {exc}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { BoxliteError, ComputerBox } from "@boxlite-ai/boxlite";
+
+async function main(): Promise<void> {
+  try {
+    await using cb = new ComputerBox();
+    await cb.waitUntilReady(60); // wait for the desktop to be ready
+    console.log(`screen resolution: ${await cb.getScreenSize()}`);
+
+    await cb.mouseMove(400, 300);
+    await cb.leftClick();
+    await cb.type("hello desktop");
+
+    const shot = await cb.screenshot(); // returns a Screenshot object
+    console.log(`screenshot fields: ${Object.keys(shot)}`);
+  } catch (err) {
+    console.error(`error: ${err instanceof BoxliteError ? err.message : err}`);
+  }
+}
+
+main();
+```
+
+`ComputerBox` allocates higher resources by default (`cpu=2`, `memory=2048`), and its GUI ports default to HTTP `3000` / HTTPS `3001`.
+
+***
+
+### InteractiveBox — interactive terminal
+
+Use it to manually enter a sandbox shell to debug, like `docker exec -it`. On `async with` entry it automatically starts a shell and forwards stdin/stdout in both directions; type `exit` to leave.
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+from boxlite import InteractiveBox, BoxliteError
+
+async def main() -> None:
+    try:
+        # image is required; when tty=None, sys.stdin.isatty() is auto-detected
+        async with InteractiveBox(image="alpine:latest") as box:
+            # once entered you are inside the sandbox shell; type commands to see live output, type exit to leave
+            await box.wait()
+    except RuntimeError as exc:
+        print(f"startup failed: {exc}")
+    except BoxliteError as exc:
+        print(f"BoxLite error: {exc}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { BoxliteError, InteractiveBox } from "@boxlite-ai/boxlite";
+
+async function main(): Promise<void> {
+  try {
+    // image is required
+    await using box = new InteractiveBox({ image: "alpine:latest" });
+    // once entered you are inside the sandbox shell; stdin/stdout are forwarded automatically
+    await box.wait();
+  } catch (err) {
+    console.error(`error: ${err instanceof BoxliteError ? err.message : err}`);
+  }
+}
+
+main();
+```
+
+> When run in a non-TTY environment (a redirected pipe, some CI), `tty` is auto-detected as `False` and interactive input is not forwarded. To force interactivity, pass `tty=True` explicitly.
+
+***
+
+### SkillBox — run Claude Code inside a sandbox
+
+> `SkillBox` is purpose-built for the Claude Code CLI: its image installs `claude` and
+> starts it with a computer-use MCP config. To run a different agent CLI, install it into
+> a `SimpleBox` yourself — see [Run Codex](/agent-in-box/run-codex),
+> [Run Pi](/agent-in-box/run-pi), or [Run OpenCode](/agent-in-box/run-opencode).
+
+Use it to host an AI agent so the Claude Code CLI works in an isolated environment; you can install skills, hold multi-turn conversations, and watch live through the built-in noVNC desktop.
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+import os
+from boxlite import SkillBox, BoxliteError
+
+async def main() -> None:
+    # an OAuth token must be provided: via constructor argument or the CLAUDE_CODE_OAUTH_TOKEN environment variable, otherwise entry raises ValueError
+    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "<YOUR_CLAUDE_OAUTH_TOKEN>")  # TODO: replace with your token
+    try:
+        async with SkillBox(skills=["anthropics/skills"], oauth_token=token) as box:
+            await box.wait_until_ready(timeout=60)
+            # open https://localhost:<gui_https_port> in a browser to watch live
+            answer = await box.call("What skills do you have?")
+            print(answer)
+    except ValueError as exc:
+        print(f"configuration missing: {exc}")        # e.g. no OAuth token provided
+    except RuntimeError as exc:
+        print(f"startup failed: {exc}")
+    except BoxliteError as exc:
+        print(f"BoxLite error: {exc}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { BoxliteError, SkillBox } from "@boxlite-ai/boxlite";
+
+async function main(): Promise<void> {
+  // an OAuth token must be provided: via constructor option or CLAUDE_CODE_OAUTH_TOKEN, otherwise the constructor throws
+  const token = process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "<YOUR_CLAUDE_OAUTH_TOKEN>"; // TODO: replace
+  try {
+    await using box = new SkillBox({ skills: ["anthropics/skills"], oauthToken: token });
+    await box.waitUntilReady(60);
+    // open https://localhost:<guiHttpsPort> in a browser to watch live
+    const answer = await box.call("What skills do you have?");
+    console.log(answer);
+  } catch (err) {
+    console.error(`error: ${err instanceof BoxliteError ? err.message : err}`);
+  }
+}
+
+main();
+```
+
+`SkillBox` raises the memory default to `memory_mib=4096`; its `disk_size_gb=10` is the runtime-wide default; its noVNC GUI ports default to `0` at construction time (randomly assigned), and `auto_remove=True`.
+
+***
+
+## Parameters and Returns
+
+### Key constructor arguments per type (Python)
+
+| Type | Key arguments (with defaults) | Required |
+| - | - | - |
+| `SimpleBox` | `image=None`, `rootfs_path=None`, `memory_mib=None`, `cpus=None`, `name=None`, `runtime=None`, `auto_remove=True`, `reuse_existing=False` | At least one of `image` or `rootfs_path` |
+| `CodeBox` | `image="python:slim"`, `memory_mib=None`, `cpus=None` | None (has a default image) |
+| `BrowserBox` | First positional argument is `options: BrowserBoxOptions \| None`; `BrowserBoxOptions` fields: `browser="chromium"`, `memory=2048`, `cpu=2`, `port=None` (default 3000), `cdp_port=None` (default 9222) | None |
+| `ComputerBox` | `cpu=2`, `memory=2048`, `gui_http_port=3000`, `gui_https_port=3001` | None |
+| `InteractiveBox` | `image` (positional), `shell="/bin/sh"`, `tty=None`, `auto_remove=True` | `image` required |
+| `SkillBox` | `skills=None`, `oauth_token=None`, `name="skill-box"`, `memory_mib=4096`, `disk_size_gb=10`, `gui_http_port=0`, `gui_https_port=0`, `auto_remove=True` | OAuth token (argument or environment variable) |
+
+> Resource defaults: when `cpus` / `memory_mib` are left unset, the runtime applies **1 vCPU / 1024 MiB** (`vm_defaults` in `src/boxlite/src/runtime/constants.rs`), not any SDK-level constant. `BrowserBox` and `ComputerBox` override with their own higher defaults (`cpu=2`, `memory=2048`). Set `cpus` / `memory_mib` explicitly for predictable capacity planning. See [Compute resources](/manage-sandbox/compute-resources).
+
+### Common capabilities (inherited by all types from SimpleBox)
+
+| Method | Type | Description |
+| - | - | - |
+| `exec(cmd, *args, env=None, user=None, timeout=None, cwd=None)` | async | Run a command, returns `ExecResult`; `timeout` is a `float` in seconds, `env` is a `dict` |
+| `copy_in(host_path, container_dest, ...)` | async | Copy files from the host into the sandbox |
+| `copy_out(container_src, host_dest, ...)` | async | Copy files from the sandbox to the host |
+| `start()` / `stop()` | async | Start / stop (`async with` manages this automatically) |
+| `info()` | **async** | `await` it; returns `BoxInfo` |
+| `id` | property | Accessing it before start raises `RuntimeError` |
+| `created` | property | Whether the Box was newly created (`True`) or an existing same-named Box was reused (`False`); returns `None` before start |
+
+### `ExecResult` fields (Python wrapper layer)
+
+| Field | Type | Description |
+| - | - | - |
+| `exit_code` | `int` | Exit code; a non-zero value **does not raise**, check it yourself |
+| `stdout` | `str` | Standard output |
+| `stderr` | `str` | Standard error |
+| `error_message` | `str \| None` | Non-`None` only when the process died abnormally |
+
+***
+
+## Troubleshooting
+
+| Symptom / error | Cause | Fix |
+| - | - | - |
+| `SimpleBox(...)` raises `ValueError` (missing image/rootfs) | `SimpleBox` requires at least one of `image` and `rootfs_path` | Pass `SimpleBox(image="alpine:latest")` or `rootfs_path=...` |
+| `import boxlite; boxlite.AdvancedBoxOptions` → `AttributeError` | An SDK older than 0.10 required the submodule path | Upgrade, then `from boxlite import AdvancedBoxOptions`; security options are passed via `BoxOptions(advanced=AdvancedBoxOptions(security=SecurityOptions.maximum()))` — there is no top-level `security=` keyword |
+| `SkillBox` raises `ValueError` on entry | No Claude OAuth token was provided | Pass `oauth_token=...` or set the `CLAUDE_CODE_OAUTH_TOKEN` environment variable |
+| A command ran but "succeeded without error yet the result is wrong" | `exec` does not raise on a non-zero exit | Check `result.exit_code != 0` and read `result.stderr` |
+| A missing command / image pull failure raises `RuntimeError` or a bare `Error`, and catching `BoxliteError` does not match | These paths raise a standard `RuntimeError` (Python) / a bare `Error` (Node), **not** `BoxliteError` | Catch with `except RuntimeError` (Python) / a general `catch (err: Error)` (Node); see each example |
+| Startup reports no virtualization / no `/dev/kvm` | The current environment has no hardware virtualization (environment constraint) | Linux requires KVM and the user in the `kvm` group; macOS Apple Silicon uses Hypervisor.framework automatically; WSL2 requires KVM enabled. Environments without virtualization cannot start a microVM |
+| `box.info()` returns a coroutine instead of `BoxInfo` | `info()` is **async** | `await box.info()` |
+| `BrowserBox.endpoint()` fails to connect to WebKit | `endpoint()` (direct CDP/BiDi) does not support WebKit | Use `playwright_endpoint()` (Playwright Server mode, supports all browsers) |
+| Node: `import { Boxlite } from 'boxlite'` reports a missing module/export | The package name should be `@boxlite-ai/boxlite`, and there is no bare `Boxlite` class | Use `import { CodeBox } from "@boxlite-ai/boxlite"`; the runtime handle class is `JsBoxlite` |

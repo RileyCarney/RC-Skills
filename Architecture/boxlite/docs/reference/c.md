@@ -1,0 +1,883 @@
+# C SDK reference
+Source: https://docs.boxlite.ai/reference/c
+
+BoxLite's C SDK embeds hardware-isolated microVM sandboxes into any C/C++ program, game engine, or other language's FFI layer through a stable C ABI (boxlite.h). Its core is an **async-callback, post-and-drain event model**: after you start an operation and register a callback, you must pump the event loop yourself (boxlite_runtime_drain) to receive results.
+
+***
+
+## What the C SDK gives you
+
+The C SDK offers two API surfaces for two levels of usage:
+
+| API style | Entry prefix | Model | When to use |
+| - | - | - | - |
+| **Simple API** | `boxlite_simple_*` | **Synchronous, blocking**, manages the runtime for you | Scripts, prototypes, one-shot commands, buffered output |
+| **Native API** | `boxlite_*` | **Async callbacks, post-and-drain** | Streaming output, custom volumes/network/security, multi-box orchestration, embedding BoxLite into an existing event loop |
+
+**Key mental model**: the Native API is not "call and get a result back". It is "start an operation -> the operation runs in a background Tokio task -> on completion it posts an event to the runtime queue -> you call `boxlite_runtime_drain` to dispatch queued events to your callbacks". **If you never call drain, your callbacks never fire.** This is the most common source of errors with this SDK, and it is emphasized repeatedly below.
+
+> **API source of truth**: the function that runs a command is `boxlite_box_exec` (there is no `boxlite_execute`); `boxlite_execution_wait`, `boxlite_stop_box`, and the rest are all callback-style. Treat `sdks/c/include/boxlite.h` as the single source of truth — every signature on this page matches that header.
+
+***
+
+## Prerequisites
+
+* The BoxLite C library and headers and a machine with hardware virtualization — see [Installation](/getting-started/installation#platform-and-virtualization-requirements-common-to-all-sdks).
+* **A C11-compatible compiler**: GCC or Clang.
+* **Build artifacts** (produced by compiling the C crate from the repository root):
+  * Shared library: `target/release/libboxlite.dylib` (macOS) / `libboxlite.so` (Linux)
+  * Static library: `target/release/libboxlite.a`
+  * Header: `sdks/c/include/boxlite.h` (generated automatically by cbindgen)
+
+Build:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Run from the repository root
+# Fetch submodules (required)
+git submodule update --init --recursive
+# Build the C SDK, producing libboxlite.* and sdks/c/include/boxlite.h
+cargo build --release -p boxlite-c
+```
+
+Compile your program (replace the paths with your actual paths):
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Replace <YOUR_BOXLITE_ROOT> with the absolute path to the BoxLite repository root
+gcc \
+  -I<YOUR_BOXLITE_ROOT>/sdks/c/include \
+  -L<YOUR_BOXLITE_ROOT>/target/release \
+  -lboxlite \
+  my_program.c -o my_program
+# macOS: let the executable find the dylib
+install_name_tool -add_rpath <YOUR_BOXLITE_ROOT>/target/release ./my_program
+# Linux: use LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=<YOUR_BOXLITE_ROOT>/target/release:$LD_LIBRARY_PATH
+./my_program
+```
+
+***
+
+## Quick Example (minimal happy path)
+
+### Simple API — synchronous, least code (recommended starting point)
+
+The Simple API manages the runtime itself; commands run synchronously and return buffered `stdout`/`stderr`. No drain or callbacks are needed, which makes it the best entry point.
+
+```c theme={"theme":{"light":"github-light","dark":"github-dark"}}
+/* simple_quickstart.c
+ * See Section 2 for compilation. Can be copied and run directly.
+ */
+#include <stdio.h>
+#include "boxlite.h"
+
+int main(void) {
+    printf("BoxLite C SDK version: %s\n", boxlite_version());
+
+    CBoxliteSimple *box = NULL;
+    CBoxliteError error = {0};
+
+    /* 0 = use defaults (cpus / memory_mib). */
+    if (boxlite_simple_new("python:slim", 0, 0, &box, &error) != Ok) {
+        fprintf(stderr, "create failed (code %d): %s\n",
+                error.code, error.message ? error.message : "unknown");
+        boxlite_error_free(&error);   /* free error.message even on failure */
+        return 1;
+    }
+
+    /* Note: argc is the actual argument count; args does not need NULL termination (read by argc). */
+    const char *args[] = {"-c", "print('Hello from BoxLite!')"};
+    CBoxliteExecResult *result = NULL;
+
+    if (boxlite_simple_run(box, "python", args, 2, &result, &error) != Ok) {
+        fprintf(stderr, "run failed (code %d): %s\n",
+                error.code, error.message ? error.message : "unknown");
+        boxlite_error_free(&error);
+        boxlite_simple_free(box);
+        return 1;
+    }
+
+    /* A non-zero exit code does *not* report an error; check exit_code yourself. */
+    printf("exit_code = %d\n", result->exit_code);
+    printf("stdout    = %s",  result->stdout_text ? result->stdout_text : "");
+    if (result->stderr_text && result->stderr_text[0]) {
+        printf("stderr    = %s", result->stderr_text);
+    }
+
+    boxlite_result_free(result);   /* free the result */
+    boxlite_simple_free(box);      /* automatically stop + remove + free the runtime */
+    return 0;
+}
+```
+
+### Native API — full callback + post-and-drain skeleton
+
+The following is the standard pattern for the Native API: **register callbacks -> start the async operation -> loop on drain until a callback sets a completion flag**. This is the core pattern of the SDK.
+
+```c theme={"theme":{"light":"github-light","dark":"github-dark"}}
+/* native_quickstart.c
+ * Demonstrates the full post-and-drain model: create box -> exec -> stream output -> wait for exit code -> cleanup.
+ * See Section 2 for compilation. Can be copied and run directly.
+ */
+#include <stdio.h>
+#include <string.h>
+#include "boxlite.h"
+
+/* ---- Use user_data to pass state between callbacks and the main thread ---- */
+
+typedef struct {
+    CBoxHandle *box;     /* the create callback writes the result here */
+    int         done;    /* operation-complete flag; the main loop stops draining based on it */
+    int         failed;  /* whether the operation failed */
+    int         code;    /* exec exit code (filled in by the wait callback) */
+} OpState;
+
+/* box creation callback: CBoxCreateBoxCb = void(*)(CBoxHandle*, CBoxliteError*, void*) */
+static void on_box_created(CBoxHandle *box, CBoxliteError *err, void *ud) {
+    OpState *st = (OpState *)ud;
+    if (err && err->code != Ok) {
+        fprintf(stderr, "create failed (code %d): %s\n",
+                err->code, err->message ? err->message : "unknown");
+        st->failed = 1;
+    } else {
+        st->box = box;   /* box ownership is transferred to us; free it with boxlite_box_free at the end */
+    }
+    st->done = 1;
+}
+
+/* streaming stdout: CBoxStdoutCb = void(*)(const uint8_t*, size_t, void*) */
+static void on_stdout(const uint8_t *data, size_t len, void *ud) {
+    (void)ud;
+    fwrite(data, 1, len, stdout);
+}
+
+/* streaming stderr: CBoxStderrCb = void(*)(const uint8_t*, size_t, void*) */
+static void on_stderr(const uint8_t *data, size_t len, void *ud) {
+    (void)ud;
+    fwrite(data, 1, len, stderr);
+}
+
+/* exec wait completion: CExecutionWaitCb = void(*)(int exit_code, CBoxliteError*, void*) */
+static void on_wait_done(int exit_code, CBoxliteError *err, void *ud) {
+    OpState *st = (OpState *)ud;
+    if (err && err->code != Ok) {
+        fprintf(stderr, "wait failed (code %d): %s\n",
+                err->code, err->message ? err->message : "unknown");
+        st->failed = 1;
+    }
+    st->code = exit_code;   /* the exit code is returned via the callback's int parameter */
+    st->done = 1;
+}
+
+/* box stop/remove completion: CBoxStopBoxCb / CBoxRemoveBoxCb = void(*)(CBoxliteError*, void*) */
+static void on_simple_done(CBoxliteError *err, void *ud) {
+    OpState *st = (OpState *)ud;
+    if (err && err->code != Ok) {
+        fprintf(stderr, "op failed (code %d): %s\n",
+                err->code, err->message ? err->message : "unknown");
+        st->failed = 1;
+    }
+    st->done = 1;
+}
+
+/* Event pump: drain repeatedly until st->done is set to 1 by some callback.
+ * timeout_ms < 0 means block until at least one event arrives. */
+static void pump_until_done(CBoxliteRuntime *rt, OpState *st) {
+    CBoxliteError drain_err = {0};
+    while (!st->done) {
+        int n = boxlite_runtime_drain(rt, -1, &drain_err);
+        if (n < 0) {
+            fprintf(stderr, "drain error (code %d): %s\n",
+                    drain_err.code, drain_err.message ? drain_err.message : "unknown");
+            boxlite_error_free(&drain_err);
+            st->failed = 1;
+            return;
+        }
+    }
+}
+
+int main(void) {
+    CBoxliteRuntime *runtime = NULL;
+    CBoxliteError error = {0};
+
+    /* 1) Create the runtime (synchronous). home_dir=NULL uses the default ~/.boxlite; no custom registry. */
+    if (boxlite_runtime_new(NULL, NULL, 0, &runtime, &error) != Ok) {
+        fprintf(stderr, "runtime_new failed (code %d): %s\n",
+                error.code, error.message ? error.message : "unknown");
+        boxlite_error_free(&error);
+        return 1;
+    }
+
+    /* 2) Build the box options (synchronous setters). */
+    CBoxliteOptions *opts = NULL;
+    if (boxlite_options_new("alpine:3.19", &opts, &error) != Ok) {
+        fprintf(stderr, "options_new failed (code %d): %s\n",
+                error.code, error.message ? error.message : "unknown");
+        boxlite_error_free(&error);
+        boxlite_runtime_free(runtime);
+        return 1;
+    }
+    boxlite_options_set_network_enabled(opts);
+
+    /* 3) Asynchronously create the box: submit -> drive drain -> callback sets done. */
+    OpState st = {0};
+    if (boxlite_create_box(runtime, opts, on_box_created, &st, &error) != Ok) {
+        fprintf(stderr, "create_box submit failed (code %d): %s\n",
+                error.code, error.message ? error.message : "unknown");
+        boxlite_error_free(&error);
+        boxlite_options_free(opts);
+        boxlite_runtime_free(runtime);
+        return 1;
+    }
+    pump_until_done(runtime, &st);
+    boxlite_options_free(opts);   /* options have been copied into the box; can be freed immediately */
+    if (st.failed || st.box == NULL) {
+        boxlite_runtime_free(runtime);
+        return 1;
+    }
+    CBoxHandle *box = st.box;
+
+    /* 4) exec: boxlite_box_exec returns the ExecutionHandle *synchronously* (returns once the handle is obtained). */
+    const char *args[] = {"-c", "echo out; echo err 1>&2"};
+    BoxliteCommand cmd = {
+        .command      = "/bin/sh",
+        .args         = args,
+        .argc         = 2,
+        .env_pairs    = NULL,
+        .env_count    = 0,
+        .workdir      = NULL,
+        .user         = NULL,
+        .timeout_secs = 0.0,   /* 0.0 = no timeout */
+        .tty          = 0,
+    };
+    CExecutionHandle *exec = NULL;
+    if (boxlite_box_exec(box, &cmd, &exec, &error) != Ok) {
+        fprintf(stderr, "box_exec failed (code %d): %s\n",
+                error.code, error.message ? error.message : "unknown");
+        boxlite_error_free(&error);
+        boxlite_box_free(box);
+        boxlite_runtime_free(runtime);
+        return 1;
+    }
+
+    /* 5) Register streaming output callbacks (register before wait so early output is not lost). */
+    boxlite_execution_on_stdout(exec, on_stdout, NULL, &error);
+    boxlite_execution_on_stderr(exec, on_stderr, NULL, &error);
+
+    /* 6) Asynchronously wait for the exit code: submit wait -> drive drain -> callback receives exit_code.
+     *    drain also dispatches stdout/stderr chunks to the callbacks registered above. */
+    OpState wait_st = {0};
+    if (boxlite_execution_wait(exec, on_wait_done, &wait_st, &error) != Ok) {
+        fprintf(stderr, "wait submit failed (code %d): %s\n",
+                error.code, error.message ? error.message : "unknown");
+        boxlite_error_free(&error);
+        boxlite_execution_free(exec);
+        boxlite_box_free(box);
+        boxlite_runtime_free(runtime);
+        return 1;
+    }
+    pump_until_done(runtime, &wait_st);
+    printf("\nexit_code = %d\n", wait_st.code);
+
+    boxlite_execution_free(exec);
+
+    /* 7) Asynchronously remove the box (force=1: remove even if running). */
+    char *box_id = boxlite_box_id(box);   /* must be freed with boxlite_free_string */
+    OpState rm_st = {0};
+    if (boxlite_remove(runtime, box_id, 1, on_simple_done, &rm_st, &error) == Ok) {
+        pump_until_done(runtime, &rm_st);
+    } else {
+        boxlite_error_free(&error);
+    }
+    boxlite_free_string(box_id);
+
+    /* 8) Cleanup. */
+    boxlite_box_free(box);
+    boxlite_runtime_free(runtime);   /* free the runtime (NULL-safe) */
+    return 0;
+}
+```
+
+***
+
+## Runtime image management
+
+Beyond creating boxes, the runtime exposes an image handle for pulling and listing images directly. Obtain the handle synchronously with `boxlite_runtime_images`; the pull and list operations are **callback-style** and must be driven by `boxlite_runtime_drain` like any other async operation.
+
+```c theme={"theme":{"light":"github-light","dark":"github-dark"}}
+/* Pull and list images via the runtime image handle.
+ * boxlite_image_pull / _image_list are callback-based; drain dispatches them. */
+typedef struct { CImagePullResult *pull; int done; int failed; } PullState;
+typedef struct { CImageInfoList   *list; int done; int failed; } ListState;
+
+static void on_pulled(CImagePullResult *res, CBoxliteError *err, void *ud) {
+    PullState *st = (PullState *)ud;
+    if (err && err->code != Ok) { st->failed = 1; }
+    else if (res) {
+        /* res is valid only during the callback; copy fields you need to keep */
+        printf("Pulled: %s (%d layers)\n", res->reference, res->layer_count);
+    }
+    st->done = 1;
+}
+
+static void on_listed(CImageInfoList *list, CBoxliteError *err, void *ud) {
+    ListState *st = (ListState *)ud;
+    if (err && err->code != Ok) { st->failed = 1; }
+    else if (list) { printf("Images: %d\n", list->count); }
+    st->done = 1;
+}
+
+void images_demo(CBoxliteRuntime *runtime) {
+    CBoxliteError error = {0};
+    CBoxliteImageHandle *images = NULL;
+    if (boxlite_runtime_images(runtime, &images, &error) != Ok) {
+        boxlite_error_free(&error);
+        return;
+    }
+
+    PullState ps = {0};
+    if (boxlite_image_pull(images, "alpine:latest", on_pulled, &ps, &error) == Ok) {
+        CBoxliteError de = {0};
+        while (!ps.done) { if (boxlite_runtime_drain(runtime, -1, &de) < 0) { boxlite_error_free(&de); break; } }
+    } else {
+        boxlite_error_free(&error);
+    }
+
+    ListState ls = {0};
+    if (boxlite_image_list(images, on_listed, &ls, &error) == Ok) {
+        CBoxliteError de = {0};
+        while (!ls.done) { if (boxlite_runtime_drain(runtime, -1, &de) < 0) { boxlite_error_free(&de); break; } }
+    } else {
+        boxlite_error_free(&error);
+    }
+
+    boxlite_image_free(images);   /* free the image handle */
+}
+```
+
+> Note: the image pull/list operations here take a callback and `user_data` (`CBoxImagePullCb` / `CBoxImageListCb`) — they are not synchronous. The result pointers (`CImagePullResult*` / `CImageInfoList*`) passed into the callback are valid only during the callback; copy out any fields you need.
+
+Image function signatures and result structs (verified against `sdks/c/include/boxlite.h`):
+
+```c theme={"theme":{"light":"github-light","dark":"github-dark"}}
+/* Obtain the image handle (synchronous) */
+enum BoxliteErrorCode boxlite_runtime_images(
+    CBoxliteRuntime *runtime, CBoxliteImageHandle **out_handle, CBoxliteError *out_error);
+
+/* Pull / list (callback-style; require drain) */
+enum BoxliteErrorCode boxlite_image_pull(
+    CBoxliteImageHandle *handle, const char *image_ref,
+    CBoxImagePullCb cb, void *user_data, CBoxliteError *out_error);
+enum BoxliteErrorCode boxlite_image_list(
+    CBoxliteImageHandle *handle, CBoxImageListCb cb, void *user_data, CBoxliteError *out_error);
+
+void boxlite_image_free(CBoxliteImageHandle *handle);
+void boxlite_free_image_pull_result(CImagePullResult *result);
+void boxlite_free_image_info_list(CImageInfoList *list);
+```
+
+`CImagePullResult` fields:
+
+| Field | Type | Description |
+| - | - | - |
+| `reference` | `char *` | The pulled image reference |
+| `config_digest` | `char *` | The image config digest |
+| `layer_count` | `int` | Number of layers in the image |
+
+`CImageInfoList` fields:
+
+| Field | Type | Description |
+| - | - | - |
+| `items` | `CImageInfo *` | Array of `CImageInfo` entries |
+| `count` | `int` | Number of entries in `items` |
+
+Each `CImageInfo` carries `reference`, `repository`, `tag`, `id`, `cached_at` (`int64_t`), `size` (`uint64_t`), and `has_size` (`int`, whether `size` is meaningful).
+
+***
+
+## The post-and-drain model in detail
+
+The table below summarizes the complete Native API model:
+
+| Phase | Operation | Who runs it and when |
+| - | - | - |
+| **Start** | Call `boxlite_create_box / _remove / _start_box / _stop_box / _execution_wait / ...` with a callback + `user_data` | The function returns immediately (a background task has been submitted) |
+| **Background execution** | — | A Tokio task performs the actual VM operation in the background and posts an event to the runtime queue on completion |
+| **Drive (drain)** | Call `boxlite_runtime_drain(runtime, timeout_ms, &err)` on the current thread | drain takes events off the queue and runs callbacks **on the calling thread**, synchronously |
+| **Callback** | Read the result and set a completion flag inside the callback | Triggered by drain; do not block inside a callback |
+
+`timeout_ms` semantics for `boxlite_runtime_drain`:
+
+| Value | Behavior |
+| - | - |
+| `0` | Non-blocking poll (handle currently ready events and return) |
+| `< 0` | Block until at least one event can be dispatched |
+| `> 0` | Block at most this many milliseconds |
+
+Return value: the number of dispatched events, or `-1` (error, details written to `out_error`).
+
+> **Core principle**: for every async operation you start with a callback, you must call `boxlite_runtime_drain`, or the callback never fires and your program hangs waiting for the `done` flag it set itself. The simplest reliable form is `pump_until_done` from the Quick Example: `while (!done) drain(rt, -1, &err);`.
+
+**Synchronous vs. asynchronous functions** (easy to confuse):
+
+| Function | Model | Notes |
+| - | - | - |
+| `boxlite_runtime_new` / `boxlite_runtime_free` | Synchronous | Construct/release the runtime |
+| `boxlite_options_*` (all setters) | Synchronous | Modify options in place |
+| `boxlite_box_exec` | **Synchronous** | Returns an `ExecutionHandle` immediately (does not wait for the command to finish) |
+| `boxlite_execution_on_stdout / _on_stderr / _on_exit` | Synchronous registration | Register a callback; the actual chunks are dispatched during drain |
+| `boxlite_execution_stdin_write / _stdin_close` | **Synchronous** | Write/close stdin immediately |
+| `boxlite_box_id` | Synchronous | Returns a heap string; free with `boxlite_free_string` |
+| `boxlite_create_box / _start_box / _stop_box / _get / _remove` | **Async callback** | Require drain |
+| `boxlite_execution_wait / _kill / _signal / _tty_resize` | **Async callback** | Require drain |
+| `boxlite_copy_into / _copy_out` | **Async callback** | Require drain |
+| `boxlite_box_info / _get_info / _list_info / _box_metrics / _runtime_metrics` | **Async callback** | Results returned via callback |
+| `boxlite_image_pull / _image_list` | **Async callback** | Require drain (see [Runtime image management](#runtime-image-management)) |
+| `boxlite_runtime_shutdown` | **Async callback** | Require drain |
+| `boxlite_simple_*` | **Synchronous, blocking** | The Simple API manages its own runtime; no drain |
+
+***
+
+## Parameters and returns (core types and signatures)
+
+Every function returns `enum BoxliteErrorCode` (`Ok = 0` is success, unless noted otherwise). On failure, if you pass `CBoxliteError *out_error`, its `code` + `message` are filled in, and `message` must be freed with `boxlite_error_free`.
+
+### `BoxliteErrorCode` (complete enum)
+
+The full error-code enum has 22 entries (`Ok = 0` through `SessionReaped = 21`), verified against `sdks/c/include/boxlite.h`:
+
+| Name | Value | Meaning |
+| - | - | - |
+| `Ok` | 0 | Operation succeeded |
+| `Internal` | 1 | Internal error |
+| `NotFound` | 2 | Resource not found |
+| `AlreadyExists` | 3 | Resource already exists |
+| `InvalidState` | 4 | Invalid state for the operation |
+| `InvalidArgument` | 5 | Invalid argument (e.g. NULL, empty string) |
+| `Config` | 6 | Configuration error |
+| `Storage` | 7 | Storage error |
+| `Image` | 8 | Image pull/resolve error |
+| `Network` | 9 | Network error |
+| `Execution` | 10 | Command execution error |
+| `Stopped` | 11 | Resource stopped |
+| `Engine` | 12 | Engine error |
+| `Unsupported` | 13 | Unsupported operation |
+| `Database` | 14 | Database error |
+| `Portal` | 15 | Host-to-guest RPC transport error |
+| `Rpc` | 16 | RPC error |
+| `RpcTransport` | 17 | RPC transport error |
+| `Metadata` | 18 | Metadata error |
+| `UnsupportedEngine` | 19 | Unsupported engine (e.g. no virtualization) |
+| `ResourceExhausted` | 20 | A system resource limit was reached |
+| `SessionReaped` | 21 | An interactive exec session was reaped server-side after disconnect; reattach is no longer possible — start a new exec |
+
+### `BoxliteCommand` (exec command descriptor)
+
+| Field | Type | Required | Description |
+| - | - | - | - |
+| `command` | `const char *` | Yes | The command to run, **must not be NULL** |
+| `args` | `const char *const *` | No | Argument array; NULL = no arguments |
+| `argc` | `int` | No | Number of `args` elements (read by count, no NULL terminator needed) |
+| `env_pairs` | `const char *const *` | No | Flat `[k0,v0,k1,v1,...]`; NULL = inherit the environment |
+| `env_count` | `int` | No | Number of strings in `env_pairs`; a trailing unpaired (odd) entry is ignored |
+| `workdir` | `const char *` | No | Working directory inside the container; NULL = container default |
+| `user` | `const char *` | No | User (e.g. `"nobody"`, `"1000:1000"`); NULL = container default |
+| `timeout_secs` | `double` | No | Timeout in seconds; **`0.0` = no timeout** |
+| `tty` | `int` | No | Non-zero = enable a TTY (interactive/PTY programs) |
+
+### `ExecResult` (Simple API buffered result)
+
+| Field | Type | Description |
+| - | - | - |
+| `exit_code` | `int` | Process exit code (non-zero is **not** an API error; check it yourself) |
+| `stdout_text` | `char *` | Buffered standard output (may be an empty string) |
+| `stderr_text` | `char *` | Buffered standard error |
+
+> Free the whole struct with `boxlite_result_free(result)`. The Native API does not use this struct — it reads output via streaming callbacks, and the exit code arrives through the `int` parameter of `CExecutionWaitCb`.
+
+### `CBoxInfo` (box info, aligned across SDKs)
+
+| Field | Type | Description |
+| - | - | - |
+| `id` | `char *` | Box ID |
+| `name` | `char *` | Box name (may be NULL) |
+| `image` | `char *` | Image reference |
+| `status` | `char *` | Status string (e.g. `running` / `stopped`) |
+| `running` | `int` | Whether running |
+| `pid` | `int` | Process PID |
+| `cpus` | `int` | The CPU value from the image configuration. To read the real allocation, run `nproc` inside the box |
+| `memory_mib` | `int` | The memory value from the image configuration. To read the real allocation, read `/proc/meminfo` |
+| `created_at` | `int64_t` | Creation timestamp |
+
+Free a single struct with `boxlite_free_box_info`, a list with `boxlite_free_box_info_list`.
+
+### `CBoxMetrics` / `CRuntimeMetrics` (metrics fields, real names)
+
+Key `CBoxMetrics` (per-box) fields:
+
+| Field | Type | Description |
+| - | - | - |
+| `cpu_percent` | `double` | CPU usage (**not** `cpu_time_ms`) |
+| `memory_bytes` | `int64_t` | Memory in bytes (**not** `memory_usage_bytes`) |
+| `commands_executed` | `int` | Commands executed |
+| `exec_errors` | `int` | Execution errors |
+| `bytes_sent` / `bytes_received` | `int64_t` | I/O bytes |
+| `create_duration_ms` / `boot_duration_ms` | `int64_t` | Create/boot durations |
+| `network_bytes_sent` / `network_bytes_received` | `int64_t` | Network bytes |
+| `network_tcp_connections` / `network_tcp_errors` | `int` | TCP connections/errors |
+
+`CRuntimeMetrics` (runtime-wide):
+
+| Field | Type | Description |
+| - | - | - |
+| `boxes_created_total` | `int` | Total boxes created |
+| `boxes_failed_total` | `int` | Total boxes that failed |
+| `num_running_boxes` | `int` | Currently running boxes (**not** `active_boxes`) |
+| `total_commands_executed` | `int` | Total commands executed |
+| `total_exec_errors` | `int` | Total execution errors |
+
+Metrics are returned via callbacks (`CBoxMetricsCb` / `CRuntimeMetricsCb`, signature `void(*)(struct C...Metrics*, CBoxliteError*, void*)`), which also require drain.
+
+### Callback function-pointer types
+
+| typedef | Signature | Used by |
+| - | - | - |
+| `CBoxCreateBoxCb` | `void(*)(CBoxHandle*, CBoxliteError*, void*)` | `boxlite_create_box` |
+| `CBoxGetBoxCb` | `void(*)(CBoxHandle*, CBoxliteError*, void*)` | `boxlite_get` |
+| `CBoxStartBoxCb` | `void(*)(CBoxliteError*, void*)` | `boxlite_start_box` |
+| `CBoxStopBoxCb` | `void(*)(CBoxliteError*, void*)` | `boxlite_stop_box` |
+| `CBoxRemoveBoxCb` | `void(*)(CBoxliteError*, void*)` | `boxlite_remove` |
+| `CBoxCopyCb` | `void(*)(CBoxliteError*, void*)` | `boxlite_copy_into` / `_copy_out` |
+| `CBoxImagePullCb` | `void(*)(CImagePullResult*, CBoxliteError*, void*)` | `boxlite_image_pull` |
+| `CBoxImageListCb` | `void(*)(CImageInfoList*, CBoxliteError*, void*)` | `boxlite_image_list` |
+| `CBoxStdoutCb` | `void(*)(const uint8_t*, size_t, void*)` | `boxlite_execution_on_stdout` |
+| `CBoxStderrCb` | `void(*)(const uint8_t*, size_t, void*)` | `boxlite_execution_on_stderr` |
+| `CBoxExitCb` | `void(*)(int, void*)` | `boxlite_execution_on_exit` |
+| `CExecutionWaitCb` | `void(*)(int, CBoxliteError*, void*)` | `boxlite_execution_wait` (first arg = exit code) |
+| `CExecutionKillCb` | `void(*)(CBoxliteError*, void*)` | `boxlite_execution_kill` |
+| `CExecutionSignalCb` | `void(*)(CBoxliteError*, void*)` | `boxlite_execution_signal` |
+| `CExecutionResizeCb` | `void(*)(CBoxliteError*, void*)` | `boxlite_execution_tty_resize` |
+| `CBoxInfoCb` / `CBoxInfoListCb` | `void(*)(struct CBoxInfo*/*List*, CBoxliteError*, void*)` | `boxlite_box_info` / `_get_info` / `_list_info` |
+| `CRuntimeShutdownCb` | `void(*)(CBoxliteError*, void*)` | `boxlite_runtime_shutdown` |
+
+> **Pointer lifetime in callbacks**: pointers passed into a callback (`CBoxliteError*`, `CBoxInfo*`, etc.) are valid only while the callback runs; copy anything you want to keep. `CBoxHandle*` (in the create/get callbacks) transfers ownership to you and must later be freed with `boxlite_box_free`.
+
+### Key function signatures (matching the header)
+
+```c theme={"theme":{"light":"github-light","dark":"github-dark"}}
+/* Runtime (synchronous construction/release) */
+const char *boxlite_version(void);
+enum BoxliteErrorCode boxlite_runtime_new(
+    const char *home_dir,                              /* NULL = ~/.boxlite */
+    const struct BoxliteImageRegistry *image_registries,
+    int image_registries_count,
+    CBoxliteRuntime **out_runtime, CBoxliteError *out_error);
+void boxlite_runtime_free(CBoxliteRuntime *runtime);
+
+/* Event pump (must be called, otherwise callbacks do not fire) */
+int boxlite_runtime_drain(CBoxliteRuntime *runtime, int timeout_ms, CBoxliteError *out_error);
+
+/* Graceful shutdown (async callback, requires drain).
+ * timeout_secs: 0 = default 10s; -1 = wait indefinitely; >0 = custom seconds.
+ * Marks runtime liveness as closed synchronously so subsequent ops fail fast. */
+enum BoxliteErrorCode boxlite_runtime_shutdown(
+    CBoxliteRuntime *runtime, int timeout_secs,
+    CRuntimeShutdownCb cb, void *user_data, CBoxliteError *out_error);
+
+/* box lifecycle (async callbacks, require drain) */
+enum BoxliteErrorCode boxlite_create_box(
+    CBoxliteRuntime *runtime, CBoxliteOptions *opts,
+    CBoxCreateBoxCb cb, void *user_data, CBoxliteError *out_error);
+enum BoxliteErrorCode boxlite_start_box(CBoxHandle *handle, CBoxStartBoxCb cb, void *ud, CBoxliteError *err);
+enum BoxliteErrorCode boxlite_stop_box (CBoxHandle *handle, CBoxStopBoxCb  cb, void *ud, CBoxliteError *err);
+/* Note: boxlite_stop_box is callback-style and does NOT consume the handle (it clones internally).
+ * The handle stays valid after stop — you can start it again, then free it once with boxlite_box_free. */
+enum BoxliteErrorCode boxlite_get(CBoxliteRuntime *rt, const char *id_or_name, CBoxGetBoxCb cb, void *ud, CBoxliteError *err);
+enum BoxliteErrorCode boxlite_remove(CBoxliteRuntime *rt, const char *id_or_name, int force, CBoxRemoveBoxCb cb, void *ud, CBoxliteError *err);
+char *boxlite_box_id(CBoxHandle *handle);   /* free with boxlite_free_string */
+void  boxlite_box_free(CBoxHandle *handle);
+
+/* exec (box_exec returns the handle synchronously; wait is async) */
+enum BoxliteErrorCode boxlite_box_exec(
+    CBoxHandle *handle, const struct BoxliteCommand *cmd,
+    CExecutionHandle **out_execution, CBoxliteError *out_error);
+enum BoxliteErrorCode boxlite_execution_on_stdout(CExecutionHandle *e, CBoxStdoutCb cb, void *ud, CBoxliteError *err);
+enum BoxliteErrorCode boxlite_execution_on_stderr(CExecutionHandle *e, CBoxStderrCb cb, void *ud, CBoxliteError *err);
+enum BoxliteErrorCode boxlite_execution_on_exit  (CExecutionHandle *e, CBoxExitCb   cb, void *ud, CBoxliteError *err);
+enum BoxliteErrorCode boxlite_execution_stdin_write(CExecutionHandle *e, const uint8_t *data, size_t len, CBoxliteError *err);
+enum BoxliteErrorCode boxlite_execution_stdin_close(CExecutionHandle *e, CBoxliteError *err);
+enum BoxliteErrorCode boxlite_execution_wait  (CExecutionHandle *e, CExecutionWaitCb   cb, void *ud, CBoxliteError *err);
+enum BoxliteErrorCode boxlite_execution_kill  (CExecutionHandle *e, CExecutionKillCb   cb, void *ud, CBoxliteError *err);
+enum BoxliteErrorCode boxlite_execution_signal(CExecutionHandle *e, int sig, CExecutionSignalCb cb, void *ud, CBoxliteError *err);
+enum BoxliteErrorCode boxlite_execution_tty_resize(CExecutionHandle *e, int rows, int cols, CExecutionResizeCb cb, void *ud, CBoxliteError *err);
+void boxlite_execution_free(CExecutionHandle *e);
+
+/* options (synchronous setters) */
+enum BoxliteErrorCode boxlite_options_new(const char *image, CBoxliteOptions **out_opts, CBoxliteError *err);
+void boxlite_options_set_cpus(CBoxliteOptions *opts, int cpus);
+void boxlite_options_set_memory(CBoxliteOptions *opts, int memory_mib);
+void boxlite_options_add_bind_mount(CBoxliteOptions *opts, const char *host_path, const char *guest_path, int read_only); /* read_only: 1=read-only 0=read-write */
+enum BoxliteErrorCode boxlite_options_add_port(CBoxliteOptions *opts, uint16_t host_port, uint16_t guest_port, enum BoxlitePortProtocol protocol, const char *host_ip); /* host_port=0 => same as guest_port */
+void boxlite_options_add_secret(CBoxliteOptions *opts, const char *name, const char *value, const char *placeholder, const char *const *hosts, int hosts_count);
+void boxlite_options_free(CBoxliteOptions *opts);
+
+/* Simple API (synchronous blocking) */
+enum BoxliteErrorCode boxlite_simple_new(const char *image, int cpus, int memory_mib, CBoxliteSimple **out, CBoxliteError *err);
+enum BoxliteErrorCode boxlite_simple_run(CBoxliteSimple *box, const char *command, const char *const *args, int argc, CBoxliteExecResult **out, CBoxliteError *err);
+void boxlite_simple_free(CBoxliteSimple *box);
+void boxlite_result_free(CBoxliteExecResult *result);
+
+/* Memory release */
+void boxlite_error_free(CBoxliteError *error);
+void boxlite_free_string(char *s);
+```
+
+***
+
+## Configuring a box (volumes / ports / secrets / security)
+
+All options setters are synchronous; once built, pass the options to `boxlite_create_box`. **Options are copied into the box at create time**, so you can call `boxlite_options_free` right after submitting create.
+
+### Mounting volumes (the third argument is `int read_only`, not a string)
+
+```c theme={"theme":{"light":"github-light","dark":"github-dark"}}
+/* read_only: 1 = read-only, 0 = read-write.
+ * Replace <YOUR_HOST_PATH> with the absolute path to the host directory. */
+boxlite_options_add_bind_mount(opts, "<YOUR_HOST_PATH>", "/data", 1);   /* read-only mount at /data */
+boxlite_options_add_bind_mount(opts, "<YOUR_HOST_PATH>", "/work", 0);   /* read-write mount at /work */
+```
+
+> **Key**: the SDK's third argument is **`int read_only`** (1/0 in C), **not** the CLI-style `:ro`/`:rw` string. Passing a string here will not even compile; the CLI `-v host:box:ro` syntax belongs to the command-line parsing layer and is unrelated to the SDK API.
+
+### Port forwarding (host-first convention)
+
+```c theme={"theme":{"light":"github-light","dark":"github-dark"}}
+/* host_port=0 means same as guest_port; host_ip=NULL/"" means bind to all host interfaces. */
+enum BoxliteErrorCode rc =
+    boxlite_options_add_port(opts, 8080, 80, BoxlitePortProtocolTcp, NULL);
+/* Forward host 8080 to port 80 inside the box (TCP). A return of InvalidArgument indicates invalid arguments. */
+```
+
+### Injecting a secret (vault/secrets entry point)
+
+```c theme={"theme":{"light":"github-light","dark":"github-dark"}}
+/* On outbound network requests to a matching host, the secret is injected via its placeholder; value is never exposed in plaintext to the workload command. */
+const char *secret_hosts[] = {"api.example.com"};
+boxlite_options_add_secret(
+    opts,
+    "API_KEY",                 /* name */
+    "<YOUR_API_KEY>",          /* value: replace with the real key; do not commit to version control */
+    "{{API_KEY}}",             /* placeholder */
+    secret_hosts, 1);          /* applies only to these hosts */
+```
+
+### Security sandbox (toggled through advanced options)
+
+Security is controlled through the advanced layer (consistent with the core model's `BoxOptions.advanced.security`); in C this goes through a separate `CAdvancedBoxOptions` handle:
+
+```c theme={"theme":{"light":"github-light","dark":"github-dark"}}
+CAdvancedBoxOptions *adv = NULL;
+CBoxliteError error = {0};
+
+if (boxlite_advanced_options_new(&adv, &error) != Ok) {
+    fprintf(stderr, "advanced_options_new failed (code %d): %s\n",
+            error.code, error.message ? error.message : "unknown");
+    boxlite_error_free(&error);
+    /* ... handle the error ... */
+}
+
+/* enabled != 0: fully isolated sandbox (default); 0: disable the sandbox (debugging only / when virtualization is unavailable). */
+boxlite_advanced_options_set_security_enabled(adv, 1);
+
+/* Apply to the box options (copied into opts; adv remains owned by the caller). */
+boxlite_options_set_advanced(opts, adv);
+
+/* Free adv when done. */
+boxlite_advanced_options_free(adv);
+```
+
+> Security isolation is on by default: not calling `set_security_enabled` is equivalent to full isolation. Pass `0` to disable it only in environments that genuinely cannot virtualize (debugging).
+
+***
+
+## stdin, signals, and PTY (interactive execution)
+
+The `ExecutionHandle` returned by `boxlite_box_exec` supports bidirectional interaction:
+
+```c theme={"theme":{"light":"github-light","dark":"github-dark"}}
+/* Write data to the process stdin (synchronous). */
+const char *line = "hello\n";
+boxlite_execution_stdin_write(exec, (const uint8_t *)line, strlen(line), &error);
+
+/* End of input (EOF), so programs that wait on stdin like cat/wc/sort can finish (synchronous, idempotent). */
+boxlite_execution_stdin_close(exec, &error);
+
+/* Send an arbitrary Unix signal (async callback). sig: 2=SIGINT, 15=SIGTERM. */
+boxlite_execution_signal(exec, 2 /* SIGINT */, on_signal_done, &sig_st, &error);
+/* Note: for kill (SIGKILL + reap) use the dedicated boxlite_execution_kill. */
+
+/* Resize the window for a TTY program (requires cmd.tty=1 at start, async callback). */
+boxlite_execution_tty_resize(exec, 40 /* rows */, 120 /* cols */, on_resize_done, &rs_st, &error);
+```
+
+Each async operation (signal/resize/kill) needs drain to dispatch its callback after you start it. `stdin_write` / `stdin_close` are synchronous and need no drain.
+
+***
+
+## Simple API defaults
+
+In `boxlite_simple_new(image, cpus, memory_mib, ...)`, passing `0` for `cpus`/`memory_mib` leaves the value to the engine's fallback. The Simple API cannot configure volumes/network/security or other advanced options — switch to the Native API when you need those.
+
+> **Implicit defaults**: passing `0` lets the runtime decide, which allocates **1 vCPU / 1024 MiB** (`vm_defaults` in `src/boxlite/src/runtime/constants.rs`). Pass explicit `cpus`/`memory_mib` in production. See [Compute resources](/manage-sandbox/compute-resources).
+
+***
+
+## Troubleshooting (common problems and typical errors)
+
+### The callback never fires after an async call / the program hangs
+
+**Symptom**: `boxlite_create_box` / `boxlite_execution_wait` returns `Ok`, but the `done` flag never becomes 1 and the program hangs.
+
+**Cause**: `boxlite_runtime_drain` was never called. The Native API is post-and-drain — callbacks are dispatched only when you drain.
+
+**Fix**: after each async operation, loop on drain until the completion flag is set:
+
+```c theme={"theme":{"light":"github-light","dark":"github-dark"}}
+CBoxliteError drain_err = {0};
+while (!st.done) {
+    if (boxlite_runtime_drain(runtime, -1, &drain_err) < 0) {
+        fprintf(stderr, "drain failed: %s\n",
+                drain_err.message ? drain_err.message : "unknown");
+        boxlite_error_free(&drain_err);
+        break;
+    }
+}
+```
+
+### `boxlite_execute` not found / old examples fail to compile with "implicit declaration"
+
+**Symptom**: reusing older third-party snippets, the compiler reports `implicit declaration of function 'boxlite_execute'` or argument mismatches on `boxlite_execution_wait`.
+
+**Cause**: `boxlite_execute` is not part of the current header. The real exec entry point is `boxlite_box_exec(handle, &cmd, &out_execution, &error)` (synchronously obtain the handle); the exit code is returned via the **`int` parameter of the callback** in `boxlite_execution_wait(exec, CExecutionWaitCb, ud, err)` (not an `int*` out-parameter).
+
+**Fix**: follow `sdks/c/include/boxlite.h` and the pattern in [Native API — full callback + post-and-drain skeleton](#native-api-full-callback-post-and-drain-skeleton) of this page.
+
+### The third volume argument was passed as the string `"ro"` / `"rw"`
+
+**Symptom**: `boxlite_options_add_bind_mount(opts, host, guest, "ro")` fails to compile with a type error (a `const char *` where an `int` is expected).
+
+**Cause**: the SDK's third argument is `int read_only`, not the CLI's `ro`/`rw` string.
+
+**Fix**: use `1` (read-only) / `0` (read-write): `boxlite_options_add_bind_mount(opts, host, guest, 1);`.
+
+> Compared with other SDKs: the Python/Node volume third element is likewise a **bool `read_only`** (e.g. Python `(host, guest, True)`), and passing a string raises `TypeError: 'str' object cannot be cast as 'bool'`. Only the CLI `-v host:box:ro` uses the string syntax.
+
+### The command exits non-zero but you receive no error
+
+**Symptom**: `boxlite_simple_run` / `boxlite_execution_wait` returns `Ok`, but the command actually failed.
+
+**Cause**: a non-zero process exit **is not an API error**. `Ok` means "the command was executed successfully"; the command's own success or failure is the exit code.
+
+**Fix**: always check `result->exit_code` (Simple) or the `int exit_code` from the `CExecutionWaitCb` callback (Native).
+
+### `dyld: Library not loaded: @rpath/libboxlite.dylib` (macOS)
+
+**Cause**: the loader cannot find the dylib at runtime.
+
+**Fix**:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Add an rpath to the executable (replace with the absolute path to your library directory)
+install_name_tool -add_rpath <YOUR_BOXLITE_ROOT>/target/release ./my_program
+# Or use an environment variable temporarily
+export DYLD_LIBRARY_PATH=<YOUR_BOXLITE_ROOT>/target/release:$DYLD_LIBRARY_PATH
+```
+
+On Linux the equivalent is `export LD_LIBRARY_PATH=<YOUR_BOXLITE_ROOT>/target/release:$LD_LIBRARY_PATH`.
+
+### Box creation returns `Image` (code 8) / image pull failed
+
+**Cause**: a wrong image name or a network failure during pull.
+
+**Fix**:
+
+1. Confirm the image reference is correct (e.g. `"alpine:3.19"`, `"python:slim"`).
+2. Check network connectivity (the first run pulls the image over the network).
+3. Check disk space: `df -h ~/.boxlite`.
+4. Enable debug logging: `RUST_LOG=debug ./my_program`.
+
+### Box start returns `UnsupportedEngine` (code 19) / `Engine` (code 12) — no virtualization (environment constraint)
+
+**This is an environment constraint**: BoxLite requires hardware virtualization.
+
+* **Linux**: requires KVM.
+
+  ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+  lsmod | grep kvm                       # check the module
+  sudo modprobe kvm kvm_intel            # or kvm_amd
+  sudo usermod -aG kvm $USER && newgrp kvm   # join the kvm group
+  ```
+
+* **macOS (Apple Silicon ARM64)**: uses the built-in Hypervisor.framework, **no /dev/kvm required**, works out of the box.
+
+* **macOS Intel**: not supported.
+
+* **Windows**: use WSL2 (follow the Linux flow inside it; KVM required).
+
+Without virtualization, start fails (the error is catchable; the process does not crash). For debugging, you can disable the sandbox via advanced options (`boxlite_advanced_options_set_security_enabled(adv, 0)`), but that sacrifices isolation.
+
+### Memory leaks
+
+The C SDK requires manual freeing. Missing any of these leaks memory:
+
+| Source | Free function |
+| - | - |
+| String returned by `boxlite_box_id()` | `boxlite_free_string` |
+| Any `CBoxliteError` (`.message` on failure) | `boxlite_error_free` |
+| `CBoxliteExecResult *` | `boxlite_result_free` |
+| `CBoxInfo *` / `CBoxInfoList *` | `boxlite_free_box_info` / `boxlite_free_box_info_list` |
+| `CImagePullResult *` / `CImageInfoList *` | `boxlite_free_image_pull_result` / `boxlite_free_image_info_list` |
+| `CBoxliteImageHandle *` | `boxlite_image_free` |
+| `CBoxHandle *` (ownership transferred by the create/get callback) | `boxlite_box_free` |
+| `CExecutionHandle *` | `boxlite_execution_free` |
+| `CBoxliteRuntime *` | `boxlite_runtime_free` (NULL-safe) |
+| `CBoxliteSimple *` | `boxlite_simple_free` |
+| `CAdvancedBoxOptions *` | `boxlite_advanced_options_free` |
+| `CBoxliteOptions *` | `boxlite_options_free` |
+
+All `*_free` functions are NULL-safe. Diagnose with valgrind (Linux) / `leaks` (macOS):
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+valgrind --leak-check=full ./my_program        # Linux
+leaks -atExit -- ./my_program                  # macOS
+```
+
+### Thread safety
+
+* `CBoxliteRuntime` is thread-safe (runtime functions may be called concurrently from multiple threads).
+* `CBoxHandle` / `CExecutionHandle` / `CBoxliteSimple` are **not** thread-safe — do not share the same handle across threads.
+* Callbacks run on **the thread that calls `boxlite_runtime_drain`**; do not block inside a callback.
+
+***
+
+### The linker/runtime cannot find the library
+
+Error `dyld: Library not loaded: @rpath/libboxlite.dylib` (macOS) or `error while loading shared libraries: libboxlite.so` (Linux).
+
+The dynamic linker was not told the library path. Set it:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# macOS
+export DYLD_LIBRARY_PATH=<YOUR_PATH>/boxlite/target/release:$DYLD_LIBRARY_PATH
+# Linux
+export LD_LIBRARY_PATH=<YOUR_PATH>/boxlite/target/release:$LD_LIBRARY_PATH
+```
+
+Or use CMake (`examples/c/CMakeLists.txt` already sets `BUILD_RPATH`, so no manual export is needed).
+
+## Related pages
+
+* [Installation](/getting-started/installation) — platform and virtualization prerequisites
+* [Python SDK Reference](/reference/python) — the high-level wrapper API
+* [Lifecycle management](/manage-sandbox/lifecycle) — concepts for box create/start/stop/remove
+* [Secrets and security](/manage-sandbox/secrets-and-security) — secrets and the security sandbox
+* [Volume mounts](/manage-sandbox/volumes) — volume read_only semantics

@@ -1,0 +1,83 @@
+# Managing billing
+Source: https://docs.boxlite.ai/cloud/billing
+
+Fund your wallet, set automatic reload so boxes never stop for lack of balance, read what you have actually been charged, and know the per-box ceilings that apply to every box in your organization.
+
+This page covers running the account. For what a box costs see [What a box costs](/cloud/box-costs); for whether to subscribe see [Wallet or a plan?](/cloud/plans).
+
+Your **wallet** is a prepaid balance. It funds usage once a plan's included quota is consumed, and it funds everything if you have no plan.
+
+## The wallet
+
+The **Wallet** tab shows your available balance and what you have spent this month.
+
+> [!NOTE]
+>
+> The figure shown as **available** is your *ongoing* balance: it already reflects usage accrued this cycle but not yet settled. That is why it drifts downward while boxes run, with no payment having been taken.
+
+### Add funds
+
+Click **Top up** and pick a preset amount — **$25**, **$500**, **$1,000**, or **$2,000** — or enter a custom amount. The console redirects you to Stripe to complete the payment.
+
+### Set automatic reload
+
+Manual top-ups are why wallets hit zero at 3am. Automatic reload watches the balance and refills it: set a **threshold** to drop below and a **target** to be refilled to, and the console reads the result back as `Below $20.00 → $100.00`.
+
+It prefills $20 and $100. Reload stays off until you save it, and it charges your connected card — so attach one first.
+
+### Connect a payment method
+
+Until a card is attached the console shows the payment method as not connected, with a **Connect** button beside it. Connecting one earns an additional **\$100 of credits**.
+
+### Redeem a coupon
+
+**Redeem coupon** takes a coupon code and credits the account. Credits are tracked separately from your topped-up balance, so the console shows credits remaining against credits granted.
+
+## Read the usage chart
+
+The **Usage** tab answers "where is my money going" with settled cost by day for the last 30 days, as either a chart or a list. It splits cost into two series:
+
+| Series | What it represents |
+| - | - |
+| **Quota-covered** | Cost your plan's included quota absorbed |
+| **From wallet** | Cost your prepaid wallet balance paid for |
+
+The moment worth watching is when the second series starts growing: that is where this cycle's quota ran out and your boxes began drawing on money you topped up.
+
+This tab is the authority on what you were actually charged — the hourly figures in the **New Box** dialog and on [What a box costs](/cloud/box-costs) are estimates. **Check it before you scale a workload up:** see what a typical day already costs, then multiply by the fan-out you are about to add.
+
+## Per-box resource ceilings
+
+**Billing** also publishes the ceilings that apply to every box in your organization:
+
+| Resource | Ceiling per box |
+| - | - |
+| Compute | 4 vCPU |
+| Memory | 32 GiB |
+| Storage | 120 GiB |
+
+These bound how large a **single box** can be — a different constraint from your plan's concurrency limit, which bounds how many boxes run at once. A request above a ceiling is rejected before the box is created, so you get a clear error rather than a box that fails later. See [Choose a size](/cloud/box-sizes) for the presets and custom fields available within them.
+
+If a workload genuinely needs a larger single box, that is an Enterprise conversation — custom limits go through [sales@boxlite.ai](mailto:sales@boxlite.ai).
+
+## Troubleshooting
+
+| Situation | Why it happens | What to do |
+| - | - | - |
+| Wallet balance has reached zero and your quota is consumed | There is nothing left to fund usage this cycle | Top up on the **Wallet** tab, or redeem a coupon code |
+| Boxes stopped and the console reports credits depleted | Nothing remains to fund them, so the platform stops boxes rather than running up an unfunded bill | Top up, then set automatic reload so it does not recur |
+| Automatic reload is configured but never fires | Reload needs a card to charge, and no payment method is connected | Connect a card on the **Wallet** tab |
+| The available balance drops while you have taken no payment | The figure is the ongoing balance, which already includes usage accrued but not yet settled | Nothing is wrong. Compare against the **Usage** tab for settled cost |
+| The payment method shows as not connected | No card is attached to the account | Click **Connect** on the **Wallet** tab. Connecting one also earns \$100 of credits |
+| A box request asks for more CPU, memory, or disk than allowed | It exceeds a per-box ceiling for the organization | Lower the request, or spread the work across several boxes within your concurrency limit |
+| Cost is higher than expected with no obvious cause | Stopped boxes are still billed for their disk until they are deleted | Delete boxes you have finished with. See [What each box state costs](/cloud/box-costs#what-each-box-state-costs) |
+
+## Next steps
+
+> [card] [What a box costs](/cloud/box-costs)
+>
+> Rates, worked examples, and the two controls that cap what you keep paying.
+
+> [card] [Wallet or a plan?](/cloud/plans)
+>
+> The usage level at which a subscription starts costing less.

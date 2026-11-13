@@ -1,0 +1,403 @@
+# Debug macOS Seatbelt denials
+Source: https://docs.boxlite.ai/development/macos-sandbox-debugging
+
+On macOS, BoxLite runs boxlite-shim under a deny-by-default sandbox-exec (Seatbelt) policy. When a rule denies an operation, the box fails to start or behaves oddly, and the only evidence is a deny line in the system log.
+
+Finding which rule fired needs nothing but an installed SDK. Changing the policy needs a source checkout
+and a rebuild — on a published SDK, capture the `deny` line and file it upstream instead of editing the
+policy locally.
+
+***
+
+## Prerequisites
+
+* A working BoxLite install (Python `boxlite` or Node `@boxlite-ai/boxlite`) and a machine with hardware virtualization — see [Installation](/getting-started/installation#platform-and-virtualization-requirements-common-to-all-sdks).
+* Command-line tools: `log` (Unified Logging, ships with the system),
+  `sandbox-exec` (at `/usr/bin/sandbox-exec`, ships with the system).
+* To modify and rebuild the policy: you need the BoxLite source tree and the
+  Rust toolchain (`cargo`), plus the `make` environment for the Python SDK.
+
+> Note: Seatbelt is a macOS-specific isolation mechanism. On Linux, BoxLite uses
+> bwrap/landlock (`src/boxlite/src/jailer/sandbox/bwrap.rs`, `landlock.rs`), and
+> the SBPL debugging flow on this page does not apply.
+
+***
+
+## Quick Example (minimal flow)
+
+The core of debugging is two steps: **start monitoring first, then run the
+triggering operation.**
+
+First terminal — real-time monitoring of boxlite-related Sandbox denials:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Real-time streaming monitor (recommended during development): show only boxlite denials
+log stream --predicate 'eventMessage CONTAINS "Sandbox:" AND eventMessage CONTAINS "boxlite" AND eventMessage CONTAINS "deny"'
+```
+
+Second terminal — run a minimal operation that exercises the isolation layer
+(copy and run directly):
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# pip install boxlite  (latest published version)
+import asyncio
+import boxlite
+
+async def main() -> None:
+    try:
+        # SimpleBox is an async context manager; create + start happen only on entering async with
+        async with boxlite.SimpleBox(image="alpine:latest") as box:
+            # A non-zero exit code does not raise; check exit_code yourself
+            result = await box.exec("echo", "hello")
+            if result.exit_code != 0:
+                print(f"non-zero exit: {result.exit_code}\n{result.stderr}")
+            else:
+                print(result.stdout)
+    except RuntimeError as exc:
+        # No virtualization / image pull failure / Sandbox start failure may all raise a standard RuntimeError
+        print(f"box failed to start: {exc}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Back in the first terminal: if a `deny(1)` line appears, one of the box's
+operations was blocked by Seatbelt — see the "Debugging Workflow" below.
+
+***
+
+## Debugging Workflow
+
+### Step 1: Start real-time log monitoring first
+
+Start monitoring in a separate terminal (always start monitoring before running
+the test, otherwise you miss early denials):
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# View all sandbox denials (error level only)
+log stream --predicate 'subsystem == "com.apple.sandbox"' --level error
+
+# Or filter only denials from the boxlite-shim process
+log stream --predicate 'eventMessage CONTAINS "boxlite-shim" AND eventMessage CONTAINS "deny"'
+```
+
+### Step 2: Run the triggering operation
+
+In another terminal, run the operation that fails (reuse the Quick Example above,
+or substitute your actual use-case script):
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# If using the project's bundled venv
+source .venv/bin/activate
+python your_repro_script.py
+```
+
+### Step 3: Interpret the denial
+
+The format of a Sandbox denial in the log:
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+kernel: (Sandbox) Sandbox: boxlite-shim(PID) deny(1) OPERATION TARGET
+```
+
+Common denial types:
+
+| Operation | Target example | Meaning |
+| - | - | - |
+| `file-read-data` | `/path/to/file` | The process tried to read file contents |
+| `file-read-metadata` | `/path` | The process tried to stat / access file metadata |
+| `file-write-data` | `/path/to/file` | The process tried to write to a file |
+| `file-write-create` | `/path/to/file` | The process tried to create a new file |
+| `sysctl-read` | `kern.bootargs` | The process tried to read a sysctl value |
+| `mach-lookup` | `com.apple.service` | The process tried to connect to a mach service |
+| `network-outbound` | `*:443` | The process tried to make a network connection |
+| `iokit-open` | `IOHIDFamily` | The process tried to access an IOKit device |
+
+### Step 4: Update the policy
+
+Based on the denial, add the corresponding allow rule to the SBPL policy:
+
+```scheme theme={"theme":{"light":"github-light","dark":"github-dark"}}
+; For file-read-data /var
+(allow file-read* (literal "/var"))
+
+; For sysctl-read kern.bootargs
+(allow sysctl-read (sysctl-name "kern.bootargs"))
+
+; For mach-lookup com.apple.service
+(allow mach-lookup (global-name "com.apple.service"))
+```
+
+### Step 5: Rebuild and retest
+
+The `.sbpl` files are embedded at compile time via `include_str!`, so changes
+take effect only after a rebuild:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Rebuild only the Rust library
+cargo clean -p boxlite && cargo build -p boxlite
+
+# Rebuild the Python SDK (along with the native extension)
+make dev:python
+```
+
+***
+
+## Log command reference
+
+### Real-time streaming
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# All sandbox messages
+log stream --predicate 'subsystem == "com.apple.sandbox"'
+
+# Errors only (denials)
+log stream --predicate 'subsystem == "com.apple.sandbox"' --level error
+
+# Specific process
+log stream --predicate 'eventMessage CONTAINS "boxlite-shim"'
+
+# Combined: show only boxlite denials
+log stream --predicate 'eventMessage CONTAINS "Sandbox:" AND eventMessage CONTAINS "boxlite" AND eventMessage CONTAINS "deny"'
+```
+
+### Historical queries
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Last N minutes
+log show --last 5m --predicate 'eventMessage CONTAINS "Sandbox:"'
+
+# Time range
+log show --start "2024-01-06 10:00:00" --end "2024-01-06 10:05:00" --predicate 'subsystem == "com.apple.sandbox"'
+
+# Count denials by type
+log show --last 10m --predicate 'eventMessage CONTAINS "Sandbox:" AND eventMessage CONTAINS "deny"' | grep -oE 'deny\(1\) [^ ]+' | sort | uniq -c | sort -rn
+```
+
+### Filtering tips
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Exclude noisy system processes
+log show --last 5m --predicate 'eventMessage CONTAINS "Sandbox:" AND eventMessage CONTAINS "deny" AND NOT eventMessage CONTAINS "imagent" AND NOT eventMessage CONTAINS "bluetoothd"'
+
+# Kernel messages only (most reliable)
+log show --last 5m --predicate 'senderImagePath == "/kernel" AND eventMessage CONTAINS "Sandbox:"'
+```
+
+***
+
+## SBPL policy syntax
+
+### Basic structure
+
+```scheme theme={"theme":{"light":"github-light","dark":"github-dark"}}
+(version 1)
+
+; Deny everything by default
+(deny default)
+
+; Allow specific operations
+(allow process-exec)
+(allow file-read* (subpath "/usr/lib"))
+(allow sysctl-read (sysctl-name "hw.ncpu"))
+```
+
+### Common patterns
+
+```scheme theme={"theme":{"light":"github-light","dark":"github-dark"}}
+; Allow reading an entire directory tree
+(allow file-read* (subpath "/path/to/dir"))
+
+; Allow reading a single file only
+(allow file-read* (literal "/path/to/file"))
+
+; Allow reading files matching a regex
+(allow file-read* (regex #"^/Users/[^/]+/\.boxlite/"))
+
+; Allow multiple sysctls
+(allow sysctl-read
+    (sysctl-name "hw.ncpu")
+    (sysctl-name "hw.memsize")
+    (sysctl-name-prefix "kern.proc."))
+
+; Allow mach service lookup
+(allow mach-lookup
+    (global-name "com.apple.CoreServices.coreservicesd")
+    (global-name "com.apple.system.logger"))
+```
+
+### Validating syntax
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Test whether the policy syntax is valid (inline policy)
+sandbox-exec -p '(version 1)(deny default)(allow process-exec)' /bin/echo "Policy OK"
+
+# Test with a policy file
+sandbox-exec -f /path/to/policy.sbpl /bin/echo "Policy OK"
+# Replace /path/to/policy.sbpl with the path to your policy file
+```
+
+***
+
+## BoxLite policy files
+
+BoxLite's Seatbelt policy is split across several files: the static fragments are
+in `src/boxlite/resources/seatbelt/`, and the dynamic assembly is in
+`src/boxlite/src/jailer/sandbox/seatbelt.rs`:
+
+| File | Purpose |
+| - | - |
+| `src/boxlite/resources/seatbelt/seatbelt_base_policy.sbpl` | Process ops, sysctls, mach services, IOKit; contains `(deny default)` |
+| `src/boxlite/resources/seatbelt/seatbelt_file_read_policy.sbpl` | Static system paths allowed for reading |
+| `src/boxlite/resources/seatbelt/seatbelt_file_write_policy.sbpl` | Static paths allowed for writing (e.g. `/tmp`) |
+| `src/boxlite/resources/seatbelt/seatbelt_network_policy.sbpl` | Network access (optional) |
+| `src/boxlite/src/jailer/sandbox/seatbelt.rs` | Dynamic policy assembly (binary path, mounted volumes, box directory) |
+
+### Viewing the full generated policy
+
+The full runtime policy is assembled by `build_sandbox_policy()` in
+`src/boxlite/src/jailer/sandbox/seatbelt.rs` and passed directly via
+`sandbox-exec -p`. The absolute path of `sandbox-exec` is hardcoded to
+`/usr/bin/sandbox-exec` (the constant `SANDBOX_EXEC_PATH`, to prevent PATH
+injection).
+
+When debugging, focus on:
+
+* The static fragments: `src/boxlite/resources/seatbelt/*.sbpl`
+* Dynamic path grants: `build_dynamic_read_paths()` and
+  `build_dynamic_write_paths()` (both in `seatbelt.rs`)
+* The denial records from `log show` / `log stream`, used to locate the missing
+  allow clause
+
+***
+
+## Troubleshooting
+
+### Changes to `.sbpl` did not take effect
+
+The `.sbpl` files are embedded into the binary at compile time via `include_str!`
+(see the consts at the top of `seatbelt.rs`). After modifying them, you must
+force a rebuild:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Force a recompile of the Rust library
+cargo clean -p boxlite
+cargo build -p boxlite
+
+# Python SDK
+make dev:python
+```
+
+### Path canonicalization (symlink problem)
+
+macOS uses symlinks: `/var` -> `/private/var`, `/tmp` -> `/private/tmp`. The
+policy must use the canonicalized real path:
+
+```scheme theme={"theme":{"light":"github-light","dark":"github-dark"}}
+; Wrong -- /tmp is a symlink; the rule will not match
+(allow file-write* (subpath "/tmp"))
+
+; Correct -- use the canonical path
+(allow file-write* (subpath "/private/tmp"))
+```
+
+### Duplicate denials
+
+The log may show "X duplicate reports for...", meaning the same denial happened
+multiple times. Fix the root cause; you do not need to handle each one
+individually.
+
+### Silent failure (no log, but a hang/crash)
+
+Some denials are not written to the log immediately. If the process hangs or
+crashes without a denial record:
+
+1. Check the crash reports: `ls ~/Library/Logs/DiagnosticReports/*shim*`
+2. Confirm the process actually started: check the host logs
+3. Temporarily run with sandbox isolation off to narrow it down (see the next
+   item)
+
+### Distinguishing "permissions" from "sandbox"
+
+Not all failures are caused by Sandbox. Also check:
+
+* File permissions (`ls -la`)
+* Whether the directory exists
+* Hypervisor.framework entitlements
+
+### Narrow the problem with a security preset (SDK layer)
+
+To tell whether the problem is caused by the isolation layer, temporarily switch
+the security level in the SDK. **Note: security options are passed via
+`advanced=AdvancedBoxOptions(security=...)`; there is no top-level `security=`
+keyword**, and `AdvancedBoxOptions` is exported at the top level:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+import boxlite
+from boxlite import SecurityOptions
+from boxlite import AdvancedBoxOptions
+
+async def main() -> None:
+    # Presets: development() / standard() / maximum() (there is no .minimum())
+    # Security options are passed via advanced=AdvancedBoxOptions(security=...); there is no top-level security= keyword.
+    # SimpleBox forwards extra kwargs (including advanced) to the underlying BoxOptions.
+    try:
+        async with boxlite.SimpleBox(
+            image="alpine:latest",
+            advanced=AdvancedBoxOptions(security=SecurityOptions.development()),
+        ) as box:
+            # SimpleBox.exec returns an ExecResult (output already drained); the timeout parameter is timeout (float)
+            result = await box.exec("echo", "hello", timeout=10.0)
+            if result.exit_code != 0:
+                print(f"non-zero exit: {result.exit_code}\n{result.stderr}")
+            else:
+                print(result.stdout)
+    except RuntimeError as exc:
+        print(f"failed: {exc}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+> If you want to manage the lifecycle manually with the native `Boxlite` + `Box`
+> handles: the native `Box.exec(...)` returns an **`Execution`** (not
+> an `ExecResult`); you must `await execution.wait()` to get the exit code and
+> read the `stdout()`/`stderr()` streams; remove with
+> `runtime.remove(box.id, force=True)` (on the runtime, not `box.remove()`). The
+> `SimpleBox` form above already drains output automatically, which is more
+> convenient for debugging.
+
+> If a box fails to start with `SecurityOptions.maximum()` but works with
+> `development()`, the Seatbelt policy is almost certainly missing an allow rule
+> — go back to Step 1 and capture the `deny` line.
+
+### Start fails outright / no virtualization
+
+macOS starts the microVM via Apple Hypervisor.framework (no `/dev/kvm`
+required). If the machine has no hardware virtualization or the entitlement is
+missing, the box fails to start and raises a standard `RuntimeError` (the
+process stays alive and can be caught with `try/except`).
+
+### Image pull failure raises `RuntimeError` (not `BoxliteError`)
+
+A missing command or an image pull failure raises a standard `RuntimeError` (Python) / bare `Error` (Node), not `BoxliteError`. See [Error Handling](/guides/error-handling#troubleshooting).
+
+## Debugging checklist
+
+* [ ] Start `log stream` before running the test
+* [ ] Filter logs by process name (`boxlite-shim`)
+* [ ] Look for `deny(1)` messages
+* [ ] Record the exact operation and target
+* [ ] Add a minimal rule (prefer `literal` over `subpath`)
+* [ ] Document in a comment why the rule is needed
+* [ ] Rebuild and retest
+* [ ] Confirm no new denials appear
+
+***
+
+## Further reading
+
+* [Apple Sandbox Guide](https://developer.apple.com/library/archive/documentation/Security/Conceptual/AppSandboxDesignGuide/)
+* [SBPL Reference (reverse-engineered)](https://reverse.put.as/wp-content/uploads/2011/09/Apple-Sandbox-Guide-v1.0.pdf)
+* [Chromium macOS Sandbox](https://chromium.googlesource.com/chromium/src/+/main/sandbox/mac/)

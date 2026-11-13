@@ -1,0 +1,149 @@
+# Volume reference
+Source: https://docs.boxlite.ai/cloud/volume-reference
+
+How a volume is addressed by name or id, the parameters and return shapes of every volume call, the mount tuple, read-only behavior, and what differs from open source.
+
+One page for everything the volume API does, so the task pages can stay about the task. If you have not created a volume yet, start with [Mount a volume](/cloud/mount-a-volume).
+
+## Prerequisites
+
+* An API key from the console, exported as `BOXLITE_API_KEY`. See [API keys](/cloud/api-keys).
+* A REST runtime. Managed volumes need one — a local runtime has no volume backend to resolve a reference against.
+
+## Name a volume and mount it by that name
+
+A volume has both a server-assigned `id` and a `name`, and **either one mounts it**. When you create a volume without a name, the server uses the id as the name.
+
+Choosing your own name is what lets a worker mount the volume it wants without knowing the id. The two halves can live in different processes that never exchange an id:
+
+The same split works from a terminal — `boxlite volume create --name` on one side,
+`-v <NAME>:<PATH>` on the other. See [`boxlite volume`](/reference/cli#boxlite-volume).
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# In the process that provisions storage:
+volume = await rt.volumes.create("training-data")
+
+# In a worker that only knows the name:
+box = await rt.create(BoxOptions(image=IMAGE, volumes=[("training-data", "/data")]))
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// In the process that provisions storage:
+const volume = await rt.volumes.create("training-data");
+
+// In a worker that only knows the name:
+const box = await rt.create({ image: IMAGE, volumes: [["training-data", "/data"]] });
+```
+
+```bash REST theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# The wire field is managed_volume, and it accepts a name or an id.
+curl -fsS -X POST "${BOXLITE_REST_URL}/v1/boxes" \
+  -H "Authorization: Bearer ${BOXLITE_API_KEY}" \
+  -H 'Content-Type: application/json' \
+  -d '{"image":"'"${IMAGE}"'","volumes":[{"managed_volume":"training-data","guest_path":"/data"}]}'
+```
+
+Names are unique within your organization, so a name is a stable address across processes and across time. An id is stable too, but you have to carry it somewhere.
+
+## Parameters and returns
+
+The runtime you build with `Boxlite.rest(...)` carries a volumes API. `volumes` is a **property**, so write `rt.volumes` — no parentheses — and await the four methods hanging off it.
+
+| Call | Parameters | Returns |
+| - | - | - |
+| `rt.volumes` | Not awaited — a property on the runtime | The volumes handle the four methods below live on |
+| `rt.volumes.create(name=None)` | `name`: `str`, optional. Mountable in place of the id; the server names the volume after its id when omitted | `VolumeInfo` for the new volume |
+| `rt.volumes.list()` | None | `list[VolumeInfo]` |
+| `rt.volumes.get(id)` | `id`: `str`, required | `VolumeInfo`. Raises when no volume has that id |
+| `rt.volumes.remove(id, force=False)` | `id`: `str`, required. `force`: `bool`, optional, default `False` | `None` |
+
+In Node the same four methods are `create(name?)`, `list()`, `get(id)`, and `remove(id, force?)`.
+
+`VolumeInfo` fields are read-only:
+
+| Field | Python | Node | Description |
+| - | - | - | - |
+| id | `id` | `id` | Server-assigned. Mounts the volume, and addresses `get()` and `remove()` |
+| name | `name` | `name` | Yours if you passed one to `create()`, otherwise the id. Also mounts the volume |
+| created at | `created_at` | `createdAt` | RFC 3339 string |
+| size | `size_bytes` | `sizeBytes` | **Always empty on Cloud** — the service does not report volume size on either the list or the single-volume response. See [Volume operations](/cloud/volume-operations#state-the-sdk-does-not-expose) |
+
+To work with a volume you already have, pass its name or id straight to the box's `volumes` field, or call `get()` first to confirm it exists.
+
+## Mount a volume into a box
+
+Mounting is configured at creation time through the `volumes` field on the box options. Each element is a `(volume, mount_path)` pair.
+
+**The first element is a managed volume's name or id — not a path on your machine.** That is the mental switch to make coming from open source.
+
+The mount path has to be an absolute path that is not the root and not a system directory. The service rejects the box otherwise:
+
+| Mount path | Result |
+| - | - |
+| `/data`, `/mnt/models`, `/srv/cache` | Accepted |
+| `data` or any relative path | Rejected — must be absolute |
+| `/` or `//` | Rejected — cannot mount to the root directory |
+| `/data/../etc` | Rejected — cannot contain relative path components |
+| `/data//cache` | Rejected — cannot contain consecutive slashes |
+| `/proc` `/sys` `/dev` `/boot` `/etc` `/bin` `/sbin` `/lib` `/lib64`, or anything under them | Rejected — cannot mount to a system directory |
+
+For the full box options table and `exec` semantics, see the [Python SDK reference](/reference/python) or the [Node.js SDK reference](/reference/nodejs). For host-directory mount forms, see [Volumes and mounts](/manage-sandbox/volumes).
+
+## Read-only mounts
+
+Read-only managed volumes are not supported. The SDK refuses the mount before the request leaves your process, rather than mounting it writable and letting you believe it is protected:
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+read-only managed volumes are not supported yet; mount "training-data" read-write
+```
+
+Mount read-write and enforce read-only behavior in your own code, or use a separate volume for data no box should modify.
+
+## What is different from open source
+
+> [!WARNING]
+>
+> **Host bind mounts are rejected over REST.** In open source, `volumes=[("/home/you/data", "/data")]` mounts a directory from your machine. On Cloud that first element must be a managed volume's name or id. The SDK refuses the box **before any network request goes out**:
+>
+> ```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> host bind mounts are only supported by the local runtime; mount a managed volume by id or name instead
+> ```
+>
+> So the mistake surfaces immediately, rather than as a box that starts with an empty mount. If you are porting code, replace every host path with a managed volume reference.
+
+| | Open source | Cloud |
+| - | - | - |
+| What you mount | A directory on the host machine | A managed volume, by name or id |
+| Where the data lives | Your filesystem | Managed storage in the BoxLite resource pool |
+| Creating storage | Make a directory | `create(name)`, or the console's **New Volume** dialog |
+| Host bind mounts | Supported | Rejected |
+| Read-only mounts | Supported | Not supported |
+
+For host-directory mount options, read-only mounts, and `copy_in` / `copy_out`, see [Volumes and mounts](/manage-sandbox/volumes). For the complete side-by-side, see [Cloud vs open source](/cloud/vs-opensource).
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| - | - | - |
+| The box is refused with a host-path error | A path from your machine was passed as the first element. Cloud takes a managed volume reference there | Pass the volume's name or id: `volumes=[("training-data", "/data")]` |
+| `read-only managed volumes are not supported yet` | A mount asked for read-only, which Cloud does not support | Mount read-write; the SDK refuses rather than silently mounting writable |
+| `volumes tuples must be (host_path, guest_path[, read_only])` | A `volumes` entry is a tuple of the wrong length | Give each mount exactly the volume reference and the mount path |
+| `volumes entries must be tuple or dict` | A `volumes` entry is neither — most often a bare string | Wrap each mount in a tuple: `volumes=[(volume.name, "/data")]`, not `volumes=[volume.name]` |
+| `rt.volumes(...)` fails when you call it | `volumes` is a property on the runtime, not a method | Drop the parentheses: `await rt.volumes.create()` |
+| A BoxLite error from `create()`, `list()`, `get()`, or `remove()` | The runtime has no volume backend — a local runtime cannot resolve a managed volume reference | Build the runtime with `Boxlite.rest(...)` against Cloud |
+| `Invalid mount path ... (cannot mount to system directory)` | The mount path is `/proc`, `/etc`, `/bin`, or another system directory | Mount somewhere like `/data` or `/mnt/models` |
+| `Invalid mount path ... (must be absolute)` | The mount path is relative | Start the path with `/` |
+| `get()` raises for an id you expect to exist | `get()` takes the id, not the name — or the volume was already removed | Call `list()` and read the `id` off the `VolumeInfo` you want |
+| Files are gone after the box is removed | The data was written outside the mount path, so it lived on the box's own disk | Write under the mount path, for example `/data/results.json` |
+| A volume is not ready, is stuck, or will not go away after deletion | Volume state and deletion are covered on their own page | See [Volume operations](/cloud/volume-operations) |
+| `401` on `/v1/volumes` | Missing, malformed, or expired API key | Send `Authorization: Bearer <YOUR_API_KEY>` with a key from the console — see [API keys](/cloud/api-keys) |
+
+## Next steps
+
+> [card] [Mount a volume](/cloud/mount-a-volume)
+>
+> Create one, mount it, write and read through it.
+
+> [card] [Volume operations](/cloud/volume-operations)
+>
+> List, inspect, and delete volumes.

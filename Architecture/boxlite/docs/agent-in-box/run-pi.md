@@ -1,0 +1,188 @@
+# Run Pi
+Source: https://docs.boxlite.ai/agent-in-box/run-pi
+
+Install and drive the Pi coding agent inside a microVM, where it can read, write, and execute freely while your host and your provider key stay outside.
+
+Pi is a coding-agent CLI with read, bash, edit, and write tools. Its own documentation notes that running the whole process in a plain container means "provider API keys enter the container" — a box plus `Secret` removes that trade-off.
+
+## Prerequisites
+
+* The `boxlite` Python package and a machine with hardware virtualization — see [Installation](/getting-started/installation#platform-and-virtualization-requirements-common-to-all-sdks).
+* An API key for a provider Pi supports (Anthropic, OpenAI, Google, or any endpoint speaking one of those APIs).
+* A Node image for the box. Pi installs from npm, so `node:20-slim` or newer works.
+
+## Quick Example
+
+Install Pi into a box, point it at a provider, and run one non-interactive prompt.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+
+from boxlite import SimpleBox
+
+MODEL = "<YOUR_MODEL>"                    # e.g. a model id your provider serves
+API_KEY = "<YOUR_API_KEY>"                # TODO: read from your own secret store
+
+
+async def run(box, *cmd, env=None, user=None, timeout=None):
+    result = await box.exec(*cmd, env=env, user=user, timeout=timeout)
+    # exec does not raise on a non-zero exit — check it yourself
+    if result.exit_code != 0:
+        raise RuntimeError(f"`{' '.join(cmd)}` failed (exit={result.exit_code}): {result.stderr}")
+    return result
+
+
+async def main() -> None:
+    try:
+        # disk_size_gb leaves room for a global npm install
+        async with SimpleBox(image="node:20-slim", memory_mib=2048, disk_size_gb=8) as box:
+            # 1) Install the CLI. --ignore-scripts is what Pi's own docs recommend.
+            await run(box, "npm", "install", "-g", "--ignore-scripts",
+                      "@earendil-works/pi-coding-agent", timeout=600.0)
+            version = await run(box, "pi", "--version")
+            print("pi:", version.stdout.strip())
+
+            # 2) Run one prompt and exit. < /dev/null keeps the CLI from waiting on stdin.
+            answer = await run(
+                box, "sh", "-c",
+                f'pi -p "Write a one-line Python snippet that reverses a string." '
+                f'--provider anthropic --model {MODEL} --no-session < /dev/null',
+                env={"ANTHROPIC_API_KEY": API_KEY},
+                timeout=300.0,
+            )
+            print(answer.stdout)
+    except RuntimeError as exc:
+        print(f"runtime error: {exc}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+pi: 0.84.2
+def reverse(s: str) -> str: return s[::-1]
+```
+
+Verified inside a box on macOS (Apple Silicon): the box was up in **19 s**, the global
+npm install finished at **72 s**, and the prompt returned at **77 s**. An 8 GB disk came
+back **7% used**, so `disk_size_gb=8` has ample headroom.
+
+## Parameters and Returns
+
+The CLI surface used above, all from `pi --help`:
+
+| Flag | Meaning |
+| - | - |
+| `-p`, `--print` | Non-interactive: process the prompt and exit |
+| `--provider <name>` | Provider to use. Defaults to `google` |
+| `--model <pattern>` | Model id, or `provider/id` |
+| `--api-key <key>` | Key on the command line; otherwise read from the environment |
+| `--mode <mode>` | Output mode: `text` (default), `json`, or `rpc` |
+| `--no-session` | Do not persist the session — the right default for a disposable box |
+| `--list-models` | List models the configured providers expose. Useful as a readiness check |
+
+Pi reads its configuration from `~/.pi/agent`. Set **`PI_CODING_AGENT_DIR`** to relocate it. Inside a box, that keeps configuration on a path you control rather than in the image's home directory.
+
+## Machine-readable output
+
+`--mode json` emits one JSON object per line. The type sequence for a successful turn is:
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+session → agent_start → turn_start → message_start → message_end → turn_end → agent_end
+```
+
+The assistant's `message_end` carries what you need:
+
+```json theme={"theme":{"light":"github-light","dark":"github-dark"}}
+{"type":"message_end","message":{"role":"assistant","stopReason":"stop",
+ "content":[{"type":"text","text":"..."}],"usage":{"totalTokens":1970}}}
+```
+
+**Read `stopReason`, not the exit code.** `pi -p` exits `0` even when the model call fails; the failure shows up as `stopReason: "error"` plus an `errorMessage` field, and Pi retries up to three times (`auto_retry_start`, backing off 2000 ms then 4000 ms) before giving up — still with exit code `0`.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import json
+
+async def run_pi_json(box, prompt: str, model: str, api_key: str) -> str:
+    result = await box.exec(
+        "sh", "-c",
+        f'pi -p "{prompt}" --provider anthropic --model {model} '
+        f'--mode json --no-session < /dev/null',
+        env={"ANTHROPIC_API_KEY": api_key},
+        timeout=300.0,
+    )
+    for line in result.stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        message = event.get("message", {})
+        if event.get("type") == "message_end" and message.get("role") == "assistant":
+            if message.get("stopReason") == "error":
+                raise RuntimeError(f"pi failed: {message.get('errorMessage')}")
+            return "".join(b["text"] for b in message["content"] if b.get("type") == "text")
+    raise RuntimeError("no assistant message in pi output")
+```
+
+## Keeping the provider key out of the box
+
+The example above passes the key in as an environment variable, which means it exists inside the sandbox. When that is not acceptable, inject it at the proxy instead: the box sees only a placeholder, and BoxLite substitutes the real value on outbound requests to the hosts you allow.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+from boxlite import NetworkSpec, OutboundNetworkSpec, Secret, SimpleBox
+
+secret = Secret(
+    name="provider",
+    value="<YOUR_API_KEY>",                      # stays on the host
+    hosts=["api.anthropic.com"],                 # substituted only for these hosts
+)
+
+box = SimpleBox(
+    image="node:20-slim",
+    disk_size_gb=8,
+    secrets=[secret],
+    network=NetworkSpec(outbound=OutboundNetworkSpec(mode="enabled", allow_net=["registry.npmjs.org", "api.anthropic.com"])),
+)
+```
+
+Substitution covers request headers, the URL query string, and the request body — not the URL path. Details and the exact placeholder format are on [Secrets and hardening](/manage-sandbox/secrets-and-security).
+
+## Custom or self-hosted endpoints
+
+Pi's built-in providers use their vendors' own endpoints and **ignore `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`**. Pointing `--provider anthropic` at a compatible third-party endpoint through those variables fails with a `401 authentication_error` from the official host.
+
+To use a different endpoint, declare a provider in `models.json` under the directory `PI_CODING_AGENT_DIR` points at:
+
+```json theme={"theme":{"light":"github-light","dark":"github-dark"}}
+{
+  "providers": {
+    "my-endpoint": {
+      "baseUrl": "https://<YOUR_HOST>/anthropic",
+      "api": "anthropic-messages",
+      "apiKey": "<YOUR_API_KEY>",
+      "models": [{"id": "<MODEL_ID>", "name": "<Display name>", "contextWindow": 128000, "maxTokens": 8192}]
+    }
+  }
+}
+```
+
+Then select it with `--provider my-endpoint --model my-endpoint/<MODEL_ID>`. Confirm the box can see it with `pi --list-models` before spending a real prompt.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| - | - | - |
+| `npm install -g` fails with `ENOSPC: no space left on device` | The default box disk is too small for a global Node install | `SimpleBox(..., disk_size_gb=8)` — measured at 7% used after install |
+| The command hangs and never returns | The CLI is waiting on stdin | Append `< /dev/null` |
+| `401 authentication_error` naming a vendor host you did not configure | A built-in provider ignored your `*_BASE_URL` and used the vendor endpoint | Declare a custom provider in `models.json` as above |
+| The prompt "succeeded" but produced nothing useful | `pi -p` exits `0` on failure | Use `--mode json` and check `stopReason` / `errorMessage` |
+| `Model "<id>" not found for provider "<name>". Using custom model id.` | The model is not in Pi's bundled catalogue for that provider | Expected for custom endpoints — the call still proceeds |
+| Sessions accumulate inside the box | Pi persists sessions by default | Pass `--no-session`, or point `PI_CODING_AGENT_DIR` at a path you clean up |
+
+## Related
+
+* [Run Claude Code](/agent-in-box/run-claude-code) — the same pattern with the Claude Code CLI, plus `SkillBox` and a noVNC desktop.
+* [Run Codex](/agent-in-box/run-codex) — OpenAI's CLI, which reads its endpoint from environment variables instead.
+* [Secrets and hardening](/manage-sandbox/secrets-and-security) — keeping the provider key outside the sandbox.
+* [Drive a sandbox from your agent loop](/agent-tools/drive-from-agent-loop) — the inverse arrangement, where your process owns the loop.

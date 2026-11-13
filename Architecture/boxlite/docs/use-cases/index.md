@@ -1,0 +1,136 @@
+# Use cases
+Source: https://docs.boxlite.ai/use-cases/index
+
+Complete, end-to-end guides for shipping something real with BoxLite. Each one takes a scenario from problem statement to running code, states its isolation boundary explicitly, and links to the reference pages rather than repeating them.
+
+**How to pick one.** Find the outcome you want in the tables below. Guides are grouped by how your system uses the sandbox:
+
+* **The box is a tool the model calls** — your orchestration stays on the host, and untrusted code runs inside.
+* **The agent lives in the box** — an autonomous agent works inside the sandbox with its own filesystem, browser, or desktop.
+* **Multi-tenant platform** — you hand isolated environments to users or workloads.
+
+Every guide is self-contained and copy-runnable. Placeholders such as `<YOUR_API_KEY>` mark the values you must supply.
+
+Each guide starts from a box that already runs on your machine — see [Installation](/getting-started/installation) and a [quickstart](/getting-started/index).
+
+## The box is a tool the model calls
+
+| Guide | What you ship | Level |
+| - | - | - |
+| [Build a code interpreter for your LLM](/use-cases/code-interpreter) | A model writes Python; it executes in a disposable microVM | Beginner |
+| [Build a data analysis agent](/use-cases/data-analysis-agent) | CSV in, model-written pandas analysis and a chart out | Intermediate |
+| [Preview a sandboxed web app](/use-cases/sandboxed-web-app) | A generated web service running behind a forwarded port | Beginner+ |
+| [Expose a sandbox as an MCP tool](/use-cases/mcp-tool-server) | A standard MCP server any client can discover and call | Intermediate |
+| [Review untrusted pull requests in a sandbox](/use-cases/sandboxed-ci) | Tests and an automated review of code you have not read | Intermediate |
+
+## The agent lives in the box
+
+| Guide | What you ship | Level |
+| - | - | - |
+| [Give an agent a computer](/use-cases/computer-use-agent) | A vision model driving a real Linux desktop | Intermediate |
+| [Scrape and analyze the web safely](/use-cases/web-scraping-agent) | A browser box plus a parsing box, feeding clean data to a model | Intermediate |
+| [Use a custom image as the agent environment](/use-cases/custom-agent-image) | Boxes that boot with your toolchain already installed | Beginner+ |
+| [Run Claude Code](/agent-in-box/run-claude-code) | An autonomous coding agent confined to a microVM | Intermediate |
+
+## Multi-tenant platform
+
+| Guide | What you ship | Level |
+| - | - | - |
+| [Give each user a persistent shell](/use-cases/interactive-dev-environment) | A live, stateful shell per user, branch, or agent | Beginner |
+| [Run untrusted tools safely](/use-cases/untrusted-tool-execution) | An analysis bench with no network, dropped privileges, and maximum sandboxing | Intermediate |
+
+***
+
+## Recipe index: single-purpose snippets
+
+When you need one call rather than a whole guide, the tables below map a goal to its entry point and to the runnable example in the BoxLite repository.
+
+The tables below are organized by goal. Each row gives the recommended box type, the matching repository example file (relative to the repository root `boxlite/`), and the related concept page on this site.
+
+### Getting started: execute code and commands in a sandbox
+
+| Goal | Recommended entry point | Repository example (`boxlite/`) | Concept page |
+| - | - | - | - |
+| Run an arbitrary command and get stdout/stderr/exit_code | `SimpleBox.exec` | `examples/python/01_getting_started/run_simplebox.py` · `examples/node/simplebox.js` | [code-execution-any-language](/agent-tools/code-execution-any-language) |
+| Run a piece of Python code (with dynamic package install) | `CodeBox.run` / `install_package` | `examples/python/01_getting_started/run_codebox.py` · `examples/node/codebox.js` | [code-execution-python](/agent-tools/code-execution-python) |
+| Use the sync API (no async/await) | `SyncSimpleBox` / `SyncCodeBox` (requires `boxlite[sync]`) | `examples/python/01_getting_started/run_simplebox_sync.py` · `run_codebox_sync.py` | — |
+| List all current boxes | `runtime.list_info()` | `examples/python/01_getting_started/list_boxes.py` | [lifecycle](/manage-sandbox/lifecycle) |
+
+### Configure the sandbox: resources / volumes / network / ports / secrets
+
+| Goal | Recommended entry point | Repository example (`boxlite/`) | Concept page |
+| - | - | - | - |
+| Mount a host directory into the sandbox | `BoxOptions(volumes=[(host, guest, read_only)])` | `examples/python/02_features/mount_host_dir.py` | [volumes](/manage-sandbox/volumes) |
+| Copy files between sandbox and host | `box.copy_in` / `box.copy_out` | `examples/python/02_features/copy_files.py` · `examples/node/cp.js` | [lifecycle](/manage-sandbox/lifecycle) |
+| Forward a port to the host | `BoxOptions(ports=[...])` | `examples/python/02_features/forward_ports.py` | [network-access](/manage-sandbox/network-access) |
+| Restrict outbound network (allowlist) | `BoxOptions(network=NetworkSpec(...))` | `examples/python/02_features/network_allowlist.py` | [network-access](/manage-sandbox/network-access) |
+| Override entrypoint/cmd/user | `BoxOptions(cmd=, user=)` | `examples/python/02_features/set_cmd_and_user.py` | [configuration](/manage-sandbox/environment) |
+| Use a private/custom image registry | `Options(image_registries=[...])` | `examples/python/02_features/use_custom_registry.py` · `examples/node/custom_registry.js` | [configuration](/manage-sandbox/environment) |
+| Start from a local OCI image layout | `rootfs_path=` | `examples/python/02_features/use_local_oci_bundle.py` · `examples/node/local_oci_bundle.js` | [configuration](/manage-sandbox/environment) |
+| Inject secrets (effective only for specified hosts) | `BoxOptions(secrets=[Secret(...)])` | — (see concept page) | [secrets-and-security](/manage-sandbox/secrets-and-security) |
+| Tighten security isolation | `advanced=AdvancedBoxOptions(security=SecurityOptions.maximum())` | — (see concept page) | [secrets-and-security](/manage-sandbox/secrets-and-security) |
+
+### Lifecycle: stop / restart / reuse across processes / snapshots
+
+| Goal | Recommended entry point | Repository example (`boxlite/`) | Concept page |
+| - | - | - | - |
+| Stop / restart / explicitly remove a box | `box.stop()` · `runtime.remove(id, force=)` | `examples/python/03_lifecycle/manage_lifecycle.py` | [lifecycle](/manage-sandbox/lifecycle) |
+| Run in the background and reattach | detach + `runtime.get(...)` | `examples/python/03_lifecycle/detach_and_reattach.py` | [lifecycle](/manage-sandbox/lifecycle) |
+| Share one named box across processes | `reuse_existing=True` / `get_or_create` | `examples/python/03_lifecycle/share_across_processes.py` | [lifecycle](/manage-sandbox/lifecycle) |
+| Shut down all boxes managed by a runtime | `runtime.shutdown(timeout=)` | `examples/python/03_lifecycle/shutdown_runtime.py` · `examples/node/shutdown.js` | [lifecycle](/manage-sandbox/lifecycle) |
+| Clone / export / import a box | `box.clone_box` · `box.export` · `runtime.import_box` | `examples/python/03_lifecycle/clone_export_import.py` | [snapshots](/manage-sandbox/snapshots) |
+
+### Interactive terminal (PTY)
+
+| Goal | Recommended entry point | Repository example (`boxlite/`) | Concept page |
+| - | - | - | - |
+| Open an interactive shell in the sandbox | `InteractiveBox` | `examples/python/04_interactive/run_interactive_shell.py` · `examples/node/interactivebox.js` | [Interactive shell (PTY)](/agent-tools/pseudo-terminal) |
+| Interactively install/configure tools in a terminal | `InteractiveBox` | `examples/python/04_interactive/install_claude_interactively.py` | [Interactive shell (PTY)](/agent-tools/pseudo-terminal) |
+
+> Note: `InteractiveBox` / `ComputerBox` provide high-level wrappers only in Python and Node; C / Go / Rust only have the low-level `exec(tty=...)`.
+
+### Browser and desktop automation
+
+| Goal | Recommended entry point | Repository example (`boxlite/`) | Concept page |
+| - | - | - | - |
+| Drive the in-sandbox browser with Playwright | `BrowserBox.playwright_endpoint()` | `examples/python/05_browser_desktop/automate_with_playwright.py` · `examples/node/browserbox.js` | [browser-automation](/agent-tools/browser-automation) |
+| Connect Puppeteer via CDP | `BrowserBox.endpoint()` | `examples/python/05_browser_desktop/automate_with_puppeteer.py` · `examples/node/browserbox_puppeteer.js` | [browser-automation](/agent-tools/browser-automation) |
+| Desktop automation (mouse/keyboard/screenshot) | `ComputerBox` (xdotool backend) | `examples/python/05_browser_desktop/automate_desktop.py` · `examples/node/computerbox.js` | [computer-use](/agent-tools/computer-use) |
+
+### AI agents: let an LLM operate a sandbox
+
+| Goal | Recommended entry point | Repository example (`boxlite/`) | Concept page |
+| - | - | - | - |
+| Run Claude Code in a sandbox | `SkillBox.call` / drive `box.exec("claude", ...)` directly | `examples/python/06_ai_agents/chat_with_claude.py` · `examples/node/claude_in_boxlite.js` | [run-claude-code](/agent-in-box/run-claude-code) |
+| Use SkillBox (an AI box with skills) | `SkillBox.call` / `install_skill` | `examples/python/06_ai_agents/use_skillbox.py` | [agent-in-box](/agent-in-box/index) |
+| Drive a sandbox with an LLM tool-use loop | `SimpleBox.exec` + LLM | `examples/python/06_ai_agents/drive_box_with_llm.py` · `drive_box_with_minimax.py` | [agent-in-box](/agent-in-box/index) |
+
+### Advanced and remote REST
+
+| Goal | Recommended entry point | Repository example (`boxlite/`) | Concept page |
+| - | - | - | - |
+| Use the native low-level API directly | `Boxlite` + `Box` (native handles) | `examples/python/07_advanced/use_native_api.py` | [architecture](/architecture/index) |
+| Multi-agent orchestration (inter-box messaging) | `boxlite.orchestration.BoxRuntime` / `ManagedBox` | `examples/python/07_advanced/multi_agent/host.py` | [agent-in-box](/agent-in-box/index) |
+| Connect to a remote BoxLite REST service | `Boxlite.rest(BoxliteRestOptions(...))` | `examples/python/08_rest_api/connect_and_list.py` · `examples/node/rest_connect_and_list.js` | — |
+| Switch from local to REST | `Boxlite.rest(...)` | `examples/python/07_advanced/local_to_rest_migration.py` | — |
+
+### C SDK examples
+
+The C SDK ships its own example set under `examples/c/` (build with CMake; see `examples/c/README.md`). It exposes both a Simple API and a lower-level Native API with structured error handling (every function returns a `BoxliteErrorCode`).
+
+| Example (`boxlite/examples/c/`) | What it shows |
+| - | - |
+| `simple_api_demo.c` | Quick start with the Simple API: create a box and run a command |
+| `execute.c` | Command execution with real-time output streaming (Native API + callbacks) |
+| `shutdown.c` | Graceful runtime shutdown with multiple boxes |
+| `01_lifecycle.c` | Complete box lifecycle: create -> stop -> restart -> remove |
+| `02_list_boxes.c` | Discovery and introspection: list boxes, get info, ID-prefix lookup |
+| `03_streaming_output.c` | Real-time output handling with callbacks and user data/statistics |
+| `04_error_handling.c` | Error codes, retry logic, and graceful degradation |
+| `05_metrics.c` | Runtime and per-box performance metrics |
+
+> The C SDK uses `BoxliteErrorCode` for control flow rather than exceptions. Common codes: `Ok` (0), `NotFound` (2), `InvalidState` (4), `InvalidArgument` (5), `Image` (8, image pull failed), `Execution` (10, command failed). Always initialize `CBoxliteError error = {0};` and call `boxlite_error_free(&error)` on failure.
+
+> Link convention: the "concept page" column above links only to pages that exist on this site; the "repository example" entries are real file paths in the BoxLite source repository under `boxlite/` (not pages on this site), so open and run them inside the repository. A few capabilities without a standalone example script (such as Secrets) are marked with — ; see the corresponding concept page.
+
+***

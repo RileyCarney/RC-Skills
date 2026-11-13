@@ -1,0 +1,325 @@
+# Image registry configuration
+Source: https://docs.boxlite.ai/guides/image-registry-configuration
+
+Pull agent images from private or custom OCI registries — a corporate registry, ghcr.io, quay.io, or a local caching proxy — instead of only Docker Hub.
+
+You declare the registries once at runtime level, and unqualified image names resolve against them in the order you list.
+
+## Prerequisites
+
+* A working BoxLite install (Python `boxlite` or Node `@boxlite-ai/boxlite`) and a machine with hardware virtualization — see [Installation](/getting-started/installation#platform-and-virtualization-requirements-common-to-all-sdks).
+* The target image registry is reachable from your machine; for a private
+  registry, have credentials ready (username/password or bearer token).
+
+### How it works
+
+When you create a box with a "non-fully-qualified" reference (such as
+`image="alpine"`), BoxLite must resolve it to a full reference (such as
+`docker.io/library/alpine:latest`).
+
+* With no registries configured, the default is `docker.io` (Docker Hub).
+* With `image_registries` configured, BoxLite tries each registry that has
+  `search=True` in list order, and the first success wins; if all fail, it
+  raises.
+* **A fully-qualified reference (such as
+  `quay.io/prometheus/prometheus:v2.40.1`) always skips the lookup list and
+  pulls directly from that registry.**
+* The SDK reads no local state: it **does not** automatically read any local
+  config file. The registry list is supplied entirely by your code, so behavior
+  is deterministic and does not depend on the host machine's environment.
+
+## Quick Example
+
+The simplest flow: have BoxLite check `ghcr.io` first, then fall back to
+`docker.io`, then create a box with `alpine` and run a command. You can copy and
+run it directly.
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+
+import boxlite
+
+async def main() -> None:
+    # 1) Declare image registries (tried in order; the first success wins)
+    #    search=True means this registry participates in resolving "non-fully-qualified" image names
+    options = boxlite.Options(
+        image_registries=[
+            boxlite.ImageRegistry(host="ghcr.io", search=True),
+            boxlite.ImageRegistry(host="docker.io", search=True),
+        ]
+    )
+
+    # 2) Boxlite is a synchronous context manager (use with, not await)
+    with boxlite.Boxlite(options) as runtime:
+        # 3) SimpleBox is an async context manager (use async with)
+        #    'alpine' resolves to ghcr.io/library/alpine -> on failure, docker.io/library/alpine
+        try:
+            async with boxlite.SimpleBox(image="alpine:latest", runtime=runtime) as box:
+                result = await box.exec("cat", "/etc/os-release")
+                print(result.stdout)
+        except RuntimeError as exc:
+            # An image pull failure (network/auth/not-found) raises a standard RuntimeError
+            print(f"box failed: {exc}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { JsBoxlite, SimpleBox } from "@boxlite-ai/boxlite";
+
+async function main(): Promise<void> {
+  // JsBoxlite is the runtime class (note: there is no bare Boxlite class)
+  const runtime = new JsBoxlite({
+    imageRegistries: [
+      { host: "ghcr.io", search: true },
+      { host: "docker.io", search: true },
+    ],
+  });
+
+  const box = new SimpleBox({ image: "alpine:latest", runtime });
+  try {
+    const result = await box.exec("cat", "/etc/os-release");
+    console.log(result.stdout);
+  } catch (err) {
+    console.error("box failed:", err);
+  } finally {
+    await box.stop();
+  }
+}
+
+main();
+```
+
+## Private / authenticated registries
+
+A private registry takes credentials via `ImageRegistry`'s `username`/`password`
+(Basic auth) or `bearer_token` (Bearer auth) fields. **Username and password
+must be provided together**; supplying only one raises.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+import os
+
+import boxlite
+
+async def main() -> None:
+    options = boxlite.Options(
+        image_registries=[
+            # Private enterprise registry: Basic auth (username + password)
+            boxlite.ImageRegistry(
+                host="registry.example.com",
+                search=True,
+                # Do not hardcode credentials in source; read from environment variables
+                username=os.environ.get("REGISTRY_USER", "<YOUR_REGISTRY_USER>"),
+                password=os.environ.get("REGISTRY_PASS", "<YOUR_REGISTRY_PASS>"),
+            ),
+            # Local HTTP caching proxy (plaintext HTTP, requires explicit transport="http")
+            boxlite.ImageRegistry(
+                host="registry.local:5000",  # host[:port], not a URL
+                transport="http",
+                search=True,
+            ),
+            # Fallback: Docker Hub
+            boxlite.ImageRegistry(host="docker.io", search=True),
+        ]
+    )
+
+    with boxlite.Boxlite(options) as runtime:
+        try:
+            async with boxlite.SimpleBox(
+                image="my-internal-app:latest", runtime=runtime
+            ) as box:
+                result = await box.exec("echo", "hello from private image")
+                print(result.stdout)
+        except RuntimeError as exc:
+            print(f"pull/start failed: {exc}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+For Bearer token auth, replace `username`/`password` with `bearer_token`:
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import os
+
+import boxlite
+
+registry = boxlite.ImageRegistry(
+    host="ghcr.io",
+    search=True,
+    # Registries that support token auth, such as GitHub Container Registry
+    bearer_token=os.environ.get("GHCR_TOKEN", "<YOUR_BEARER_TOKEN>"),
+)
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { JsBoxlite, SimpleBox } from "@boxlite-ai/boxlite";
+
+const runtime = new JsBoxlite({
+  imageRegistries: [
+    {
+      host: "registry.example.com",
+      search: true,
+      // Credentials go in the auth sub-object (username+password or bearerToken)
+      auth: {
+        username: process.env.REGISTRY_USER ?? "<YOUR_REGISTRY_USER>",
+        password: process.env.REGISTRY_PASS ?? "<YOUR_REGISTRY_PASS>",
+      },
+    },
+    { host: "registry.local:5000", transport: "http", search: true },
+    { host: "docker.io", search: true },
+  ],
+});
+
+const box = new SimpleBox({ image: "my-internal-app:latest", runtime });
+try {
+  const result = await box.exec("echo", "hello");
+  console.log(result.stdout);
+} catch (err) {
+  console.error(err);
+} finally {
+  await box.stop();
+}
+```
+
+Node puts auth in an `auth` sub-object, unlike Python's flat fields.
+
+## Parameters and Returns
+
+### `boxlite.Options` (Python)
+
+| Parameter | Type | Required | Default | Description |
+| - | - | - | - | - |
+| `home_dir` | `str \| None` | Optional | `None` | BoxLite data/cache directory; `None` uses the default location |
+| `image_registries` | `list[ImageRegistry]` | Optional | `[]` | Image registry list; an empty list is equivalent to using only `docker.io` |
+
+After construction, pass it to `boxlite.Boxlite(options)` to get a runtime handle
+(a synchronous context manager).
+
+### `boxlite.ImageRegistry` (Python)
+
+Constructor signature:
+`ImageRegistry(host, transport="https", skip_verify=False, search=False, username=None, password=None, bearer_token=None)`
+
+| Parameter | Type | Required | Default | Description |
+| - | - | - | - | - |
+| `host` | `str` | **Required** | — | Registry host, in the form `host[:port]` (e.g. `ghcr.io`, `registry.local:5000`). **Must not contain `://` or `/`**, otherwise it raises |
+| `transport` | `str` | Optional | `"https"` | Only accepts `"https"` or `"http"`; `"http"` is for plaintext HTTP registries |
+| `skip_verify` | `bool` | Optional | `False` | When `True`, skips HTTPS TLS certificate and hostname verification (self-signed certificate scenario) |
+| `search` | `bool` | Optional | `False` | When `True`, this registry participates in lookup fallback for "non-fully-qualified" image names. **Note the default is `False`** |
+| `username` | `str \| None` | Optional | `None` | Basic auth username; must be paired with `password` |
+| `password` | `str \| None` | Optional | `None` | Basic auth password; must be paired with `username` |
+| `bearer_token` | `str \| None` | Optional | `None` | Bearer token auth. If you also set `username`/`password`, the bearer token wins — they are not rejected |
+
+### `JsImageRegistry` (Node)
+
+| Field | Type | Required | Default | Description |
+| - | - | - | - | - |
+| `host` | `string` | **Required** | — | Registry host `host[:port]` |
+| `transport` | `"https" \| "http"` | Optional | `"https"` | Transport protocol |
+| `skipVerify` | `boolean` | Optional | `false` | Skip TLS verification |
+| `search` | `boolean` | Optional | `false` | Participate in non-qualified-name lookup fallback |
+| `auth` | `JsImageRegistryAuth` | Optional | — | Auth sub-object: `{ username?, password?, bearerToken? }` |
+
+### Returns / behavior
+
+| Operation | Return / effect |
+| - | - |
+| `boxlite.Boxlite(options)` | Runtime handle (a synchronous context manager); construction is synchronous, do not `await` |
+| `runtime.create(...)` / `SimpleBox(... runtime=runtime)` | Resolves the image with the configured registry list and creates the box |
+| Non-qualified-name pull | Tries the `search=True` registries in list order, first success wins; if all fail it raises `RuntimeError` (Python) / usually a bare `Error` (Node) |
+| Fully-qualified name (reference with a host) | Skips the lookup list and pulls directly from that host |
+
+> Tip: `box.exec(...)` **does not** raise when a command exits with a non-zero
+> code; it returns an `ExecResult` (Python fields `exit_code/stdout/stderr`;
+> Node `exitCode/stdout/stderr`). Only image-level failures (pull/auth) raise.
+
+## Troubleshooting
+
+### `transport` is not a string literal
+
+A common mistake is passing a boolean or an uppercase form. `transport` only
+accepts `"https"` or `"http"`:
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+RuntimeError: unsupported registry transport: HTTP
+```
+
+Fix: use the lowercase string `transport="http"` or `transport="https"`
+(defaults to https, can be omitted).
+
+### `host` was written as a URL
+
+`host` must be `host[:port]`; it cannot have a protocol prefix or a path:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Wrong
+boxlite.ImageRegistry(host="https://registry.example.com")
+# RuntimeError: image registry host must be host[:port], not a URL: https://registry.example.com
+
+# Correct
+boxlite.ImageRegistry(host="registry.example.com", transport="https")
+```
+
+An empty host also raises: `RuntimeError: image registry host is required`.
+
+### Only a username was given (or only a password)
+
+The two Basic auth fields must be paired:
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+RuntimeError: registry username and password must be provided together
+```
+
+Fix: provide both `username` and `password`; if using token auth, switch to
+`bearer_token` (Python) / `auth.bearerToken` (Node), and do not mix them.
+
+### A registry is configured but pulls still go to Docker Hub / the image is not found
+
+The most common cause is not setting `search=True`. This field **defaults to
+`False`**, and a registry that is `False` does not participate in
+non-qualified-name lookup:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# This configuration has no effect on non-qualified names like 'alpine'
+boxlite.ImageRegistry(host="ghcr.io")            # search defaults to False
+
+# To participate in lookup fallback, it must be explicitly enabled
+boxlite.ImageRegistry(host="ghcr.io", search=True)
+```
+
+Also confirm you are not using a fully-qualified name — a fully-qualified name
+(with a host) bypasses the lookup list and pulls directly.
+
+### Self-signed / internal HTTPS certificate verification fails
+
+An internal self-signed certificate causes TLS verification to fail. For a
+trusted internal registry you can set `skip_verify=True` (Python) /
+`skipVerify: true` (Node). This disables certificate and hostname verification,
+**so only use it when you trust the network**. For a plaintext HTTP registry,
+switch to `transport="http"` instead.
+
+### Image pull failure raises a standard exception, not `BoxliteError`
+
+A missing command or an image pull failure raises a standard `RuntimeError` (Python) / bare `Error` (Node), not `BoxliteError`. See [Error Handling](/guides/error-handling#troubleshooting).
+
+### Box fails to start: environment has no virtualization
+
+BoxLite runs inside a microVM and needs hardware virtualization:
+
+* Linux: needs KVM (`/dev/kvm` accessible; on WSL2 the user must be in the `kvm`
+  group).
+* macOS: via the built-in virtualization stack (Apple Hypervisor.framework), no
+  `/dev/kvm` required.
+* Without virtualization, startup fails (the exception is catchable; the process
+  does not crash).
+
+This is unrelated to registry configuration — first confirm the base
+environment can start a box with `image="alpine:latest"` (default Docker Hub),
+then debug the registry configuration.
+
+***
+
+Related pages: [Error Handling](/guides/error-handling)

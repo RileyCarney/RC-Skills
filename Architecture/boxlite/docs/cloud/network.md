@@ -1,0 +1,46 @@
+# Network
+Source: https://docs.boxlite.ai/cloud/network
+
+Reach a service running inside a Cloud box, and control what that box is allowed to reach on the way out.
+
+A box that runs a web app, a dev server, or an SSH daemon is only useful once something can reach it. On BoxLite Cloud you ask a box for a **tunnel** to one of its ports, and that tunnel gives you a public URL and a byte stream. What the box itself may reach on the way out is a separate control.
+
+Two rules hold across everything here:
+
+* **Your service must bind `0.0.0.0`.** A tunnel arrives on the box's network interface, so a server on `127.0.0.1` inside the box is unreachable.
+* **A tunnel carries exactly one connection.** Ask for a fresh one per request, per retry, and per concurrent client.
+
+## In this section
+
+> [card] [How tunnels work](/cloud/tunnels)
+>
+> The concept, the one-shot rule, what a tunnel is verified to carry, and the full parameter reference. **Start here.**
+
+> [card] [Serve HTTP](/cloud/serve-http)
+>
+> Start an HTTP server inside a box, get its public URL, and make a request over it.
+
+> [card] [Port forwarding](/cloud/port-forwarding)
+>
+> Publish a box port on your own machine so `curl`, a browser, or a database driver can dial it.
+
+> [card] [Raw streams](/cloud/raw-streams)
+>
+> Take the byte stream directly when you are speaking a protocol of your own.
+
+> [card] [Network policy](/cloud/network-policy)
+>
+> Who can reach a box — public, private, signed URLs — and the egress allowlist that bounds what it reaches.
+
+## Which page do I want?
+
+| You want | Page |
+| - | - |
+| To understand the model before writing code | [How tunnels work](/cloud/tunnels) |
+| A fixed public hostname that can move between boxes | [Domains](/cloud/domains) |
+| A public URL for an HTTP service in a box | [Serve HTTP](/cloud/serve-http) |
+| A local port any TCP client can dial | [Port forwarding](/cloud/port-forwarding) |
+| The raw bidirectional stream | [Raw streams](/cloud/raw-streams) |
+| To make a box public, private, or shared by signed URL | [Network policy](/cloud/network-policy#inbound-who-can-reach-a-box) |
+| To restrict what the box can call out to | [Network policy](/cloud/network-policy#outbound-what-the-box-can-reach) |
+| A parameter table for `tunnel()`, `BoxTunnel`, or `SocketAddress` | [How tunnels work](/cloud/tunnels#parameters-and-returns) |

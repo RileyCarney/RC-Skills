@@ -1,0 +1,107 @@
+# BoxLite documentation
+Source: https://docs.boxlite.ai/index
+
+Run arbitrary code, commands, browsers, desktops, or entire AI agents inside hardware-isolated microVM sandboxes that start in about a second.
+
+**BoxLite runs arbitrary code, commands, browsers, desktops, or entire AI agents inside hardware-isolated microVM sandboxes that start in about a second — in a few lines of code, and isolated enough to run untrusted LLM output directly.**
+
+## Which BoxLite do I want?
+
+There are two ways to run boxes, and the choice is made for you by one thing: whether the machine running your code has hardware virtualization.
+
+> [card] [Open source — boxes on your own machine](/getting-started/quickstart)
+>
+> Free, self-hosted, no account. **Needs hardware virtualization** — KVM on Linux, Apple Silicon on macOS, WSL2 on Windows. Not available in most CI runners, nested VMs, or containers.
+
+> [card] [BoxLite Cloud — boxes on our machines](/cloud/quickstart)
+>
+> An API key and HTTPS is all your machine needs. Works from CI, containers, and locked-down laptops. Same SDK, different runtime handle.
+
+Not sure? Run this. If it prints a path, take the open-source track; if it prints nothing, take Cloud:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Linux
+ls /dev/kvm 2>/dev/null
+# macOS (Apple Silicon reports arm64)
+uname -m | grep -q arm64 && echo "/dev/kvm-equivalent: Hypervisor.framework"
+```
+
+The two tracks are not exclusive — the same SDK talks to both, so developing against a local box and running the same code against Cloud in production is a change of runtime handle, not a rewrite. [BoxLite Cloud vs open source](/cloud/vs-opensource) enumerates every difference.
+
+## Run your first sandbox
+
+This is the open-source path. For the Cloud path, see the [Cloud quickstart](/cloud/quickstart).
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+pip install boxlite
+```
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# hello.py — needs hardware virtualization; see the Cloud track above if you have none
+import asyncio
+import boxlite
+
+
+async def main() -> None:
+    try:
+        async with boxlite.SimpleBox(image="python:slim") as box:
+            result = await box.exec("python", "-c", "print('Hello from BoxLite!')")
+            # A non-zero exit code does not raise — check it yourself.
+            print(result.stdout if result.exit_code == 0 else result.stderr, end="")
+    except RuntimeError as exc:
+        print("Box failed to start:", exc)
+
+
+asyncio.run(main())
+```
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+Hello from BoxLite!
+```
+
+The same five steps in Node.js, Rust, Go, and C are on the [Quickstart](/getting-started/quickstart). Platform matrix, the CLI, and offline installs are on [Installation](/getting-started/installation).
+
+***
+
+## Who this documentation is for
+
+* **AI / agent engineers**: you need to give an LLM a secure sandbox that can run code, open a browser, and operate a desktop, without exposing the host to model-generated commands.
+* **Backend / platform engineers**: you need to start, reuse, and reclaim isolated execution environments on demand inside your own service (multi-tenant, CI, code grading, untrusted third-party code).
+* **Agent product authors**: you already have a demo and want to turn it into a concurrency-safe, observable, cleanable production service.
+
+## Quickest path for new users
+
+1. **Pick a track** → [above](#which-boxlite-do-i-want). Self-hosted needs virtualization; Cloud does not.
+2. **Run your first box** → [Quickstart](/getting-started/quickstart) for self-hosted, [Cloud quickstart](/cloud/quickstart) for Cloud.
+3. **Understand what you are operating** → [Architecture overview](/architecture/index), then [Box types](/manage-sandbox/sandbox-types).
+4. **Build something real** → [Agent tools](/agent-tools/index) for the capabilities, or [use cases](/use-cases/index) for end-to-end guides.
+5. **Go to production** → [Running sandboxes at scale](/guides/at-scale) and [Error handling](/guides/error-handling).
+
+***
+
+## Where everything lives
+
+One row per section. The sidebar lists every page; this table is for deciding *which* section you need.
+
+| Section | Answers |
+| - | - |
+| [Introduction](/getting-started/index) | What a Box is, how it differs from a container, and what is ready today |
+| [BoxLite Cloud](/cloud/index) | The hosted runtime: API keys, boxes, volumes, network, and pricing |
+| [Manage sandbox](/manage-sandbox/index) | Creating, configuring, and reclaiming boxes — resources, volumes, network, secrets |
+| [Agent tools](/agent-tools/index) | The capabilities an agent calls: run code, PTY, browser, desktop, MCP, Git |
+| [Agent in a box](/agent-in-box/index) | Putting a full agent *inside* a box — Claude Code, tool loops, a REST service |
+| [Human tools](/human-tools/index) | Handing a running box to a person: desktop and browser takeover |
+| [Use cases](/use-cases/index) | End-to-end guides — one complete, runnable deliverable per page |
+| [From demo to production](/guides/index) | Turning a demo into a production service: concurrency, limits, cleanup, deployment |
+| [Architecture](/architecture/index) | Components, the path of one `exec`, and — deeper — how isolation, networking, storage, and boot actually work |
+| [SDK reference](/reference/index) | Exact signatures and types, one page per language, plus the CLI |
+| [FAQ](/faq) and [releases](/resources/index) | Recurring questions, and where each release's notes are published |
+| [Contributing](/development/index) | Working on BoxLite itself — build, tests, style, and the contributor license agreement |
+
+***
+
+## Key mental model (three sentences)
+
+* **The `Boxlite` runtime**: a synchronous context manager that creates / queries / reuses / reclaims a set of boxes (`get` / `get_or_create` / `list_info` / `remove(id_or_name, force=False)` / `metrics` / `shutdown` / `close`).
+* **A Box**: each sandbox is an async context manager (`SimpleBox` / `CodeBox` / `BrowserBox` / `ComputerBox` / `InteractiveBox` / `SkillBox`), and every method must be awaited — `box.info()` included, on both `SimpleBox` and the native `Box`.
+* **Isolation**: microVM-level isolation is on by default; to tighten it further use `BoxOptions(advanced=AdvancedBoxOptions(security=SecurityOptions.maximum()))`, and to inject credentials use `BoxOptions(secrets=[Secret(...)])`.

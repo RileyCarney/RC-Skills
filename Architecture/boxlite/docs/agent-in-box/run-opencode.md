@@ -1,0 +1,149 @@
+# Run OpenCode
+Source: https://docs.boxlite.ai/agent-in-box/run-opencode
+
+Install and drive the OpenCode CLI inside a microVM, configuring its provider without writing a config file into the image.
+
+OpenCode takes its whole configuration as a JSON string in an environment variable, which suits a disposable box: nothing to mount, nothing left behind, and the provider block can be assembled by your orchestration code.
+
+## Prerequisites
+
+* The `boxlite` Python package and a machine with hardware virtualization — see [Installation](/getting-started/installation#platform-and-virtualization-requirements-common-to-all-sdks).
+* An API key for a provider OpenCode supports.
+* A Node image for the box. OpenCode installs from npm, so `node:20-slim` or newer works.
+
+## Quick Example
+
+Install the CLI, inject a provider through `OPENCODE_CONFIG_CONTENT`, and run one prompt.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+import json
+
+from boxlite import SimpleBox
+
+API_KEY = "<YOUR_API_KEY>"                 # TODO: read from your own secret store
+BASE_URL = "<YOUR_BASE_URL>/v1"            # must end at /v1 — see Troubleshooting
+MODEL_ID = "<MODEL_ID>"
+
+# OpenCode reads its entire configuration from this JSON string, so nothing is
+# written into the image and the key never lands in a file inside the box.
+CONFIG = json.dumps({
+    "provider": {
+        "custom": {
+            "npm": "@ai-sdk/anthropic",
+            "name": "Custom endpoint",
+            "options": {"baseURL": BASE_URL, "apiKey": API_KEY},
+            "models": {MODEL_ID: {"name": MODEL_ID}},
+        }
+    }
+})
+
+
+async def run(box, *cmd, env=None, timeout=None):
+    result = await box.exec(*cmd, env=env, timeout=timeout)
+    # exec does not raise on a non-zero exit — check it yourself
+    if result.exit_code != 0:
+        raise RuntimeError(f"`{' '.join(cmd)}` failed (exit={result.exit_code}): {result.stderr}")
+    return result
+
+
+async def main() -> None:
+    try:
+        async with SimpleBox(image="node:20-slim", memory_mib=2048, disk_size_gb=8) as box:
+            await run(box, "npm", "install", "-g", "opencode-ai", timeout=600.0)
+            version = await run(box, "opencode", "--version")
+            print("opencode:", version.stdout.strip())
+
+            answer = await run(
+                box, "sh", "-c",
+                f'opencode run "Write a one-line Python snippet that reverses a string." '
+                f'-m custom/{MODEL_ID} < /dev/null',
+                env={"OPENCODE_CONFIG_CONTENT": CONFIG},
+                timeout=300.0,
+            )
+            print(answer.stdout)
+    except RuntimeError as exc:
+        print(f"runtime error: {exc}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Verified output shape from a real run of the same command — OpenCode prints the agent and model it selected, then the answer:
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+opencode: 1.18.18
+> build · <MODEL_ID>
+def reverse(s: str) -> str: return s[::-1]
+```
+
+Seeing the `> build · <model>` line is the signal that the provider block was accepted. If the model does not resolve, you get an error instead of that line.
+
+Verified inside a box on macOS (Apple Silicon): the global npm install took about **20 s**
+and the prompt returned **6 s** later. An 8 GB disk came back **9% used**.
+
+## Parameters and Returns
+
+From `opencode --help` and `opencode run --help`:
+
+| Entry point | Meaning |
+| - | - |
+| `opencode run [message..]` | Run with a message and exit |
+| `-m`, `--model <provider/model>` | Model, qualified by provider name |
+| `--agent <name>` | Agent to use |
+| `-c`, `--continue` | Continue the last session |
+| `-s`, `--session <id>` | Continue a specific session |
+| `-f`, `--file <path>` | Attach files to the message |
+| `--print-logs` | Print logs to stderr — the first thing to turn on when a run misbehaves |
+| `opencode serve` | Start a headless server instead of a one-shot run |
+| `opencode providers` | Manage credentials interactively (alias `auth`) |
+
+Configuration environment variables: `OPENCODE_CONFIG_CONTENT` (whole config as JSON), `OPENCODE_CONFIG` (path to a config file), `OPENCODE_CONFIG_DIR`.
+
+## Keeping the API key out of the box
+
+`OPENCODE_CONFIG_CONTENT` keeps the key out of any file, but it is still an environment variable inside the sandbox. To keep the real value on the host entirely, put a placeholder in the config and let the proxy substitute it on the way out:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+from boxlite import NetworkSpec, OutboundNetworkSpec, Secret, SimpleBox
+
+box = SimpleBox(
+    image="node:20-slim",
+    disk_size_gb=8,
+    secrets=[Secret(name="provider", value="<YOUR_API_KEY>", hosts=["<YOUR_HOST>"])],
+    network=NetworkSpec(outbound=OutboundNetworkSpec(mode="enabled", allow_net=["registry.npmjs.org", "<YOUR_HOST>"])),
+)
+```
+
+The placeholder goes where the key would have gone in the config JSON. Substitution covers request headers, the URL query string, and the request body — not the URL path. See [Secrets and hardening](/manage-sandbox/secrets-and-security) for the placeholder format.
+
+## Long-running use: `opencode serve`
+
+For more than one prompt, run the headless server and forward its port instead of installing and starting it on every call:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+async with SimpleBox(image="node:20-slim", disk_size_gb=8, ports=[(4096, 4096)]) as box:
+    await run(box, "npm", "install", "-g", "opencode-ai", timeout=600.0)
+    await run(box, "sh", "-c", "nohup opencode serve > /tmp/opencode.log 2>&1 &")
+    # Poll the forwarded port before sending work; exec returns as soon as the
+    # command is launched and does not health-check the service for you.
+```
+
+Port forwarding requires the service to bind `0.0.0.0` rather than `127.0.0.1` — see [Network access](/manage-sandbox/network-access#port-forwarding-ports).
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| - | - | - |
+| `404 Page not found` on the first prompt | The adapter requests `{baseURL}/messages`, so a `baseURL` that stops before `/v1` cannot form `/v1/messages` | End `baseURL` at `/v1` |
+| `Error: {"name":"UnknownError",...}` and no `> build` line | OpenCode did not resolve a provider; it ignores `ANTHROPIC_BASE_URL` and similar variables | Supply the provider through `OPENCODE_CONFIG_CONTENT` as above |
+| `npm install -g` fails with `ENOSPC: no space left on device` | The default box disk is too small | `SimpleBox(..., disk_size_gb=8)` — measured at 9% used after install |
+| The command hangs and never returns | The CLI is waiting on stdin | Append `< /dev/null` |
+| No idea why a run failed | Errors are terse by default | Add `--print-logs` and read stderr |
+
+## Related
+
+* [Run Pi](/agent-in-box/run-pi) — configures custom endpoints through a config file instead of an environment variable.
+* [Run Codex](/agent-in-box/run-codex) — configures its endpoint through environment variables.
+* [Network access](/manage-sandbox/network-access) — forwarding `opencode serve` to the host.

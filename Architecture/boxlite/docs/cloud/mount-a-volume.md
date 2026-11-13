@@ -1,0 +1,235 @@
+# Create a volume and mount it into a box
+Source: https://docs.boxlite.ai/cloud/mount-a-volume
+
+Create a managed volume, mount it into a box at a path you choose, and write and read through the mount.
+
+A managed volume is storage the platform keeps for you, independent of any box. This is
+the shortest complete path: create one, mount it, write through it, read it back.
+
+## Pick where to do this
+
+Creating a volume takes one step on any of three surfaces. Mounting one always happens
+where the box is created, so that part follows whichever you use to make boxes.
+
+> [tab] Console
+>
+> 1. Open **Volumes** and click **New Volume**.
+> 2. Fill in **Name** — the only field. Pick something you will recognize later, such as
+>    `subtitle-models`.
+> 3. Creation waits until the volume is ready, so you can mount it immediately.
+>
+> Use the console when you want to **see what you own**. `rt.volumes.list()` and the
+> **Volumes** page report the same set, and a name set in either place mounts the same way.
+
+> [tab] CLI
+>
+> ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> boxlite volume create --name subtitle-models   # prints the volume id
+> boxlite create python --name trainer -v subtitle-models:/data
+> boxlite start trainer
+> boxlite exec trainer -- sh -c 'echo hi > /data/f.txt && cat /data/f.txt'
+> ```
+>
+> `boxlite volume` talks to a REST server, so run `boxlite auth login` first. Flag tables
+> are on the [CLI reference](/reference/cli#boxlite-volume).
+
+> [tab] SDK
+>
+> The script below is the whole flow — create, mount, write, read. Use this when the
+> volume is part of something your program does rather than something you set up once.
+
+## Prerequisites
+
+* An API key from the console, exported as `BOXLITE_API_KEY`. See [API keys](/cloud/api-keys).
+* `pip install boxlite`, and the REST URL exported as `BOXLITE_REST_URL`. See [Quickstart](/cloud/quickstart).
+
+Every example reads both values from the environment, so nothing hard-codes a credential.
+
+Create a volume, mount it into a box at `/data`, write a file through the mount, and read it back. This runs as written once the two environment variables are set.
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# cloud_volume.py — create a named volume, mount it, write and read through it
+# Run: python cloud_volume.py
+import asyncio
+import os
+import time
+
+from boxlite import (
+    ApiKeyCredential,
+    Boxlite,
+    BoxOptions,
+    BoxliteRestOptions,
+)
+
+IMAGE = "ghcr.io/boxlite-ai/boxlite-agent-base:v0.1.0"
+
+api_key = os.environ.get("BOXLITE_API_KEY")
+if not api_key:
+    raise SystemExit("Set BOXLITE_API_KEY to your blk_live_... key before running this.")
+
+
+async def main() -> None:
+    rt = Boxlite.rest(
+        BoxliteRestOptions(
+            url=os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
+            credential=ApiKeyCredential(api_key),
+        )
+    )
+
+    volume = None
+    box = None
+    try:
+        # rt.volumes is a property. create() takes an optional name that you can
+        # mount by later, instead of carrying the id around.
+        volume = await rt.volumes.create(f"demo-{int(time.time())}")
+        print(f"Created volume {volume.name} (id {volume.id})")
+
+        box = await rt.create(
+            BoxOptions(
+                image=IMAGE,
+                # (managed volume name or id, mount path inside the box)
+                volumes=[(volume.name, "/data")],
+            ),
+            name=f"volume-demo-{int(time.time())}",
+        )
+        await box.start()
+
+        # Write through the mount, not to the box's own disk.
+        write = await box.exec(
+            "sh",
+            args=["-c", "echo 'subtitle model v3' > /data/notes.txt"],
+        )
+        write_result = await write.wait()
+        if write_result.exit_code != 0:
+            print(f"write failed with exit code {write_result.exit_code}")
+            return
+
+        read = await box.exec("cat", args=["/data/notes.txt"])
+        content = ""
+        async for line in read.stdout():
+            content += line
+        read_result = await read.wait()
+
+        print(f"Exit code: {read_result.exit_code}")
+        print(content)
+    except Exception as exc:
+        # Auth failures, creation failures, and local runtimes without a volume
+        # backend all surface here.
+        print(f"volume run failed: {exc!r}")
+    finally:
+        # Teardown in finally, so a failure above cannot leave a box billing.
+        if box is not None:
+            await rt.remove(box.id, force=True)
+        if volume is not None:
+            await rt.volumes.remove(volume.id)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// cloudVolume.ts — create a named volume, mount it, write and read through it
+// Run: node cloudVolume.ts
+import { ApiKeyCredential, BoxliteRestOptions, JsBoxlite } from "@boxlite-ai/boxlite";
+
+const IMAGE = "ghcr.io/boxlite-ai/boxlite-agent-base:v0.1.0";
+
+const apiKey = process.env.BOXLITE_API_KEY;
+if (!apiKey) {
+  throw new Error("Set BOXLITE_API_KEY to your blk_live_... key before running this.");
+}
+
+async function main(): Promise<void> {
+  const rt = JsBoxlite.rest(
+    new BoxliteRestOptions({
+      url: process.env.BOXLITE_REST_URL ?? "https://api.boxlite.ai",
+      credential: new ApiKeyCredential(apiKey),
+    }),
+  );
+
+  const stamp = Math.floor(Date.now() / 1000);
+  let volume = null;
+  let box = null;
+  try {
+    // rt.volumes is a property. create() takes an optional name you can mount by.
+    volume = await rt.volumes.create(`demo-${stamp}`);
+    console.log(`Created volume ${volume.name} (id ${volume.id})`);
+
+    box = await rt.create(
+      {
+        image: IMAGE,
+        // [managed volume name or id, mount path inside the box]
+        volumes: [[volume.name, "/data"]],
+      },
+      `volume-demo-${stamp}`,
+    );
+    await box.start();
+
+    // Write through the mount, not to the box's own disk.
+    const write = await (await box.exec("sh", ["-c", "echo 'subtitle model v3' > /data/notes.txt"])).wait();
+    if (write.exitCode !== 0) {
+      console.error(`write failed with exit code ${write.exitCode}`);
+      return;
+    }
+
+    const read = await box.exec("cat", ["/data/notes.txt"]);
+    const stdout = await read.stdout();
+    let content = "";
+    while (true) {
+      const line = await stdout.next();
+      if (line === null) break;
+      content += line;
+    }
+    const result = await read.wait();
+
+    console.log(`Exit code: ${result.exitCode}`);
+    console.log(content);
+  } catch (err) {
+    // Auth failures, creation failures, and local runtimes without a volume
+    // backend all surface here.
+    console.error(`volume run failed: ${err instanceof Error ? err.message : err}`);
+  } finally {
+    // Teardown in finally, so a failure above cannot leave a box billing.
+    if (box !== null) await rt.remove(box.id, true);
+    if (volume !== null) await rt.volumes.remove(volume.id);
+    rt.close();
+  }
+}
+
+main();
+```
+
+```bash REST theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Requires BOXLITE_API_KEY. Create a key in the console: /cloud/api-keys
+BOXLITE_REST_URL="${BOXLITE_REST_URL:-https://api.boxlite.ai}"
+IMAGE="ghcr.io/boxlite-ai/boxlite-agent-base:v0.1.0"
+NAME="demo-$(date +%s)"
+
+# 1. Create a named volume. An empty body creates an unnamed one, whose name
+#    the server sets to the id.
+VOLUME=$(curl -fsS -X POST "${BOXLITE_REST_URL}/v1/volumes" \
+  -H "Authorization: Bearer ${BOXLITE_API_KEY}" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"${NAME}\"}")
+echo "${VOLUME}" | jq '{id, name, state}'
+
+# 2. Mount it by name. The wire field is managed_volume — it takes a name or an id.
+curl -fsS -X POST "${BOXLITE_REST_URL}/v1/boxes" \
+  -H "Authorization: Bearer ${BOXLITE_API_KEY}" \
+  -H 'Content-Type: application/json' \
+  -d "{\"image\":\"${IMAGE}\",\"volumes\":[{\"managed_volume\":\"${NAME}\",\"guest_path\":\"/data\"}]}" \
+  | jq '{id, name}'
+
+# 3. Clean up when you are done.
+curl -fsS -X DELETE "${BOXLITE_REST_URL}/v1/volumes/$(echo "${VOLUME}" | jq -r .id)" \
+  -H "Authorization: Bearer ${BOXLITE_API_KEY}"
+```
+
+Two things in that script are worth pausing on, and the rest of this page builds on them: the volume carries a **name you chose**, and the box mounts it by that name.
+
+## Next steps
+
+> [card] [Volumes](/cloud/volumes)
+>
+> What a volume is, the full parameter reference, and how Cloud differs from open source.

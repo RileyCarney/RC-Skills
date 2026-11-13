@@ -1,0 +1,194 @@
+# Boot latency analysis
+Source: https://docs.boxlite.ai/architecture/boot-latency
+
+Where the time goes between start() and a ready container — and why the second start is far faster than the first.
+
+The dominant cost of a cold start is not the sandbox policy but the macOS kernel validating code signatures page by page on freshly copied binaries. Once the cache is warm, a start drops to tens of milliseconds. Numbers below come from one Apple Silicon reference machine; the proportions matter, not the absolutes.
+
+## Executive Summary
+
+One sample, measured on a single Apple Silicon machine (APFS, `alpine:latest`). Read the proportions, not the absolute numbers — they will differ on your hardware.
+
+* `handle.start()` is about **\~2.1s** with the jailer on, and about **\~0.7s** with the jailer off.
+* This \~1.4s difference is **almost entirely not caused by sandbox-exec (the sandbox policy)** — policy compilation measured \~5–10ms across runs.
+* The root cause is **the macOS kernel's per-page code-signature validation of freshly copied dylibs**: an unavoidable kernel-level cost when executing a binary from a new inode.
+* **Code-signature validation accounts for roughly 70% of the total startup time (\~1450ms).**
+
+## Measure it yourself
+
+The code below directly measures the per-stage timing of one "cold start" and separately prints the kernel-code-signature-related stages. Note: `metrics()` is on the **native `Box`** and is **async**; the `Boxlite` runtime is entered with a **synchronous** `with` (and `Boxlite.default()` is synchronous), but its methods are async; `Box` is an **async context manager**.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Requires: pip install boxlite   (latest published version)
+# Platform: Linux+KVM or macOS (Apple Hypervisor.framework)
+import asyncio
+
+from boxlite import Boxlite, BoxOptions
+
+async def main() -> None:
+    # The Boxlite runtime is a [synchronous] context manager —— do not await it
+    with Boxlite.default() as runtime:
+        # runtime.create(...) is async (returns an awaitable); await it to get the native Box handle
+        box = await runtime.create(BoxOptions(image="alpine:latest"))
+        try:
+            # Box is an async context manager; start() triggers the actual microVM startup
+            await box.start()
+
+            # box.metrics() is async and returns a BoxMetrics with stage timings
+            m = await box.metrics()
+
+            print("total_create_duration_ms :", m.total_create_duration_ms)
+            print("guest_boot_duration_ms   :", m.guest_boot_duration_ms)
+            print("stage_image_prepare_ms   :", m.stage_image_prepare_ms)
+            print("stage_guest_rootfs_ms    :", m.stage_guest_rootfs_ms)
+            print("stage_box_spawn_ms       :", m.stage_box_spawn_ms)
+            print("stage_container_init_ms  :", m.stage_container_init_ms)
+        finally:
+            # Remove the box at the runtime layer (note: runtime.remove(...), not box.remove())
+            # runtime.remove(...) is also async —— must be awaited (even though Boxlite itself is a synchronous CM)
+            # force=True stops then removes; under default config the box may already be reclaimed, so tolerate not-found on removal
+            try:
+                await runtime.remove(box.id, force=True)
+            except RuntimeError:
+                pass  # box already reclaimed (box not found); ignore during cleanup
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except RuntimeError as exc:
+        # Missing virtualization or image pull failure raises a standard RuntimeError (process stays alive, can retry)
+        print(f"boot failed: {exc}")
+```
+
+On the first run (cold copy, empty kernel signature cache), `total_create_duration_ms` is large; running it **again** on the same machine drops the stage timings markedly because the kernel's per-page validation cache hits by inode. That is exactly this page's core finding.
+
+## Latency Breakdown
+
+| Stage | Time | Share | Root cause |
+| - | - | - | - |
+| Pipeline setup | 244ms | 12% | image_prepare (237ms) + rootfs (7ms) |
+| spawn → main() | **1000ms** | **48%** | Code signature: shim + libkrun + libgvproxy |
+| krun FFI | **450ms** | **22%** | Code signature: dlopen(libkrunfw 22MB) |
+| VM boot + guest | 286ms | 14% | Kernel boot + guest agent + vsock notification |
+| Container init | 86ms | 4% | gRPC to the guest for OCI initialization |
+
+## Root Cause: macOS Kernel Per-Page Code-Signature Validation
+
+### The mechanism
+
+The jailer copies the shim plus dylibs (20.7MB total) into each box's own directory, producing a new inode (a new inode even with APFS reflink / copy-on-write). On macOS, when `dyld` loads an executable image via `mmap()`, the kernel validates its ad-hoc code signature **per page**:
+
+1. `dyld` maps each library's `__TEXT` segment via `mmap(MAP_PRIVATE)`.
+2. On the first page fault of each page, the kernel:
+   * Reads the page contents (4KB on x86, 16KB on ARM)
+   * Computes the SHA-256 hash
+   * Compares it against the embedded `CodeDirectory` hash slot
+3. The result is **cached by inode** — subsequent executions of the same inode are therefore faster.
+
+For 20.7MB of pre-main dylibs, that is about 1,300 per-page validations at \~0.77ms each = \~1000ms.
+
+### Comparison by scenario
+
+The following scenarios all use the same shim binary (5.4MB) plus dylibs (libkrun 4.4MB, libgvproxy 10.9MB, 20.7MB total), varying only **copy freshness** and **whether the sandbox is applied**:
+
+| Scenario | Startup (ms) | Notes |
+| - | - | - |
+| Original binary, no sandbox | 13 | dyld shared cache is already hot |
+| **Cold copy, no sandbox** | **850** | New inode, full validation |
+| Warm copy, no sandbox | 10 | Kernel cache already populated |
+| Warm copy + sandbox | 14 | **Sandbox adds only +4ms** |
+| Cold copy, `cat` pre-warm | 830 | File I/O cache ≠ mmap cache |
+| Cold copy, `codesign --verify` | 850 | Userspace validation ≠ kernel cache |
+| Cold copy, pre-warm by exec-ing once | **34** | Only dyld's mmap can pre-warm the kernel cache |
+
+### Key conclusions
+
+1. **sandbox-exec is not the bottleneck** — policy compilation measured \~5–10ms regardless of complexity (5 rules and 200 rules showed the same latency).
+2. **`cat` pre-warm has no effect** — file I/O populates the buffer cache, but dyld's `mmap()` goes through the kernel code-signature pager, a different cache path.
+3. **`codesign --verify` has no effect** — it validates in userspace using its own file reads; the kernel maintains a separate validation cache that can only be populated via the mmap pager.
+4. **Only actually executing the binary warms the cache** — the kernel's code-signature validation cache is populated only when dyld maps executable pages via `mmap()`.
+
+## Jailer On vs Off
+
+| Metric | Jailer ON | Jailer OFF | Delta |
+| - | - | - | - |
+| handle.start() | 2067ms | 696ms | +1371ms |
+| spawn → main gap | 1000ms | 10ms | +990ms |
+| krun FFI (engine.create) | 450ms | 23ms | +427ms |
+| sandbox-exec overhead | \~5–10ms | N/A | \~5–10ms |
+
+The measured 1371ms delta is dominated by two components, both code-signature validation: the spawn→main gap (990ms) and the krun FFI call (427ms). The sandbox policy itself is negligible by comparison. (The two components were timed in separate runs, so they do not sum exactly to the end-to-end delta.)
+
+> The jailer / sandbox is controlled by the security options: `BoxOptions(advanced=AdvancedBoxOptions(security=SecurityOptions.maximum()))`. Import it with `from boxlite import AdvancedBoxOptions`; the `SecurityOptions` presets are `development() / standard() / maximum()` (there is no `.minimum()`).
+
+## Pipeline Stage Metrics (from `box.metrics()`)
+
+The field names below are the **readable attributes on the Python `BoxMetrics`** (all with the `_ms` suffix; the `stage_*` fields are mostly `Optional` and are `None` when unavailable):
+
+| Field | Jailer ON | Jailer OFF |
+| - | - | - |
+| `total_create_duration_ms` | 2039ms | 695ms |
+| `stage_filesystem_setup_ms` | 0ms | -- |
+| `stage_image_prepare_ms` | 237ms | -- |
+| `stage_guest_rootfs_ms` | 7ms | -- |
+| `stage_box_spawn_ms` | 12ms | 11ms |
+| `stage_container_init_ms` | 86ms | 63ms |
+| `guest_boot_duration_ms` | \~1697ms | \~621ms |
+
+> `BoxMetrics` also includes runtime fields such as `cpu_percent`, `memory_bytes`, `commands_executed_total`, `exec_errors_total`, and `network_*` (not startup-related). For runtime-level metrics use `runtime.metrics()`, with the fields `num_running_boxes / boxes_created_total / boxes_failed_total / total_commands_executed / total_exec_errors`.
+
+## What you can do about it
+
+The kernel's code-signature cache is keyed by inode and is populated only when a binary is actually executed. For callers that means one thing:
+
+**Start one box before your batch begins.** The first box pays the validation cost; every box after it on the same machine reuses the warm cache.
+
+Approaches that do **not** help, so they are not worth trying:
+
+| Attempt | Why it does not help |
+| - | - |
+| Pre-reading the binary with `cat` | Fills the buffer cache, but dyld's `mmap()` goes through a different kernel path |
+| Running `codesign --verify` | Userspace validation; it does not populate the kernel's cache |
+| Simplifying the sandbox policy | Policy compilation measured \~5–10ms regardless of complexity |
+| Narrowing the FD-cleanup range | 4092 `close()` calls take only 0.9ms in total |
+
+> Methodology: host and shim wall-clock timestamps (`chrono::Utc::now()`) were correlated through the `timing_profile.rs` integration test (jailer ON/OFF), plus standalone benchmarks isolating one variable at a time — sandbox-exec policy compilation, FD cleanup, cold vs warm binary startup, and the pre-warm strategies above.
+
+## Reproduction
+
+The repository contains a Rust timing baseline test (`src/boxlite/tests/timing_profile.rs`, targeting `alpine:latest`) that re-runs the data on this page:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Run from the root of the BoxLite source repository
+# 1) Rebuild the instrumented shim
+./scripts/build/build-shim.sh
+
+# 2) Run the timing profile test (--nocapture is required to see per-stage eprintln output)
+cargo test -p boxlite --test timing_profile -- --nocapture
+
+# 3) Run only the jailer case to avoid parallel contention skewing the timing
+cargo test -p boxlite --test timing_profile boot_timing_profile \
+  -- --exact --nocapture
+```
+
+> The repository `CLAUDE.md` recommends preferring `make` targets (which encapsulate the correct build/cross-compilation flags). The `cargo test` commands above are run directly only for a local one-off timing experiment.
+
+## Troubleshooting
+
+| Symptom / error | Cause | Resolution |
+| - | - | - |
+| `RuntimeError`, `start()` fails immediately | The current environment has no hardware virtualization (no KVM; non-macOS without a hypervisor) | Linux needs KVM with the user in the `kvm` group; WSL2 needs KVM enabled; macOS uses Hypervisor.framework (no `/dev/kvm` required, supports Apple Silicon). This is an environment constraint — the exception can be caught and the process does not exit. |
+| The first box is slow, later boxes are markedly faster | The kernel code-signature validation cache is populated by inode: cold on the first start, hot on reuse | Expected behavior. When starting many boxes in a batch, warm the first one first, or adopt the "shared bin/ directory" approach above. |
+| `await box.metrics()` raises `'coroutine' was never awaited` or similar | `Box.metrics()` is **async** and must be awaited | Use `await box.metrics()`; the `Boxlite` runtime is a **synchronous** CM and `Box` is an **async** CM — do not confuse the two await conventions. |
+| `box.info()` returns a coroutine / Future instead of `BoxInfo` | `info()` is **async** in every SDK | `await box.info()`; it returns `BoxInfo`, and the status is in `box.info().state.status`. |
+| `AttributeError: ... memory_usage_bytes` / `cpu_time_ms` / `active_boxes` | An old/wrong field name was used | Use the real fields: `BoxMetrics.memory_bytes`, `cpu_percent`, `total_create_duration_ms`, `stage_*_ms`; for the runtime use `RuntimeMetrics.num_running_boxes`. |
+| Some `stage_*_ms` is `None` | That stage was not timed or that path did not run (for example, some stages are not populated with the jailer off) | The `stage_*` fields are `Optional`; check for None before reading, and do not perform arithmetic directly. |
+| `ModuleNotFoundError` / import failure (Node: `Cannot find module 'boxlite'`) | Wrong package name | The Python package is `boxlite`; the Node package is `@boxlite-ai/boxlite` (not `boxlite`, not `@boxlite/sdk`). |
+| Image pull timeout / network hiccup → `RuntimeError` | A failed image pull raises a standard `RuntimeError` (not `BoxliteError`) | Catch with `try/except RuntimeError` and retry; the first image pull also raises `stage_image_prepare_ms` markedly, which is unrelated to boot latency analysis. |
+
+## Related Reading
+
+* [Core components](/architecture/core-components)
+* [Security and isolation](/architecture/security-and-isolation)
+* [Networking and storage](/architecture/storage)
+* [Architecture overview](/architecture/index)

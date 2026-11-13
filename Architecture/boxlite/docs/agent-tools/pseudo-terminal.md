@@ -1,0 +1,191 @@
+# Interactive shell (PTY)
+Source: https://docs.boxlite.ai/agent-tools/pseudo-terminal
+
+InteractiveBox opens a real interactive terminal inside a sandbox, like docker exec -it — every keystroke reaches the shell or REPL in the box, and its output comes back in real time.
+
+Under the hood it allocates a PTY for the command and forwards your local stdin, stdout, and stderr bidirectionally.
+
+> `InteractiveBox` — the wrapper that handles raw mode and bidirectional forwarding for you — ships in the Python and Node SDKs. PTY itself works from every SDK: call `exec(..., tty=True)` to get an `Execution` and forward stdin/stdout yourself (see "Lower-level PTY" at the end).
+
+* **You must run this in a real terminal.** Interactive forwarding is enabled only when stdin is a TTY; in CI, pipes, Jupyter, or an IDE's "Run" button, stdin is usually not a TTY, so keyboard forwarding is disabled automatically (see the `tty` parameter under [Parameters and Returns](#parameters-and-returns)).
+
+***
+
+## Quick Example (happy path)
+
+### Python
+
+Save the whole block below as `interactive.py`, run `python interactive.py` in a **terminal**, and you drop straight into the box's shell. Type `exit` or press Ctrl-D to quit.
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# interactive.py
+# How to run: execute in a real terminal  python interactive.py
+import asyncio
+import os
+import sys
+
+from boxlite import InteractiveBox
+
+async def main() -> None:
+    print("Starting interactive Alpine container...")
+    print("Type 'exit' or press Ctrl-D to quit\n")
+
+    # Pass the local TERM into the box for correct color/cursor behavior
+    term_mode = os.environ.get("TERM", "xterm-256color")
+
+    try:
+        # InteractiveBox is an async context manager:
+        # entering async with automatically creates+starts the box and launches a PTY-backed shell.
+        async with InteractiveBox(
+            image="alpine:latest",
+            shell="/bin/sh",            # optional, defaults to /bin/sh
+            env=[("TERM", term_mode)],  # env is list[tuple[str, str]]
+        ) as itbox:
+            # You are now inside the interactive shell.
+            # I/O is forwarded bidirectionally by a background task; wait() blocks until the shell exits.
+            await itbox.wait()
+    except KeyboardInterrupt:
+        print("\nInterrupted by Ctrl-C")
+    except Exception as exc:  # startup failure / no virtualization / image pull failure, etc.
+        print(f"\nError: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// interactive.mjs
+// How to run: execute in a real terminal  node interactive.mjs
+import { InteractiveBox } from "@boxlite-ai/boxlite";
+
+async function main() {
+  console.log("Starting interactive shell... (type 'exit' to quit)\n");
+
+  const box = new InteractiveBox({
+    image: "alpine:latest",
+    shell: "/bin/sh", // optional, defaults to /bin/sh
+    tty: true, // force I/O forwarding on; if omitted, auto-detected from whether stdin is a TTY
+  });
+
+  try {
+    await box.start(); // launch the PTY-backed shell and begin forwarding
+    await box.wait(); // block until the shell exits
+    console.log("\nShell exited.");
+  } catch (err) {
+    console.error("Error:", err);
+    process.exitCode = 1;
+  } finally {
+    await box.stop(); // restore terminal mode and destroy the box
+  }
+}
+
+main();
+```
+
+For the Node version, save it as `interactive.mjs` (`@boxlite-ai/boxlite` is ESM-only) and run `node interactive.mjs` in a terminal.
+
+***
+
+## Parameters and Returns
+
+### `InteractiveBox(...)` constructor parameters (Python)
+
+Source: `InteractiveBox.__init__` in `sdks/python/boxlite/interactivebox.py`. `InteractiveBox` extends `SimpleBox`; keyword arguments not listed (such as `working_dir`, `volumes`, `ports`) pass through `**kwargs` to `SimpleBox`.
+
+| Parameter | Type | Required | Default | Description |
+| - | - | - | - | - |
+| `image` | `str` | **Yes** (positional) | — | Container image, such as `alpine:latest`. |
+| `shell` | `str` | No | `/bin/sh` | The shell/REPL to launch, for example `/bin/bash`, `python`. |
+| `tty` | `bool \| None` | No | `None` | I/O forwarding mode: `None` = auto (forward only if `sys.stdin.isatty()`); `True` = force forwarding; `False` = no forwarding (programmatic control only). |
+| `memory_mib` | `int \| None` | No | `None` (system default) | Memory limit in MiB. When `None`, the runtime applies its system default — see [Compute resources](/manage-sandbox/compute-resources#defaults). |
+| `cpus` | `int \| None` | No | `None` (system default) | Number of CPU cores. When `None`, the runtime applies its system default — see [Compute resources](/manage-sandbox/compute-resources#defaults). |
+| `runtime` | `Boxlite \| None` | No | `None` (global default runtime) | Reuse an existing runtime instance. |
+| `name` | `str \| None` | No | `None` | Box name (must be unique). |
+| `auto_remove` | `bool` | No | `True` | Remove the box automatically after it stops. |
+| `env` | `list[tuple[str, str]]` | No | `[]` | Environment variables. **`InteractiveBox` passes this straight to the lower-level `Box.exec`, so it must be `list[tuple]`** (not a dict). |
+
+> Leaving `memory_mib` / `cpus` unset means "let the runtime decide". [Compute resources → Defaults](/manage-sandbox/compute-resources#defaults) is the single source of truth for those numbers.
+
+> Naming difference: in `SimpleBox.exec(env=...)` the env is a **dict**; but `InteractiveBox`'s constructor `env` is fed directly to native `Box.exec`, so it must be a **list\[tuple]** (see `_start_interactive_shell` in `interactivebox.py`).
+
+### `InteractiveBoxOptions` (Node)
+
+Source: `sdks/node/lib/interactivebox.ts`. Extends `SimpleBoxOptions`; the constructor **requires an options object**.
+
+| Field | Type | Required | Default | Description |
+| - | - | - | - | - |
+| `image` | `string` | **Yes** | — | Container image. |
+| `shell` | `string` | No | `/bin/sh` | The shell/REPL to launch. |
+| `tty` | `boolean` | No | `undefined` (auto) | `undefined` = auto by `process.stdin.isTTY`; `true` = force forwarding; `false` = no forwarding. |
+| `memoryMib` | `number` | No | system default | Memory limit in MiB. Unset = the runtime's system default ([Compute resources](/manage-sandbox/compute-resources#defaults)). |
+| `cpus` | `number` | No | system default | Number of CPU cores. Unset = the runtime's system default ([Compute resources](/manage-sandbox/compute-resources#defaults)). |
+| `name` | `string` | No | — | Box name. |
+| `env` | `Record<string, string>` | No | — | Environment variables (Node uses an object here; internally converted to `[k, v]` arrays). |
+
+### Methods and return values
+
+| Action | Python | Node | Description |
+| - | - | - | - |
+| Enter the session | `async with InteractiveBox(...) as box:` (auto start) | `await box.start()` | Launch the PTY-backed shell; if in a TTY, switch the local terminal to raw mode and begin forwarding. |
+| Wait for exit | `await box.wait()` | `await box.wait()` | Block until the shell inside the box exits. Returns `None`. |
+| Exit / clean up | Leaving `async with` (auto `__aexit__`) | `await box.stop()` (or `await using` automatically) | Restore the local terminal mode, stop forwarding, and destroy the box. |
+| Box id | `box.id` (after start, synchronous) | `box.id` (after start, synchronous getter) | Accessing it before start raises. |
+
+> Context-manager type: `InteractiveBox` is an **async** context manager (`async with`). The runtime handle `Boxlite` is a synchronous `with` — don't mix them up.
+
+***
+
+## Troubleshooting
+
+### No interaction, keyboard does nothing (running in an IDE/CI/pipe)
+
+Symptom: the script runs, but keystrokes get no response, or it blocks at `wait()`.
+
+Cause: interactive forwarding is enabled only when **stdin is a TTY**. `tty=None` (Python) / `undefined` (Node) auto-detects; under an IDE "Run" button, CI, `python x.py < file`, or `| pipe`, stdin is not a TTY, so forwarding is off.
+
+Fix: run it in a real terminal; if you must force forwarding, pass `tty=True` (Python) / `tty: true` (Node) explicitly. Note: when you force `tty=True` in a non-TTY environment, Python calls `termios.tcgetattr` / `tty.setraw` on stdin in `__aenter__` and raises `termios.error`. The exact errno varies by platform / stdin type (commonly `(25, 'Inappropriate ioctl for device')` under a pipe, and `(19, 'Operation not supported by device')` on macOS without a TTY). Whatever the errno, it is the same `termios.error` class; catch it with `except termios.error` (or a broad `except Exception`).
+
+### env passed with the wrong type
+
+`InteractiveBox`'s `env` is passed to the lower-level `Box.exec`, so it must be `list[tuple[str, str]]`:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Correct
+env=[("TERM", "xterm-256color"), ("LANG", "C.UTF-8")]
+# Wrong: passing a dict raises
+#   TypeError: argument 'env': 'dict' object cannot be cast as 'Sequence'
+# env={"TERM": "xterm-256color"}
+```
+
+(Node is the opposite: `InteractiveBoxOptions.env` uses a `Record<string, string>` object.)
+
+### Startup failure / no virtualization
+
+BoxLite requires hardware virtualization: Linux needs KVM (`/dev/kvm` available, user in the `kvm` group); macOS uses Apple's Hypervisor.framework (no KVM needed); WSL2 needs KVM enabled. Without virtualization, the box fails to start — the exception can be caught with `try/except` (Python) / `try/catch` (Node), and the process does not crash. macOS Intel is not supported.
+
+### Image pull failure raises `RuntimeError`, not `BoxliteError`
+
+When an image pull fails due to a network hiccup, Python raises the built-in `RuntimeError` (Node a bare `Error`), **not** a `BoxliteError` subclass. Catch it with a broad `except Exception` / `catch (err)` and retry; don't catch only `BoxliteError`.
+
+### Shell does not exist
+
+If `shell` points to a path that the image does not have (such as `/bin/bash` on plain alpine), it raises a `RuntimeError` when entering `async with` (the `__aenter__` that launches the PTY shell), with a message such as:
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+internal error: spawn_failed: internal error: build failed: failed to create container: exec process failed with error ...
+```
+
+The error is raised during startup — wrap the `async with` in `try/except RuntimeError` to catch it. Make sure the target image has that shell (alpine has `/bin/sh` by default, but not `bash`).
+
+***
+
+## Lower-level PTY (C / Go / Rust, no high-level wrapper)
+
+From C / Go / Rust, drive the PTY through `exec` directly and forward I/O yourself:
+
+* **Rust**: `BoxCommand::new(shell).tty(true)`, then `box.exec(cmd)` to get an `Execution`, and forward from `execution.stdin()/stdout()/stderr()` (all `&mut`); `execution.resize_tty(rows, cols)` resizes the window. The execution method is `exec` (there is no `litebox.run`).
+* **C**: `BoxliteCommand.tty = 1`, `boxlite_box_exec(handle, &cmd, &execution, &error)` to get the execution; output via the `boxlite_execution_on_stdout` / `on_stderr` callbacks, stdin via `boxlite_execution_stdin_write`, window size via `boxlite_execution_tty_resize`. This is a post-and-drain model — **you must call `boxlite_runtime_drain` in a loop to drive the callbacks**.
+* **Go**: `box.StartExecution(...)` with `ExecutionOptions{TTY: true, OnStdout: ..., OnStderr: ...}`, writing stdin yourself.
+
+On these paths PTY allocation is real; they lack the convenience layer of automatic raw-mode plus bidirectional forwarding.

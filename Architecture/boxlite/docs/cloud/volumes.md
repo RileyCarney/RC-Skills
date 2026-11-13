@@ -1,0 +1,39 @@
+# Volumes
+Source: https://docs.boxlite.ai/cloud/volumes
+
+Storage that outlives the box that wrote it — create a managed volume, mount it by a name you choose, and keep the data after the box is gone.
+
+A box loses everything on its disk when it is destroyed. A volume does not. Mount one into a box and the data outlives it.
+
+A volume has a server-assigned `id` and a `name`, and **either one mounts it** — so a worker can mount `("training-data", "/data")` without ever looking up an id.
+
+> [!NOTE]
+>
+> Managed volumes need a **REST runtime**. A local runtime has no volume backend to resolve a reference against.
+
+## In this section
+
+> [card] [Mount a volume](/cloud/mount-a-volume)
+>
+> Create a volume, mount it into a box, write through it and read it back. **Start here.**
+
+> [card] [Data across boxes](/cloud/data-across-boxes)
+>
+> Write from one box, delete that box, read the same bytes from a new one.
+
+> [card] [Volume CRUD](/cloud/volume-operations)
+>
+> Create, list, inspect, and delete — all four operations in one script, plus why deletion is asynchronous.
+
+> [card] [Reference](/cloud/volume-reference)
+>
+> Name-versus-id addressing, every parameter and return shape, read-only mounts, and what differs from open source.
+
+## When you need a volume
+
+* **An agent whose state must outlive its box.** A Cloud box can stop when idle and be deleted after stopping. Anything written to the box's own disk goes with it; anything written through a volume mount is there for the next box.
+* **A large dataset or model you do not want to re-download.** Fetch it once into a volume, then mount that volume into every box that needs it.
+* **Handing results from one box to the next.** One box produces artifacts under the mount path, a later box mounts the same volume and picks them up.
+* **A fleet that addresses storage by name.** Workers mount a name, and none of them needs an id.
+
+A volume also costs less than keeping a stopped box around: volumes are not metered at all, so mounting one adds nothing to a box's hourly price, while a stopped box is billed for its disk until it is deleted. See [What a box costs](/cloud/box-costs).

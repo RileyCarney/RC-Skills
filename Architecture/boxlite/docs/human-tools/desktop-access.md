@@ -1,0 +1,201 @@
+# Share a desktop with a person in a browser
+Source: https://docs.boxlite.ai/human-tools/desktop-access
+
+Share a Linux desktop running inside a sandbox with a human, through a browser, with no VNC client to install.
+
+`ComputerBox` runs an XFCE desktop with a built-in noVNC server. Forward its GUI ports and anyone with the address can watch or take over — useful for inspecting a misbehaving app, reviewing what an agent is doing, or handing someone a disposable desktop.
+
+## Quick Example (Happy Path)
+
+Forward the desktop HTTP/HTTPS ports of `ComputerBox` to fixed host ports, keep it running after startup, and let a human open it in a browser.
+
+> Remote access (for non-local users): replace `localhost` in the shared addresses with a reachable IP/hostname of the machine running this script, and make sure that machine's firewall allows the chosen ports. The BoxLite SDK itself only handles "box port -> host port" forwarding; "host -> public network" exposure depends on your network environment.
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# desktop_share.py — start an isolated desktop accessible from a human's browser
+# Run: python desktop_share.py
+import asyncio
+
+import boxlite  # pip install boxlite (latest published version)
+
+async def main() -> None:
+    # gui_http_port / gui_https_port are ports on the "host".
+    # Fix them so others get a stable address.
+    try:
+        async with boxlite.ComputerBox(
+            cpu=2,
+            memory=2048,
+            gui_http_port=3000,   # host HTTP port (noVNC web desktop)
+            gui_https_port=3001,  # host HTTPS port (self-signed cert)
+        ) as desktop:
+            # Wait until the desktop environment is fully ready (default timeout 60s)
+            await desktop.wait_until_ready(timeout=60)
+
+            print("Desktop ready. Send the addresses below to whoever needs access:")
+            print("  HTTP : http://localhost:3000")
+            print("  HTTPS: https://localhost:3001  (browser warns about the self-signed cert; click 'Advanced' -> 'Proceed')")
+            print("Press Ctrl+C to stop and destroy this ephemeral desktop.")
+
+            # Keep the box alive until you stop it manually.
+            while True:
+                await asyncio.sleep(3600)
+    except KeyboardInterrupt:
+        print("\nStopped; desktop box destroyed.")
+    except RuntimeError as exc:
+        # Image pull failure / no virtualization, etc. all raise standard RuntimeError
+        print(f"Failed to start: {exc}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// desktop_share.ts — Run: node desktop_share.js (compile first, or use a ts runner)
+import { ComputerBox } from "@boxlite-ai/boxlite";
+
+async function main(): Promise<void> {
+  try {
+    await using desktop = new ComputerBox({
+      cpus: 2,
+      memoryMib: 2048,
+      guiHttpPort: 3000,   // host HTTP port
+      guiHttpsPort: 3001,  // host HTTPS port
+    });
+    await desktop.waitUntilReady(60);
+
+    console.log("Desktop ready: http://localhost:3000 (or https://localhost:3001)");
+    console.log("Press Ctrl+C to stop.");
+    await new Promise(() => {}); // keep alive
+  } catch (err) {
+    // Missing command / pull failure / no virtualization raise a standard Error
+    console.error("Failed to start:", err);
+  }
+}
+
+main();
+```
+
+## Parameters and Returns
+
+### `ComputerBox(...)` desktop-access parameters (Python)
+
+| Parameter | Type | Required | Default | Description |
+| - | - | - | - | - |
+| `gui_http_port` | int | Optional | `3000` | Port on the **host** mapping the noVNC web desktop (HTTP) |
+| `gui_https_port` | int | Optional | `3001` | Port on the **host** mapping the desktop (HTTPS, self-signed cert) |
+| `cpu` | int | Optional | `2` | CPU cores for the desktop environment (the desktop is resource-hungry; >=2 recommended) |
+| `memory` | int | Optional | `2048` | Memory MiB (>=2048 recommended) |
+| `runtime` | Boxlite \| None | Optional | `None` | Reuse an existing runtime; defaults to the global runtime |
+| `**kwargs` | — | Optional | — | Forwarded to `SimpleBox` options, e.g. `volumes=[(host, guest, read_only_bool)]` |
+
+> The Node field names are camelCase: `guiHttpPort` / `guiHttpsPort` / `cpus` / `memoryMib`.
+
+### Methods related to desktop access
+
+| Method | Returns | Description |
+| - | - | - |
+| `await wait_until_ready(timeout=60)` | None | Blocks until the desktop has rendered and is ready, before you send the address to a human |
+| `await screenshot()` | dict | Server-side screenshot: `{"data": <base64>, "width", "height", "format"}`, useful for sending a preview image in a "no browser" scenario |
+| `await get_screen_size()` | (int, int) | Current desktop resolution (default 1024x768) |
+
+### Built-in defaults (from `sdks/node/lib/constants.ts` / `sdks/python/boxlite/constants.py`)
+
+| Constant | Value |
+| - | - |
+| Desktop image | `lscr.io/linuxserver/webtop:ubuntu-xfce` |
+| In-box GUI HTTP / HTTPS ports | `3000` / `3001` |
+| Default resolution | `1024 x 768` (`DISPLAY=:1`) |
+| Ready timeout | `60` seconds |
+
+> Note: `3000`/`3001` are the GUI ports fixed **inside the box**; the constructor arguments `gui_http_port`/`gui_https_port` change the mapped port on the **host** side. The two can differ (for example `gui_http_port=8080` serves the desktop on host port 8080).
+
+## Connecting a traditional VNC client
+
+| Need | Is there a dedicated API today | How to do it |
+| - | - | - |
+| Standalone `VncBox` / `DesktopBox` | **No** | Use `ComputerBox` (built-in noVNC web desktop) |
+| "Start a VNC server and return a `vnc://` connection string" | **No** | Open the forwarded noVNC HTTP/HTTPS address in a browser |
+| Connect with a traditional VNC client (RealVNC/TigerVNC) protocol | Run your own VNC service in the box | See the "roll your own" note below |
+| Expose some service port of any box to a human | Yes (general capability) | Forward any port with `BoxOptions(ports=...)` / `ports=` |
+
+If you truly need the standard VNC protocol (rather than the noVNC web page), the only option today is to install and run a VNC server inside the sandbox yourself (for example install `x11vnc`/`tigervnc` in a custom image), then expose the VNC port to the host via general port forwarding. This path has no SDK wrapper; it falls under "run a service inside the box yourself plus port forwarding."
+
+> Current limitation: the standard VNC protocol has no SDK wrapper and requires a self-built service; BoxLite provides no official support for that path, so prefer the built-in noVNC web desktop.
+
+## Troubleshooting
+
+**Opening the HTTPS address in a browser warns "not secure / certificate error"**
+The webtop desktop uses a self-signed certificate; this is expected. Click "Advanced" -> "Proceed", or switch to the HTTP port (`http://localhost:3000`).
+
+The third volume element is a **bool** `read_only` (`True` = read-only / `False` = read-write), **not** the string `"ro"`/`"rw"`. Correct form:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import boxlite
+
+async def share_with_mount() -> None:
+    # The third element must be a bool; True for read-only, False for read-write (or omit and use a 2-tuple)
+    async with boxlite.ComputerBox(
+        gui_http_port=3000,
+        volumes=[("/host/data", "/mnt/data", True)],  # bool; passing "ro" raises TypeError
+    ) as desktop:
+        await desktop.wait_until_ready()
+```
+
+> The `"ro"`/`"rw"` string syntax belongs only to the **CLI** `-v` argument, which differs from the SDK's bool; do not mix them.
+
+**Port in use / cannot connect**
+`gui_http_port`/`gui_https_port` are host ports; if taken, the mapping fails. Switch to a free port; for remote access you also need to open the host firewall and replace `localhost` in the address with a reachable IP/hostname.
+
+**`RuntimeError` (Python) / bare `Error` (Node): box failed to start**
+Common causes: (1) no hardware virtualization (Linux missing `/dev/kvm` or user not in the `kvm` group; macOS Intel not supported); (2) unstable network during image pull. An image pull failure raises a standard `RuntimeError`/bare `Error`, **not** a `BoxliteError` subclass, so catch with a broad type and retry if appropriate.
+
+**`wait_until_ready` times out**
+The webtop desktop is slow to start on first run (image decompression, X server initialization). Increase `timeout` accordingly (e.g. `wait_until_ready(timeout=120)`), and make sure you allocate >=2 CPU / >=2048 MiB memory.
+
+**Need the traditional VNC protocol but cannot find an API**
+Use the built-in noVNC web desktop (see above), or run your own VNC service plus port forwarding.
+
+## A tour: hand a running box to a person
+
+Moved here from the section index, which is now a summary and an index.
+
+The code below: (1) starts a sandbox that ships with a desktop (`ComputerBox`, image `lscr.io/linuxserver/webtop:ubuntu-xfce`); (2) waits until the desktop is ready; (3) **prints a local URL you can open directly in a browser**, then keeps running until you press Enter. During that window you can operate the sandbox like a remote desktop in your browser.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# pip install boxlite
+import asyncio
+import boxlite
+
+async def main():
+    # ComputerBox ships with an XFCE desktop plus a noVNC web client.
+    # gui_http_port / gui_https_port map "host local ports" -> in-sandbox GUI ports.
+    try:
+        async with boxlite.ComputerBox(
+            cpu=2,
+            memory=2048,
+            gui_http_port=3000,   # host http port; open it in a browser
+            gui_https_port=3001,  # host https port (self-signed cert; browser warns)
+        ) as desktop:
+            # Wait until the desktop environment is fully up (default max 60s)
+            await desktop.wait_until_ready(timeout=60)
+
+            print("Desktop ready. Open either URL below in a browser to take over:")
+            print("  HTTP :  http://localhost:3000")
+            print("  HTTPS:  https://localhost:3001  (self-signed cert; click 'Advanced' -> 'Proceed')")
+
+            # Keep the sandbox alive to give the human time to operate.
+            # On async with exit the sandbox is destroyed and all changes are lost (ephemeral).
+            input("When done, come back here and press Enter to close the sandbox...")
+    except RuntimeError as exc:
+        # Image pull failure / no hardware virtualization, etc. all raise standard RuntimeError
+        print(f"Sandbox failed to start: {exc}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+After it runs, open `http://localhost:3000` in a browser to view and operate the sandbox desktop. When you close the script (press Enter), the sandbox and every change inside it are destroyed.
+
+> Node users: `ComputerBox` is also available in the Node SDK (`import { ComputerBox } from "@boxlite-ai/boxlite"`), with camelCase method names (`waitUntilReady` / `screenshot`, etc.). The GUI port exposure logic is identical.
+
+***

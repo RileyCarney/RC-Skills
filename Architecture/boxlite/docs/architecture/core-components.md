@@ -1,0 +1,151 @@
+# Core components
+Source: https://docs.boxlite.ai/architecture/core-components
+
+What each module is responsible for, where its state lives on disk, and which metrics it exposes.
+
+A startup failure, a performance problem, or a security setting narrows to a layer first and to a module second. For the end-to-end path of one `exec` call, see [Architecture overview](/architecture/index).
+
+## Component Inventory (real module layout)
+
+The table below is the authoritative reference for writing documentation and reading the source. All paths are relative to the repository root, with the uniform prefix `src/<crate>/`.
+
+| Component | Responsibility (functional view) | Source location |
+| - | - | - |
+| **BoxliteRuntime** | The entry point for creating/getting/listing/deleting Boxes; holds the image cache and runtime-level metrics | `src/boxlite/src/runtime/` |
+| **LiteBox** | A single Box handle: execute commands, collect metrics, snapshot/clone/export; does not actually start the VM until first use (lazy initialization) | `src/boxlite/src/litebox/` |
+| **ShimController** (the virtual machine monitor, VMM) | Isolates VM startup into a subprocess, avoiding libkrun's "process takeover" blocking the host | `src/boxlite/src/vmm/` |
+| **Jailer** | Defense in depth: adds an OS-level sandbox for the shim process on top of hardware virtualization | `src/boxlite/src/jailer/` |
+| **Portal** | The gRPC communication facade between host and guest | `src/boxlite/src/portal/` |
+| **Guest Agent** | Runs inside the Box: receives host commands, initializes the environment, manages OCI containers, executes processes | `src/guest/src/` (crate `boxlite-guest`) |
+| **Shim process** | The subprocess sandboxed by the jailer, with the VMM embedded | `src/shim/src/` (crate `boxlite-shim`) |
+| **Image management** | OCI image pull, blob caching, layer extraction and deduplication | `src/boxlite/src/images/` |
+| **Rootfs** | Assembles the Box root filesystem from OCI image layers (extract + overlay) | `src/boxlite/src/rootfs/` |
+| **Volumes** | Volume management (virtiofs host-directory mounts, QCOW2 disk images) | `src/boxlite/src/volumes/` |
+| **Net** | Pluggable network backends (gvproxy by default, libslirp as an alternative) | `src/boxlite/src/net/` |
+| **Metrics** | Runtime-level and per-Box metrics (lock-free atomic counters) | `src/boxlite/src/metrics/` |
+| **Shared library** | Types, errors, constants, and the transport protocol shared by host/shim/guest | `src/shared/` (crate `boxlite-shared`) |
+
+> All source paths on this page are relative to the repository root and follow `src/<crate>/`. The workspace also contains the `cli`, `shared`, `shim`, and `guest` crates.
+
+***
+
+## Component Details
+
+### BoxliteRuntime (the runtime entry point)
+
+The entry point for creating and managing Boxes. In the SDK it is the object you enter via a `with` statement.
+
+* **Python**: `Boxlite` — entered with a **synchronous** `with`, and `Boxlite.default()` is synchronous, but its instance methods are **async and must be awaited**. Source `src/boxlite/src/runtime/core.rs`.
+* **Node**: `JsBoxlite` (there is no bare `Boxlite`).
+* **Responsibilities**: Box lifecycle (create/get/get_or_create/list_info/remove/shutdown/import_box), image handle (`images`), runtime metrics (`metrics()`).
+* **Key fact**: listing uses `list_info()` (**not** `list()`); deletion uses `remove(id_or_name, force=False)` on the runtime (**not** `box.remove()`).
+
+### LiteBox (a single Box handle)
+
+Every box object is backed by a `LiteBox`. Source `src/boxlite/src/litebox/`.
+
+* **Lazy initialization**: `runtime.create()` returns a handle immediately and **does not** trigger VM startup; the genuinely expensive operations (image pull → rootfs preparation → VM spawn → guest ready) are deferred to the first API call. So in the Python wrapper layer, entering `async with SimpleBox(...)` is what actually creates and starts the Box.
+* **Responsibilities**: command execution (`exec`), metrics, snapshot/clone/export, graceful shutdown.
+* **Key fact**: `box.info()` is **async** (`await` it); the returned `BoxInfo` uses `.state` (of type `BoxStateInfo`), and the status string is in `BoxStateInfo.status`.
+
+### ShimController and the VMM
+
+`ShimController` (`src/boxlite/src/vmm/controller/shim.rs`) places VM startup in a separate subprocess. The reason: libkrun's `krun_start_enter` uses a **process-takeover** model — once called, it never returns. If it were called directly in the host process, the application process would be permanently taken over. By wrapping it in a subprocess, the host process keeps running, and the jailer is given a sandboxable target.
+
+The VMM abstraction (`src/boxlite/src/vmm/`) is pluggable: the current production implementation is **libkrun** (`src/boxlite/src/vmm/krun/`), which handles hardware virtualization, virtio-fs file sharing, virtio-blk disks, and vsock communication.
+
+> The VMM layer sits behind a trait, so backends are pluggable. Two are declared today: `Libkrun` (production default) and `Firecracker`. Adding one is a runtime-internal change — see `src/boxlite/src/vmm/`.
+
+The configuration flow that a `Vmm` implementation drives when starting a VM is: create the libkrun context → set Box resources (CPUs, memory) → configure the network (TSI or gvproxy) → mount virtiofs shares → attach disk images → configure vsock ports → set the guest entrypoint → return the VM instance.
+
+### Jailer (security isolation)
+
+Modeled after Firecracker's jailer, it adds a layer of OS-level isolation **on top of** hardware virtualization, sandboxing the shim process. Source `src/boxlite/src/jailer/`; the threat model is in `src/boxlite/src/jailer/THREAT_MODEL.md`.
+
+| Platform | Isolation mechanisms |
+| - | - |
+| **Linux** | Namespace isolation (mount/PID/network), chroot/pivot_root, seccomp BPF syscall filtering, privilege drop to an unprivileged user, cgroups v2 resource limits |
+| **macOS** | sandbox-exec (Seatbelt) kernel-level sandbox, rlimits resource constraints |
+
+For untrusted code, set security explicitly: an explicitly constructed `SecurityOptions()` has every switch off, so pass `SecurityOptions.standard()` or `.maximum()` through `advanced` (see the Quick Example below).
+
+### Portal (host-guest communication)
+
+The gRPC-based communication layer, bridged over libkrun's vsock. Source `src/boxlite/src/portal/`.
+
+### Guest Agent
+
+Runs inside the Box and receives host commands over gRPC. Source `src/guest/src/` (crate `boxlite-guest`).
+
+| Service | Responsibility |
+| - | - |
+| **Guest** | Environment initialization (mounts, rootfs, network) |
+| **Container** | OCI container lifecycle (based on libcontainer) |
+| **Execution** | Command execution with streaming I/O |
+
+### Image / Rootfs / Volumes / Net
+
+* **Image** (`src/boxlite/src/images/`): OCI image pull, blob cache by digest, layer extraction and cross-image deduplication, copy-on-write.
+* **Rootfs** (`src/boxlite/src/rootfs/`): extracts from image layers and assembles the Box root filesystem via overlay.
+* **Volumes** (`src/boxlite/src/volumes/`): virtiofs host-directory mounts, QCOW2 copy-on-write disks.
+* **Net** (`src/boxlite/src/net/`): defaults to **gvproxy** (a user-mode network stack with full outbound access plus port forwarding plus DHCP/DNS), with **libslirp** as an alternative.
+
+***
+
+## The CLI as a Worked Example of This Layout
+
+> The `boxlite` CLI is a thin client over the same `BoxliteRuntime` the SDKs use — anything the CLI can do, your code can do, with identical semantics.
+
+***
+
+## Metrics System (real field names)
+
+Metrics come at two levels, both lock-free atomic counters. **Field names are not identical across languages, so use the real names from the tables below when writing code.**
+
+`RuntimeMetrics` (runtime level, `runtime.metrics()`):
+
+| Field (Python/C/Go) | Meaning |
+| - | - |
+| `num_running_boxes` | Number of currently running boxes (**not** `active_boxes`) |
+| `boxes_created_total` | Cumulative number of boxes created |
+| `boxes_failed_total` | Cumulative number of failed boxes |
+| `total_commands_executed` | Cumulative number of commands executed |
+| `total_exec_errors` | Cumulative number of execution errors |
+
+`BoxMetrics` (per-box level, `box.metrics()`):
+
+| Field (Python/C/Go) | Meaning |
+| - | - |
+| `memory_bytes` | Memory usage in bytes (**not** `memory_usage_bytes`) |
+| `cpu_percent` | CPU usage percentage (**not** `cpu_time_ms`) |
+| `commands_executed_total` / `exec_errors_total` | Cumulative command/error counts (note the `_total` suffix) |
+| `network_bytes_sent` / `network_bytes_received` | Network bytes sent/received (cumulative versions `bytes_sent_total` / `bytes_received_total` also exist) |
+
+> The Node SDK camelCases these names. `BoxMetrics` keeps the trailing `Total` (`commandsExecutedTotal`), while `RuntimeMetrics` keeps the leading `total` (`totalCommandsExecuted`) — napi camelCases the existing name rather than moving the word. When developing across languages, do not assume the field names match.
+
+***
+
+## Directory Layout (runtime on-disk state)
+
+A Box's runtime data is stored under the home directory (default `~/.boxlite`, overridable via `BOXLITE_HOME`). The tree below follows the `dirs` constants in the source `src/boxlite/src/runtime/layout.rs`:
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+~/.boxlite/                 # home directory (BOXLITE_HOME)
+├── db/                     # SQLite database (DB_DIR)
+├── images/                 # OCI image cache (IMAGES_DIR)
+│   ├── layers/             # downloaded layer tarballs
+│   ├── extracted/          # extracted layer directories
+│   ├── disk-images/        # ext4 disk image cache for copy-on-write
+│   ├── manifests/          # image manifests
+│   ├── configs/            # image configs
+│   └── local/              # local OCI image layout cache
+├── boxes/                  # per-Box runtime directories (BOXES_DIR)
+│   └── {box_id}/
+├── bases/                  # flat backing files (snapshot/clone base images, guest rootfs cache)
+├── locks/                  # per-entity lock files (LOCKS_DIR)
+├── logs/                   # runtime logs (LOGS_DIR)
+├── tmp/                    # temporary files (same filesystem as bases/ and images/disk-images/ to support atomic rename)
+└── .lock                   # home directory instance lock (prevents multiple instances sharing the same BOXLITE_HOME)
+```
+
+***

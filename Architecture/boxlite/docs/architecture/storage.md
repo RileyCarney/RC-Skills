@@ -1,0 +1,69 @@
+# Storage
+Source: https://docs.boxlite.ai/architecture/storage
+
+Where a box's bytes live: the digest-keyed image cache, the copy-on-write rootfs, and the two kinds of mount.
+
+Three layers, in the order a box uses them: **image cache** → **rootfs assembly** → **volume mounts**. For the SDK-facing `volumes` parameter, see [Volumes and mounts](/manage-sandbox/volumes).
+
+### Image cache (OCI, deduplicated by digest)
+
+A box uses standard OCI container images. Image layers (blobs) are stored by content digest in a local cache; multiple boxes and multiple images share the same layer and never re-download it. Source `src/boxlite/src/images/`; the default cache directory is `~/.boxlite/images/` (blobs stored by digest).
+
+### Rootfs assembly (overlay + copy-on-write)
+
+Before the box starts, the rootfs builder overlays the OCI image layers into a container filesystem, injects the DNS configuration, and creates a copy-on-write (CoW) snapshot. Each box thereby gets an independent writable view while sharing the read-only base layers. Source `src/boxlite/src/rootfs/`.
+
+### Volumes and persistent disks (virtiofs / QCOW2)
+
+| Type | Implementation | Purpose |
+| - | - | - |
+| virtiofs | Shares a host directory directly into the box | Sharing files between host and box (the `volumes` you pass in) |
+| QCOW2 disk | A copy-on-write disk image supporting thin allocation / snapshots / a shared base image | Persistent storage, sharing a base disk across boxes |
+
+Source `src/boxlite/src/volumes/`.
+
+### Mounting a Volume from the SDK (key: the third element is a boolean read_only)
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+import os
+import tempfile
+
+import boxlite
+
+async def main():
+    with tempfile.TemporaryDirectory() as host_dir:
+        with open(os.path.join(host_dir, "data.txt"), "w") as f:
+            f.write("shared\n")
+
+        try:
+            async with boxlite.SimpleBox(
+                image="alpine:latest",
+                volumes=[
+                    # 2-tuple: read-write by default
+                    (host_dir, "/rw"),
+                    # 3-tuple: the third element is a bool read_only. True = read-only
+                    (host_dir, "/ro", True),
+                ],
+            ) as box:
+                # /rw is writable
+                await box.exec("sh", "-c", "echo hi > /rw/new.txt")
+                # /ro is read-only: the write fails (non-zero exit code; note exec does not raise)
+                r = await box.exec("sh", "-c", "echo x > /ro/blocked.txt")
+                print("write to /ro exit:", r.exit_code)  # non-zero
+        except RuntimeError as e:
+            print("failed:", e)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+> **Do not** write `(host_dir, "/ro", "ro")`. At the SDK layer the third element is a `bool`; passing a string raises `TypeError`. The `"ro"`/`"rw"` string syntax belongs only to the **CLI**'s `-v host:box:ro` and differs from the SDK API.
+
+***
+
+## Related pages
+
+* [Volumes and mounts](/manage-sandbox/volumes) — the parameters and how to use them
+* [Networking](/architecture/networking) — the network stack behind a box
+* [Boot latency](/architecture/boot-latency) — why the first start pays the image-pull cost

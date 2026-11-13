@@ -1,0 +1,865 @@
+# CLI reference
+Source: https://docs.boxlite.ai/reference/cli
+
+the boxlite command line offers a docker-like experience for creating, running, and managing isolated lightweight microVM sandboxes from the terminal — pull images, run commands, mount volumes, forward ports, and connect to a remote BoxLite service without writing any SDK code.
+
+The global options, subcommands, and flags below follow the clap definitions in `src/cli/src/` for the latest published version.
+
+***
+
+## Prerequisites
+
+* The `boxlite` CLI and a machine with hardware virtualization — see [Installation](/getting-started/installation#platform-and-virtualization-requirements-common-to-all-sdks).
+* The `boxlite` CLI is installed (see "Install and verify" below).
+
+### Install and verify
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Option 1: one-line script (installs to $HOME/.local/bin/boxlite, with an embedded runtime)
+# Note: environment variables must be placed on the sh side of the pipe; placing them before curl does not pass them to the installer
+curl -fsSL https://sh.boxlite.ai | sh
+# Option 2: compile and install from crates.io
+cargo install boxlite-cli
+# Option 3: install a prebuilt binary via cargo-binstall
+cargo binstall boxlite-cli
+# Verify the installation
+boxlite --version
+boxlite --help
+```
+
+***
+
+## Quick Example (minimal happy path)
+
+The following commands form a complete "pull an image -> run once -> list sandboxes" loop and can be copied and run directly:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# 1) Run a command in an alpine sandbox; auto-clean after the command finishes (--rm)
+boxlite run --rm alpine:latest echo "hello from boxlite"
+
+# 2) Create a named, persistent sandbox in the background for later exec
+boxlite run -d --name mybox alpine:latest sleep 3600
+
+# 3) Run a command in the persistent sandbox
+boxlite exec mybox -- echo "running inside mybox"
+
+# 4) List running sandboxes
+boxlite list
+
+# 5) Remove when done (-f forcibly removes a running sandbox)
+boxlite rm -f mybox
+```
+
+> `boxlite run` **blocks the foreground** by default until the command exits; add `-d/--detach` to run it in the background and print the box ID immediately.
+> For `boxlite exec`, separate the command with `--` so the command's own flags are not parsed by the CLI.
+
+***
+
+## Command synopsis
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite [GLOBAL OPTIONS] <COMMAND> [ARGS...]
+```
+
+Global options may appear **before or after** the subcommand and apply to all commands.
+
+| Command | Aliases | Purpose |
+| - | - | - |
+| `run` | — | Create a sandbox and run a command immediately |
+| `exec` | — | Run a command in an **already running** sandbox |
+| `create` | — | Create a sandbox only (no command), print the box ID |
+| `list` | `ls`, `ps` | List sandboxes |
+| `rm` | — | Remove one or more sandboxes |
+| `start` | — | Start one or more stopped sandboxes |
+| `stop` | — | Stop one or more running sandboxes |
+| `restart` | — | Restart one or more sandboxes |
+| `pull` | — | Pull an image from a registry |
+| `images` | — | List local images |
+| `inspect` | — | Inspect one or more sandboxes in detail |
+| `cp` | — | Copy files/directories between host and sandbox |
+| `info` | — | Show runtime-level system information |
+| `logs` | — | View a sandbox's logs |
+| `stats` | — | View a sandbox's resource usage |
+| `network` | — | Inspect and manage a sandbox's network settings |
+| `volume` | — | Create, list, and remove managed volumes |
+| `serve` | — | Start the long-running REST API service |
+| `auth` | — | Authenticate with a remote BoxLite service (login/logout/status/whoami) |
+| `completion` | — | Generate shell completion scripts (hidden in help) |
+
+> Source: the `Commands` enum in `src/cli/src/cli.rs`. The `Commands` enum is marked `#[non_exhaustive]`, so new commands may be added in the future.
+
+***
+
+## Global options
+
+Source: the `GlobalFlags` group in `src/cli/src/cli.rs`.
+
+| Flag | Environment variable | Type | Description |
+| - | - | - | - |
+| `--debug` | — | bool | Enable debug output |
+| `--home <PATH>` | `BOXLITE_HOME` | path | BoxLite home directory (where data/volumes/credentials live) |
+| `--registry <REGISTRY>` | — | repeatable | Specify an image registry (may appear multiple times); takes priority over the config file |
+| `--config <FILE>` | — | path | Path to a JSON config file (with `image_registries` and other runtime options) |
+| `--url <URL>` | `BOXLITE_REST_URL` | URL | Connect to a remote BoxLite REST service instead of the local runtime |
+| `--profile <NAME>` | `BOXLITE_PROFILE` | string | Named credential profile in `~/.boxlite/credentials.toml`, default `default` |
+| `--path-prefix <P>` | `BOXLITE_REST_PATH_PREFIX` | string | Route slot in the REST URL path (`/v1/<prefix>/boxes/...`), for multi-tenant setups |
+
+### Local vs. remote selection logic
+
+`boxlite` connects to a remote service when REST configuration is present, otherwise it uses the local runtime (`GlobalFlags::create_runtime()`, cli.rs:229-245):
+
+* **URL**: `--url` / `BOXLITE_REST_URL` > the stored profile's URL. If either is present, it uses the remote `BoxliteRuntime::rest`.
+* **Bearer credential**: `BOXLITE_API_KEY` > the profile's bearer. `BOXLITE_API_KEY` **overrides only the bearer**, not the profile's url/path_prefix.
+* **Route slot**: `--path-prefix` / `BOXLITE_REST_PATH_PREFIX` > the profile's path_prefix.
+* If none of these yields a URL -> local runtime.
+
+### Related environment variables
+
+| Environment variable | Maps to | Description |
+| - | - | - |
+| `BOXLITE_HOME` | `--home` | Home directory |
+| `BOXLITE_REST_URL` | `--url` | Remote service URL |
+| `BOXLITE_PROFILE` | `--profile` | Credential profile name |
+| `BOXLITE_REST_PATH_PREFIX` | `--path-prefix` | Route slot |
+| `BOXLITE_API_KEY` | — | Remote auth bearer (overrides only the bearer) |
+| `BOXLITE_SECURITY` | `--security` | Sandbox security switch (`enable`/`disable`) |
+| `BOXLITE_SERVE_API_KEY` | `serve --api-key` | API key validated by `serve` |
+
+***
+
+## Subcommands (parameters and returns)
+
+### `boxlite run`
+
+Create a new sandbox and run a command immediately. Blocks the foreground until the command exits; the CLI exit code is the command's exit code (`src/cli/src/commands/run.rs`).
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite run [OPTIONS] <IMAGE> [COMMAND...]
+```
+
+| Positional | Required | Description |
+| - | - | - |
+| `<IMAGE>` | Yes | Image reference, e.g. `alpine:latest` |
+| `[COMMAND...]` | No | Command to run inside the image; defaults to `sh` when omitted (run.rs:150-156) |
+
+`run` reuses the following shared flag groups: process (`-i/-t/-e/-w/-u/--entrypoint`), resources (`--cpus/--memory/--disk-size`), ports (`-p`), volumes (`-v`), network (`--network/--allow-net`), and management (`--name/-d/--rm/--security`). See "Shared flag groups" below.
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Interactive shell (allocate a TTY)
+boxlite run -it --rm alpine:latest sh
+
+# Limit resources + mount a volume (read-only) + forward a port + set an environment variable
+boxlite run --rm \
+  --cpus 2 --memory 1024 \
+  -v "$(pwd)/data:/data:ro" \
+  -p 8080:80 \
+  -e MY_VAR=hello \
+  nginx:latest
+```
+
+> With `-d/--detach`, `run` returns immediately after printing the box ID and forces `auto_remove=false` (run.rs:119-121), so you must `boxlite rm` it manually.
+
+***
+
+### `boxlite exec`
+
+Run a command in an **already running** sandbox (`src/cli/src/commands/exec.rs`).
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite exec [OPTIONS] <BOX> -- <COMMAND...>
+```
+
+| Positional | Required | Description |
+| - | - | - |
+| `<BOX>` | Yes | The target sandbox's ID or name |
+| `<COMMAND...>` | Yes | The command to run (separate from flags with `--`) |
+
+| Flag | Description |
+| - | - |
+| `-d`, `--detach` | Run in the background without waiting for exit |
+| Process flag group | `-i/--interactive`, `-t/--tty`, `-e/--env`, `-w/--workdir`, `-u/--user`, `--entrypoint` |
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Run a command in the sandbox named mybox
+boxlite exec mybox -- ls -la /
+
+# Enter the sandbox interactively (requires a TTY terminal)
+boxlite exec -it mybox -- sh
+```
+
+> If the target sandbox is not found, it reports `No such box: <BOX>` (exec.rs:88).
+
+***
+
+### `boxlite create`
+
+Create a sandbox only — do not run a foreground command — and print the box ID on success (`src/cli/src/commands/create.rs`). Operate on it afterwards with `boxlite start` / `boxlite exec`.
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite create [OPTIONS] <IMAGE>
+```
+
+| Positional | Required | Description |
+| - | - | - |
+| `<IMAGE>` | Yes | Image reference |
+
+Supports `--name`, `-e/--env`, `-w/--workdir`, `--entrypoint`, plus the resources/ports/volumes/network/management shared flag groups.
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+BOX_ID=$(boxlite create --name worker alpine:latest)
+echo "created: $BOX_ID"
+boxlite start worker
+boxlite exec worker -- uname -a
+```
+
+***
+
+### `boxlite list` (aliases `ls` / `ps`)
+
+List sandboxes (`src/cli/src/commands/list.rs`). Defaults to table output.
+
+| Flag | Default | Description |
+| - | - | - |
+| `-a`, `--all` | off | Show all (by default only running ones) |
+| `-q`, `--quiet` | off | Print IDs only |
+| `--format <FMT>` | `table` | Output format: `table` / `json` / `yaml` |
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite list                  # running sandboxes (table)
+boxlite ls -a --format json   # all sandboxes, JSON output
+boxlite ps -q                 # print IDs only
+```
+
+***
+
+### `boxlite rm`
+
+Remove one or more sandboxes (`src/cli/src/commands/rm.rs`).
+
+| Flag/arg | Default | Description |
+| - | - | - |
+| `-f`, `--force` | off | Force-remove a running sandbox |
+| `-a`, `--all` | off | Remove all sandboxes (prompts `[y/N]` without `--force`) |
+| `<TARGETS...>` | — | One or more box IDs/names (omittable with `--all`) |
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite rm mybox              # remove one
+boxlite rm -f box1 box2       # forcibly remove multiple
+boxlite rm --all -f           # remove all and skip confirmation
+```
+
+***
+
+### `boxlite start` / `stop` / `restart`
+
+Lifecycle operations on one or more sandboxes (`start.rs` / `stop.rs` / `restart.rs`). All three take only a target list, with no extra flags.
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite start <TARGETS...>
+boxlite stop  <TARGETS...>
+boxlite restart <TARGETS...>
+```
+
+| Arg | Required | Description |
+| - | - | - |
+| `<TARGETS...>` | Yes | One or more box IDs/names (at least one) |
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite stop mybox
+boxlite start mybox
+boxlite restart box1 box2
+```
+
+***
+
+### `boxlite pull`
+
+Pull an image from a registry (`src/cli/src/commands/pull.rs`).
+
+| Flag/arg | Description |
+| - | - |
+| `<IMAGE>` | Required, image reference |
+| `-q`, `--quiet` | Quiet mode, print the digest only |
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite pull alpine:latest
+boxlite pull -q python:slim
+```
+
+On success it prints `Pulled: <reference>` / `Digest:` / `Layers:` (pull.rs:24-26).
+
+***
+
+### `boxlite images`
+
+List local images (`src/cli/src/commands/images.rs`). Defaults to table.
+
+| Flag | Default | Description |
+| - | - | - |
+| `-a`, `--all` | off | Show all (intermediate layer images hidden by default) |
+| `-q`, `--quiet` | off | Print image IDs only |
+| `--format <FMT>` | `table` | `table` / `json` / `yaml` |
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite images
+boxlite images --format json
+```
+
+***
+
+### `boxlite inspect`
+
+Inspect one or more sandboxes in detail (`src/cli/src/commands/inspect.rs`). Defaults to **JSON**.
+
+| Flag/arg | Default | Description |
+| - | - | - |
+| `[BOX...]` | — | One or more box IDs/names |
+| `-l`, `--latest` | off | Inspect the most recently created one (cannot be combined with `BOX`) |
+| `-f`, `--format <FMT>` | `json` | `json` / `yaml` / or a Go template (e.g. `{{.State.Status}}`) |
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite inspect mybox
+boxlite inspect --latest --format yaml
+boxlite inspect mybox -f '{{.State.Status}}'
+```
+
+***
+
+### `boxlite cp`
+
+Copy files/directories between host and sandbox (`src/cli/src/commands/cp.rs`). Use `BOX:PATH` for the sandbox-side path in the source or destination.
+
+| Flag/arg | Default | Description |
+| - | - | - |
+| `<SRC>` | — | Source path (a host path or `BOX:PATH`) |
+| `<DST>` | — | Destination path (a host path or `BOX:PATH`) |
+| `--follow-symlinks` | `false` | Copy the target a symlink points to |
+| `--no-overwrite` | `false` | Do not overwrite existing files |
+
+A directory copies under its own name. End the source with `/.` to copy its contents instead,
+as `docker cp` does:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite cp ./dist/. mybox:/srv/www    # the contents of ./dist
+boxlite cp ./dist   mybox:/srv/www    # /srv/www/dist
+```
+
+`--include-parent` was removed in 0.10.6.
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# host -> sandbox
+boxlite cp ./app.tar mybox:/tmp/app.tar
+
+# sandbox -> host
+boxlite cp mybox:/var/log/app.log ./app.log
+```
+
+***
+
+### `boxlite info`
+
+Show runtime-level system information (`src/cli/src/commands/info.rs`). Defaults to **YAML**.
+
+| Flag | Default | Description |
+| - | - | - |
+| `--format <FMT>` | `yaml` | `yaml` / `json` |
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite info
+boxlite info --format json
+```
+
+***
+
+### `boxlite logs`
+
+View a sandbox's logs (`src/cli/src/commands/logs.rs`).
+
+| Flag/arg | Default | Description |
+| - | - | - |
+| `<BOX>` | — | Required, box ID/name |
+| `-n`, `--tail <N>` | `0` | Show only the last N lines (0 = all) |
+| `-f`, `--follow` | off | Follow output continuously |
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite logs mybox
+boxlite logs -n 100 -f mybox
+```
+
+***
+
+### `boxlite stats`
+
+View a sandbox's resource usage (`src/cli/src/commands/stats.rs`). Defaults to table.
+
+| Flag/arg | Default | Description |
+| - | - | - |
+| `<BOX>` | — | Required, box ID/name |
+| `--format <FMT>` | `table` | `table` / `json` / `yaml` |
+| `-s`, `--stream` | off | Refresh stats in a live stream |
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite stats mybox
+boxlite stats --format json mybox
+boxlite stats -s mybox
+```
+
+***
+
+### `boxlite volume`
+
+Manage named volumes on a REST server — storage that outlives the box that wrote it.
+**These commands need a remote server**, so run `boxlite auth login` first (or pass
+`--url` / `BOXLITE_REST_URL`); there is nothing to manage on a purely local runtime.
+
+| Subcommand | Arguments | Description |
+| - | - | - |
+| `create` | — | Create a volume and print its **id** |
+| `ls` (alias `list`) | — | List volumes |
+| `get` (alias `inspect`) | `<ID>` | Show one volume |
+| `rm` (alias `delete`) | `<IDS>...` | Remove one or more volumes by id |
+
+| Flag | Applies to | Default | Description |
+| - | - | - | - |
+| `--name <NAME>` | `create` | server-assigned id | A name you can mount in place of the id. At least two characters of `[a-zA-Z0-9][a-zA-Z0-9_.-]` |
+| `--format <FORMAT>` | `ls`, `get` | `table` | `table`, `json`, or `yaml` |
+| `-q`, `--quiet` | `ls` | `false` | Print ids only |
+| `-f`, `--force` | `rm` | `false` | Ignore volumes that do not exist |
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Create one. The command prints the id, not the name.
+boxlite volume create --name subtitle-models
+# a265d8cc-96aa-46b4-b0a0-afa05c7e4d02
+
+boxlite volume ls
+boxlite volume ls -q                       # ids only, for scripting
+boxlite volume get a265d8cc-96aa-46b4-b0a0-afa05c7e4d02 --format json
+```
+
+`get --format json` returns PascalCase keys, and `Size` is `-` because Cloud does not
+report volume size:
+
+```json theme={"theme":{"light":"github-light","dark":"github-dark"}}
+{
+  "Id": "a265d8cc-96aa-46b4-b0a0-afa05c7e4d02",
+  "Name": "subtitle-models",
+  "CreatedAt": "2026-10-21 01:29:09 UTC",
+  "Size": "-"
+}
+```
+
+Mount it into a box by the name you chose, with `-v`:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite create python --name trainer -v subtitle-models:/data
+boxlite start trainer
+boxlite exec trainer -- sh -c 'echo hi > /data/f.txt && cat /data/f.txt'
+```
+
+> [!NOTE]
+>
+> **A volume in use cannot be removed, and the error names the box holding it:**
+>
+> ```
+> Error removing volume 'a265d8cc-…': invalid state: Volume cannot be deleted because it is in use by one or more boxes (e.g. trainer)
+> Error: Some volumes could not be removed
+> ```
+>
+> Remove the box first. And because **deletion is asynchronous**, a volume you just
+> removed can still appear in the next `boxlite volume ls` — poll with a bound rather
+> than treating one listing as proof. See [Volume operations](/cloud/volume-operations).
+
+***
+
+### `boxlite network`
+
+| Subcommand | Arguments | Description |
+| - | - | - |
+| `tunnel` | `<BOX> <PORT>` | Print a remote URL for a box service, or forward a local listener to it |
+
+| Flag | Default | Description |
+| - | - | - |
+| `--listen <ADDRESS>` | none — print the URL instead | Bind a local TCP `host:port`, or a `unix:/absolute/path` socket, and forward it to the guest port |
+
+Without `--listen`, it prints the public URL and exits:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite network tunnel mybox 8080
+# https://8080-d-6574546e6e4b787a4c596d52.proxy.boxlite.ai
+```
+
+With `--listen`, it stays in the foreground and forwards until you stop it:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite network tunnel mybox 8080 --listen 127.0.0.1:18080
+# tcp://127.0.0.1:18080
+```
+
+> [!WARNING]
+>
+> **The box must have inbound enabled.** A tunnel against a private box fails:
+>
+> ```
+> Error: invalid state: Box etTnnKxzLYmR is not public; set public: true before opening a tunnel
+> ```
+>
+> Create it with `--inbound enabled`, or flip an existing box from the console — see
+> [Network policy](/cloud/network-policy#a-new-box-is-private). Inbound has defaulted to
+> `disabled` since 0.10.5, so code that predates it hits this.
+>
+> The service inside the box must also bind `0.0.0.0`: traffic arrives on the guest's
+> network interface, not its loopback.
+
+***
+
+### `boxlite serve`
+
+Start the long-running REST API service (a local Axum reference server, `src/cli/src/commands/serve/mod.rs`). Once running, connect with the SDK's REST client or with `--url`.
+
+| Flag | Default | Environment variable | Description |
+| - | - | - | - |
+| `--port <PORT>` | `8100` | — | Listen port (`LOCAL_SERVE_PORT` in `src/cli/src/defaults.rs`) |
+| `--host <HOST>` | `127.0.0.1` | — | Bind address (`LOCAL_SERVE_HOST` in `src/cli/src/defaults.rs`). A non-loopback address requires `--api-key` |
+| `--api-key <KEY>` | none (permissive) | `BOXLITE_SERVE_API_KEY` | When set, every route except `GET /v1/config` requires `Authorization: Bearer <KEY>`, otherwise 401 |
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Local-only service, zero config (permissive mode, accepts any/no bearer)
+boxlite serve
+
+# Reachable from other machines — the key is mandatory for a non-loopback bind
+boxlite serve --host 0.0.0.0 --port 9000 --api-key "<YOUR_API_KEY>"
+```
+
+By default the REST API serves at `http://localhost:8100/v1/...`.
+
+> [!WARNING]
+>
+> **`--host` changed from `0.0.0.0` to `127.0.0.1` in 0.10.6.** Without a key the server
+> grants full box control to every caller that can reach it, so it now refuses to bind
+> anywhere but loopback:
+>
+> ```
+> Error: refusing to bind `boxlite serve` to non-loopback address 0.0.0.0 without an API key; set --api-key (or BOXLITE_SERVE_API_KEY), or bind to 127.0.0.1
+> ```
+>
+> If you upgraded a deployment that other machines connect to, add both flags —
+> `--host 0.0.0.0` to restore the old reach, and `--api-key` (or
+> `BOXLITE_SERVE_API_KEY`) to satisfy the check. Clients must then send
+> `Authorization: Bearer <YOUR_API_KEY>`.
+
+***
+
+### `boxlite auth`
+
+Authenticate with a remote BoxLite service (`src/cli/src/commands/auth/mod.rs`).
+
+| Subcommand | Description |
+| - | - |
+| `auth login` | Log in to the REST service and save credentials |
+| `auth logout` | Delete stored credentials |
+| `auth status` | Show the current auth status (offline, no network access) |
+| `auth whoami` | Confirm the current credential's identity via `GET /v1/me` |
+
+Flags for `auth login` (`auth/login.rs`):
+
+| Flag | Default | Description |
+| - | - | - |
+| `--url <URL>` | `http://localhost:8100` | Service URL (matches the `boxlite serve` default) |
+| `--api-key-stdin` | — | Read one line of API key from stdin (kept out of argv); forces `--method api-key` |
+| `--method <M>` | auto | Login method: `api-key` / `browser` / `device` |
+| `--no-browser` | — | Skip the browser and use Device Code (RFC 8628), suitable for SSH/remote |
+| `--issuer <URL>` | — | OIDC issuer URL (overrides the service's discovery config) |
+| `--client-id <ID>` | — | OIDC client_id |
+| `--audience <A>` | — | OIDC audience |
+| `--callback-port <PORT>` | `5555` | Browser-flow callback port (`http://127.0.0.1:<PORT>/callback`) |
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Log in with an API key (key passed via stdin, kept out of shell history)
+printf '%s' "<YOUR_API_KEY>" | boxlite auth login --url https://api.boxlite.ai --api-key-stdin
+
+# Check status / identity
+boxlite auth status
+boxlite auth whoami
+
+# Log out
+boxlite auth logout
+```
+
+***
+
+### `boxlite completion`
+
+Generate shell completion scripts (the `Completion` variant in `src/cli/src/cli.rs`; hidden in `--help`).
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite completion <bash|zsh|fish>
+```
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# zsh example
+boxlite completion zsh > "${fpath[1]}/_boxlite"
+
+# bash example
+boxlite completion bash > /etc/bash_completion.d/boxlite
+```
+
+***
+
+## Shared flag groups
+
+The following flag groups are reused across multiple commands (`src/cli/src/cli.rs`).
+
+### Process (ProcessFlags, cli.rs:308)
+
+| Flag | Description |
+| - | - |
+| `-i`, `--interactive` | Keep STDIN open even when not attached |
+| `-t`, `--tty` | Allocate a pseudo-terminal (in TTY mode stdout/stderr are merged) |
+| `-e`, `--env <K=V\|K>` | Set an environment variable; given only `K`, the value is taken from the host variable of the same name |
+| `-w`, `--workdir <DIR>` | Working directory inside the sandbox |
+| `-u`, `--user <name\|uid[:group\|gid]>` | Run the command as the given user |
+| `--entrypoint <EXEC>` | Override the image entrypoint with a single executable |
+
+### Resources (ResourceFlags, cli.rs:396)
+
+| Flag | Description |
+| - | - |
+| `--cpus <N>` | Number of vCPUs (values above 255 are clamped to 255 with a warning, cli.rs:420-423) |
+| `--memory <MiB>` | Memory cap (MiB) |
+| `--disk-size <GB>` | Virtual rootfs disk size (GB); the copy-on-write overlay grows sparsely, and a value smaller than the base image is ignored |
+
+### Port publishing (PublishFlags, cli.rs:476)
+
+| Flag | Description |
+| - | - |
+| `-p`, `--publish <[hostPort:]boxPort[/tcp\|udp]>` | Publish a sandbox port to the host (repeatable) |
+
+### Volumes (VolumeFlags, cli.rs:567)
+
+| Flag | Description |
+| - | - |
+| `-v`, `--volume <host:box[:ro\|rw]>` | Mount a volume (repeatable) |
+
+### Network (NetworkFlags, cli.rs:438)
+
+| Flag | Description |
+| - | - |
+| `--network <enabled\|disabled>` | Network mode: `enabled` (default, full or allowlisted egress) / `disabled` (no network interface) |
+| `--allow-net <HOST>` | Restrict egress to the listed hosts/IPs (repeatable, implies `enabled`); cannot be combined with `--network disabled` |
+
+### Management (ManagementFlags, cli.rs:744)
+
+| Flag | Default | Environment variable | Description |
+| - | - | - | - |
+| `--name <NAME>` | — | — | Name the sandbox |
+| `-d`, `--detach` | off | — | Run in the background |
+| `--rm` | off | — | Auto-delete the sandbox on exit |
+| `--security <enable\|disable>` | `enable` | `BOXLITE_SECURITY` | Sandbox security: `enable` (default, full isolation) / `disable` (turn the sandbox off for debugging) |
+
+***
+
+## Volume mount syntax (CLI-only)
+
+The CLI `-v` uses the **strings** `ro`/`rw` for read/write permission (parsing at cli.rs:591-593), defaulting to `rw`:
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+-v hostPath:boxPath[:ro|rw]   # bind mount
+-v boxPath[:ro]               # anonymous volume (host-side directory allocated automatically)
+```
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite run --rm -v "$(pwd):/work:ro" alpine:latest ls /work   # read-only
+boxlite run --rm -v /data:/app/data alpine:latest sh           # read-write (default)
+boxlite run --rm -v /cache:ro alpine:latest sh                 # anonymous read-only volume
+```
+
+> **Important distinction**: this is the **CLI parsing layer**'s `ro`/`rw` string syntax. In the SDKs (Python/Node), the volume's third element is a **`bool read_only`** (`True` = read-only / `False` = read-write), not a string. Do not conflate them (see [Python SDK Reference](/reference/python) and [Node.js SDK Reference](/reference/nodejs)).
+
+## Port publishing syntax
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+-p [hostPort:]boxPort[/tcp|udp]
+```
+
+* `-p 80` -> the host port follows the guest (host_port=None), guest port 80
+* `-p 8080:80` -> host 8080 maps to guest 80
+* The `/tcp` protocol suffix (default) forwards over TCP
+
+***
+
+## Default output formats
+
+| Command | Default format | Source |
+| - | - | - |
+| `list` / `images` / `stats` | `table` | list.rs:20, etc. |
+| `info` | `yaml` | info.rs:28 |
+| `inspect` | `json` | inspect.rs:22 |
+
+***
+
+## Registry configuration
+
+The CLI resolves an unqualified image reference (e.g. `alpine`) into a fully qualified one (e.g. `docker.io/library/alpine:latest`) by searching configured registries in order; the first successful pull wins. Fully qualified references (e.g. `quay.io/prometheus/prometheus:v2.40.1`) always bypass this search and are pulled directly.
+
+### Configuration source priority
+
+Configuration sources are layered, from lowest to highest priority (source `docs/guides/image-registry-configuration.md`):
+
+1. **Default**: `docker.io` (the implicit default when nothing is configured).
+2. **Config file (`--config <FILE>`)**: registries loaded from the JSON file.
+3. **CLI flags (`--registry <REGISTRY>`)**: prepended to the config-file registries, so they take the highest priority.
+
+### JSON config file schema
+
+A `--config` file holds an `image_registries` array. Each entry configures one registry:
+
+```json theme={"theme":{"light":"github-light","dark":"github-dark"}}
+{
+  "image_registries": [
+    {
+      "host": "ghcr.io",
+      "search": true
+    },
+    {
+      "host": "docker.io",
+      "search": true
+    },
+    {
+      "host": "registry.local:5000",
+      "transport": "http",
+      "search": true
+    },
+    {
+      "host": "registry.example.com",
+      "transport": "https",
+      "skip_verify": true,
+      "auth": {
+        "type": "basic",
+        "username": "user",
+        "password": "<YOUR_REGISTRY_PASSWORD>"
+      }
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+| - | - | - |
+| `host` | string | The registry host (with optional `:port`) |
+| `search` | bool | When `true`, this registry participates in unqualified-image fallback |
+| `transport` | `"http"` / `"https"` | `"http"` enables a plain HTTP registry (default is HTTPS) |
+| `skip_verify` | bool | When `true`, disables TLS certificate and hostname verification for HTTPS registries |
+| `auth` | object | Either `{ "type": "basic", "username": "...", "password": "..." }` or `{ "type": "bearer", "token": "..." }` |
+
+Use it with `boxlite --config ./registries.json run ...`. `--registry` flags, if also present, are prepended (higher priority).
+
+***
+
+## Troubleshooting (common problems and typical errors)
+
+### No virtualization / missing KVM, start fails
+
+**Symptom**: on Linux `boxlite run ...` reports it cannot access `/dev/kvm`, or starting a microVM fails on an unsupported platform.
+
+**Cause**: an environment constraint. BoxLite requires hardware virtualization.
+
+**Fix**:
+
+* Linux: confirm `/dev/kvm` exists and the current user is in the `kvm` group (`ls -l /dev/kvm`, `groups`).
+* macOS: use Apple Silicon (Hypervisor.framework, no `/dev/kvm` needed); macOS Intel is not supported.
+* Windows: run inside WSL2 with KVM enabled.
+
+### `--tty` reports "the input device is not a TTY."
+
+**Symptom**: `boxlite run -t ...` or `boxlite exec -t ...` errors in a non-interactive environment (e.g. CI, a pipe) (run.rs:142-143, cli.rs:359-360).
+
+**Cause**: `-t/--tty` requires stdin to be a real terminal.
+
+**Fix**: drop `-t` in scripts/CI; use `-it` only in an interactive terminal.
+
+### `exec` reports `No such box: <BOX>`
+
+**Symptom**: `boxlite exec mybox -- ...` reports the sandbox is not found (exec.rs:88).
+
+**Cause**: the target sandbox does not exist or was stopped/removed. `exec` only operates on an **existing** sandbox.
+
+**Fix**: run `boxlite list -a` to confirm the box exists; if stopped, `boxlite start <BOX>` first.
+
+### `-v` used an invalid ro/rw string
+
+**Symptom**: the CLI reports `invalid volume spec ...`.
+
+**Cause**: the third segment accepts only `ro` or `rw` (others are ignored or error), and an anonymous volume's box path must be absolute (cli.rs:616-621).
+
+**Fix**: use `-v host:box:ro` or `-v host:box` (default rw); for an anonymous volume write `-v /data`, not `-v data`.
+
+> Note: in **SDK code** (not the CLI), passing the volume's third element as the string `"ro"` raises `TypeError: 'str' object cannot be cast as 'bool'` — the SDK's third element must be a `bool`.
+
+### `--allow-net` combined with `--network disabled` is rejected
+
+**Symptom**: the error message contains `allow_net` (cli.rs:1043-1052).
+
+**Cause**: `--allow-net` implies `enabled`, which contradicts `disabled`.
+
+**Fix**: do not add `--network disabled` when you need allowlisted egress; do not add `--allow-net` when you need the network fully off.
+
+### `--security` given an unknown preset
+
+**Symptom**: the error message contains the invalid value you entered (e.g. `ultra`, cli.rs:1415-1428).
+
+**Cause**: `--security` accepts only `enable` / `disable` (case-insensitive).
+
+**Fix**: use `--security=disable` to turn the sandbox off (for debugging), or omit the option (default `enable`).
+
+### `serve` set `--api-key` but the client gets 401
+
+**Symptom**: connecting to a service started with `boxlite serve --api-key ...` returns 401.
+
+**Cause**: once `--api-key` is set, every route except `GET /v1/config` requires `Authorization: Bearer <KEY>` (serve/mod.rs:51-55).
+
+**Fix**: the client must carry the correct bearer (e.g. `--url` + `BOXLITE_API_KEY`, or the SDK's `ApiKeyCredential`); for local development you can leave `--api-key` unset (permissive mode).
+
+### The one-line install script's environment variable had no effect
+
+**Symptom**: `BOXLITE_VERSION=... curl ... | sh` did not pin the version as expected.
+
+**Cause**: a variable placed before `curl` applies only to the curl process and is not passed to the installer.
+
+**Fix**: place the variable on the pipe's `sh` side: `curl -fsSL https://sh.boxlite.ai | BOXLITE_VERSION=v<VERSION> sh` (substitute the desired release tag, e.g. the latest published version).
+
+***
+
+## Exit codes
+
+`boxlite` follows POSIX shell exit-code conventions. The mapping lives in `to_shell_exit_code` (`src/cli/src/util/mod.rs`).
+
+| Code | Source | Meaning |
+| - | - | - |
+| `0` | success | The command (or box command) finished successfully |
+| `1` | runtime | Any anyhow error from a CLI command — the top-level handler in `src/cli/src/main.rs` prints `Error: ...` to stderr and exits `1` |
+| `2` | clap | Invalid CLI usage (unknown flag, missing required argument, bad value) |
+| `N` (1-127) | box command | `run`/`exec` propagate the box command's exit status (run.rs:104, exec.rs:81) |
+| `128 + N` | signal | `run`/`exec` exited because the box command was killed by signal *N* (e.g. `137` for `SIGKILL` = 128 + 9, `143` for `SIGTERM` = 128 + 15) |
+
+`boxlite rm`, `start`, `stop`, and `restart` aggregate per-target errors and exit `1` if any target failed, after attempting all targets.
+
+You can branch on the exit code directly in a script:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+if boxlite run --rm alpine:latest sh -c 'exit 3'; then
+  echo "ok"
+else
+  echo "command failed with exit code $?"   # 3
+fi
+```
+
+***
+
+## See also
+
+* [Python SDK Reference](/reference/python)
+* [Node.js SDK Reference](/reference/nodejs)
+* [Environment and startup](/manage-sandbox/environment)
+* [Network access](/manage-sandbox/network-access)
+* [Volumes](/manage-sandbox/volumes)
+* [Secrets and security](/manage-sandbox/secrets-and-security)

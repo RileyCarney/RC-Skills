@@ -1,0 +1,224 @@
+# Keep data when the box is gone
+Source: https://docs.boxlite.ai/cloud/data-across-boxes
+
+Write to a volume from one box, delete that box, and read the same data back from a new one — the reason managed volumes exist.
+
+A box’s own disk dies with the box. A volume does not. This walks the proof end to end: write from one box, delete it, then read the same bytes from a box that did not exist when they were written.
+
+## Prerequisites
+
+* An API key from the console, exported as `BOXLITE_API_KEY`. See [API keys](/cloud/api-keys).
+* `pip install boxlite`, and the REST URL exported as `BOXLITE_REST_URL`. See [Quickstart](/cloud/quickstart).
+
+Every example reads both values from the environment, so nothing hard-codes a credential.
+
+## See it in six commands
+
+The whole proof, from a terminal. Box A writes, box A is destroyed, box B reads what A
+left behind:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite volume create --name handoff-demo
+
+boxlite create python --name box-a -v handoff-demo:/data && boxlite start box-a
+boxlite exec box-a -- sh -c 'echo "produced by box A" > /data/handoff.txt'
+boxlite rm -f box-a                      # the box is gone, the volume is not
+
+boxlite create python --name box-b -v handoff-demo:/data && boxlite start box-b
+boxlite exec box-b -- cat /data/handoff.txt
+# produced by box A
+```
+
+`boxlite volume` talks to a REST server, so run `boxlite auth login` first — see
+[`boxlite volume`](/reference/cli#boxlite-volume).
+
+## Do the same from code
+
+The property that makes a volume worth using: write through the mount in one box,
+destroy that box, mount the same volume in a different box, and the data reads back.
+The volume is backed by managed storage, not by the box.
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+import os
+import time
+
+from boxlite import (
+    ApiKeyCredential,
+    Boxlite,
+    BoxliteRestOptions,
+    BoxOptions,
+)
+
+# A name is easier to carry between processes than an id.
+VOLUME = os.environ.get("BOXLITE_VOLUME", "<YOUR_VOLUME_NAME>")
+IMAGE = "ghcr.io/boxlite-ai/boxlite-agent-base:v0.1.0"
+
+async def run_in_fresh_box(rt, name, script):
+    """Create a box with the volume mounted, run one shell script, then remove the box."""
+    box = await rt.create(
+        BoxOptions(image=IMAGE, volumes=[(VOLUME, "/data")]),
+        name=name,
+    )
+    try:
+        await box.start()
+        execution = await box.exec("sh", args=["-c", script])
+        output = ""
+        async for line in execution.stdout():
+            output += line
+        result = await execution.wait()
+        return result.exit_code, output
+    finally:
+        # The box is gone after this line; the volume is not.
+        await rt.remove(box.id, force=True)
+
+async def main():
+    rt = Boxlite.rest(BoxliteRestOptions(
+        url=os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
+        credential=ApiKeyCredential(os.environ["BOXLITE_API_KEY"]),
+    ))
+    stamp = int(time.time())
+
+    try:
+        # Box A writes, then is destroyed.
+        code, _ = await run_in_fresh_box(
+            rt,
+            f"volume-writer-{stamp}",
+            "echo 'produced by box A' > /data/handoff.txt",
+        )
+        if code != 0:
+            print(f"box A write failed with exit code {code}")
+            return
+
+        # Box B is a different box on the same volume.
+        code, output = await run_in_fresh_box(
+            rt,
+            f"volume-reader-{stamp}",
+            "cat /data/handoff.txt",
+        )
+        print(f"box B exit code: {code}")
+        print(f"box B read back: {output}")
+    except Exception as exc:
+        print(f"handoff failed: {exc}")
+
+asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { ApiKeyCredential, BoxliteRestOptions, JsBoxlite } from "@boxlite-ai/boxlite";
+
+// A name is easier to carry between processes than an id.
+const VOLUME = process.env.BOXLITE_VOLUME ?? "<YOUR_VOLUME_NAME>";
+const IMAGE = "ghcr.io/boxlite-ai/boxlite-agent-base:v0.1.0";
+
+// Create a box with the volume mounted, run one shell script, then remove the box.
+async function runInFreshBox(rt, name: string, script: string): Promise<[number, string]> {
+  const box = await rt.create({ image: IMAGE, volumes: [[VOLUME, "/data"]] }, name);
+  try {
+    await box.start();
+    const execution = await box.exec("sh", ["-c", script]);
+    const stdout = await execution.stdout();
+    let output = "";
+    while (true) {
+      const line = await stdout.next();
+      if (line === null) break;
+      output += line;
+    }
+    const result = await execution.wait();
+    return [result.exitCode, output];
+  } finally {
+    // The box is gone after this line; the volume is not.
+    await rt.remove(box.id, true);
+  }
+}
+
+async function main(): Promise<void> {
+  const rt = JsBoxlite.rest(
+    new BoxliteRestOptions({
+      url: process.env.BOXLITE_REST_URL ?? "https://api.boxlite.ai",
+      credential: new ApiKeyCredential(process.env.BOXLITE_API_KEY!),
+    }),
+  );
+  const stamp = Math.floor(Date.now() / 1000);
+
+  try {
+    // Box A writes, then is destroyed.
+    const [writeCode] = await runInFreshBox(
+      rt,
+      `volume-writer-${stamp}`,
+      "echo 'produced by box A' > /data/handoff.txt",
+    );
+    if (writeCode !== 0) {
+      console.error(`box A write failed with exit code ${writeCode}`);
+      return;
+    }
+
+    // Box B is a different box on the same volume.
+    const [readCode, output] = await runInFreshBox(rt, `volume-reader-${stamp}`, "cat /data/handoff.txt");
+    console.log(`box B exit code: ${readCode}`);
+    console.log(`box B read back: ${output}`);
+  } catch (err) {
+    console.error(`handoff failed: ${err instanceof Error ? err.message : err}`);
+  } finally {
+    rt.close();
+  }
+}
+
+main();
+```
+
+```bash REST theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Two boxes, one volume: the first writes, the second reads after the first is gone.
+BOXLITE_REST_URL="${BOXLITE_REST_URL:-https://api.boxlite.ai}"
+VOLUME="${BOXLITE_VOLUME:-<YOUR_VOLUME_NAME>}"
+IMAGE="ghcr.io/boxlite-ai/boxlite-agent-base:v0.1.0"
+AUTH=(-H "Authorization: Bearer ${BOXLITE_API_KEY}" -H 'Content-Type: application/json')
+
+make_box() {
+  curl -fsS -X POST "${BOXLITE_REST_URL}/v1/boxes" "${AUTH[@]}" \
+    -d "{\"image\":\"${IMAGE}\",\"volumes\":[{\"managed_volume\":\"${VOLUME}\",\"guest_path\":\"/data\"}]}" \
+    | jq -r .id
+}
+
+# Box A writes, then is destroyed.
+A=$(make_box)
+curl -fsS -X POST "${BOXLITE_REST_URL}/v1/boxes/${A}/exec" "${AUTH[@]}" \
+  -d '{"command":"sh","args":["-c","echo '"'"'produced by box A'"'"' > /data/handoff.txt"]}' > /dev/null
+# exec is asynchronous: it returns an execution id. Wait for it before
+# removing the box, or the write can still be in flight.
+EXEC_ID=$(curl -fsS -X POST "${BOXLITE_REST_URL}/v1/boxes/${A}/exec" "${AUTH[@]}" \
+  -d '{"command":"sh","args":["-c","true"]}' | jq -r .id)
+for _ in $(seq 30); do
+  STATE=$(curl -fsS "${BOXLITE_REST_URL}/v1/boxes/${A}/executions/${EXEC_ID}" "${AUTH[@]}" | jq -r .state)
+  [ "$STATE" = "completed" ] && break
+  sleep 1
+done
+
+curl -fsS -X DELETE "${BOXLITE_REST_URL}/v1/boxes/${A}?force=true" "${AUTH[@]}"
+
+# Box B is a different box on the same volume.
+B=$(make_box)
+curl -fsS -X POST "${BOXLITE_REST_URL}/v1/boxes/${B}/exec" "${AUTH[@]}" \
+  -d '{"command":"cat","args":["/data/handoff.txt"]}'
+curl -fsS -X DELETE "${BOXLITE_REST_URL}/v1/boxes/${B}?force=true" "${AUTH[@]}"
+```
+
+## Only what is under the mount path survives
+
+This is the part people get wrong. The volume is mounted at one path, and **only what
+you write under that path** outlives the box:
+
+| Where box A writes | After box A is destroyed |
+| - | - |
+| `/data/handoff.txt` — under the mount | Still there, readable from box B |
+| `/root/notes.txt` — the box's own disk | Gone |
+| `/tmp/anything` | Gone |
+
+If something you expected to survive did not, check which side of the mount path it was
+written to before suspecting the volume.
+
+## Next steps
+
+> [card] [Volumes](/cloud/volumes)
+>
+> What a volume is, the full parameter reference, and how Cloud differs from open source.

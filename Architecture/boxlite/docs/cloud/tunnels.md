@@ -1,0 +1,151 @@
+# How tunnels work
+Source: https://docs.boxlite.ai/cloud/tunnels
+
+The one API behind every way of reaching into a Cloud box: how a tunnel is established, why each one carries a single connection, what it is verified to carry, and the full parameter reference.
+
+Every way of reaching a service inside a Cloud box goes through the same object: a tunnel. This page is the concept and the reference. The task pages — [Serve HTTP](/cloud/serve-http), [Port forwarding](/cloud/port-forwarding), [Raw streams](/cloud/raw-streams) — are three ways of consuming what it returns.
+
+## Prerequisites
+
+* An API key from the console, exported as `BOXLITE_API_KEY`. See [API keys](/cloud/api-keys).
+* `pip install boxlite`, and the REST URL exported as `BOXLITE_REST_URL`. See [Quickstart](/cloud/quickstart).
+
+## How a tunnel reaches your service
+
+You do not open a port on the platform. You ask one specific box for a tunnel to one specific port inside it, and `await box.network.tunnel(port)` prepares it.
+
+Behind that single call: the SDK asks the Cloud API to prepare the tunnel (`POST /v1/boxes/{id}/network/tunnel` if you are driving the REST API yourself), opens a TLS connection to the public proxy, and issues an HTTP `CONNECT`. The proxy connects on to the runner hosting your box, and the runner connects to the guest port. From there the path is your service's socket: the tunnel moves bytes and nothing along it interprets your protocol.
+
+Two consequences shape every use of a tunnel.
+
+* **The box must have inbound enabled.** A tunnel against a private box is refused,
+  and inbound has defaulted to `disabled` since 0.10.5 — see
+  [Network policy](/cloud/network-policy#a-new-box-is-private).
+* **Your service must bind `0.0.0.0`.** The tunnel terminates on the box's network interface, so a server bound to `127.0.0.1` inside the box is unreachable — the same reason port forwarding needs `0.0.0.0` on a box you run yourself, explained in [Network access](/manage-sandbox/network-access).
+* **A prepared tunnel carries exactly one connection.** See [A tunnel is one-shot](#a-tunnel-is-one-shot).
+
+## A tunnel is one-shot
+
+> [!WARNING]
+>
+> **`connect()` and `forward()` each consume the tunnel.** Calling either one a second time on the same `BoxTunnel` raises a BoxLite error: `tunnel connection has already been consumed`.
+>
+> Every connection needs a fresh `await box.network.tunnel(port)`. Ask for one per request, per retry, and per concurrent client — one per connection — and never cache a `BoxTunnel` for reuse. Caching the *port number* is fine; caching the tunnel is the bug.
+
+Preparing a tunnel is cheap and boxes accept several at once, so this is a shape to lean into rather than work around: many concurrent clients on the same guest port each get their own tunnel, and different guest ports on one box can be tunnelled at the same time.
+
+## Parameters and returns
+
+### `box.network.tunnel(port)`
+
+Async. Prepares one tunnel to one port inside one box.
+
+| Parameter | Type | Required | Description |
+| - | - | - | - |
+| `port` | `int` | Required | The port your service listens on **inside** the box. `0` raises `ValueError: tunnel port must be non-zero` |
+
+Returns a `BoxTunnel`. `await box.tunnel(port)` is an equivalent shorthand on a `SimpleBox`.
+
+### `BoxTunnel`
+
+| Member | Async | Returns | Description |
+| - | - | - | - |
+| `uri()` | No | `str \| None` | Public URL of a remotely served tunnel, or `None` for a local one. Does not consume the tunnel |
+| `connect()` | Yes | `BoxConnection` | **Consumes the tunnel** and returns its bidirectional byte stream |
+| `forward(listen)` | Yes | `TunnelForwarder` | **Consumes the tunnel**, listens on `listen`, and forwards traffic into the box. `listen` is a `SocketAddress` |
+
+### `SocketAddress`
+
+Two class methods build the address `forward()` listens on.
+
+| Constructor | Signature | Constraint |
+| - | - | - |
+| `SocketAddress.tcp` | `SocketAddress.tcp(host="127.0.0.1", port=0)` | `host` must be a numeric IP, otherwise `ValueError: tunnel listener host must be a numeric IP`. `port=0` lets the system assign one |
+| `SocketAddress.unix` | `SocketAddress.unix(path)` | `path` must be absolute, otherwise `ValueError: tunnel Unix socket path must be absolute` |
+
+Read-only attributes:
+
+| Attribute | Type | TCP address | Unix address |
+| - | - | - | - |
+| `kind` | `str` | `"tcp"` | `"unix"` |
+| `host` | `str \| None` | The IP | `None` |
+| `port` | `int \| None` | The port | `None` |
+| `path` | `str \| None` | `None` | The socket path |
+
+### `TunnelForwarder`
+
+| Member | Async | Returns | Description |
+| - | - | - | - |
+| `local_addr()` | No | `SocketAddress` | The address actually bound — read this when you passed `port=0` |
+| `wait()` | Yes | — | Blocks until the forwarder finishes |
+| `close()` | Yes | — | Shuts the forwarder down |
+
+### `BoxConnection`
+
+| Member | Async | Returns | Description |
+| - | - | - | - |
+| `read(max_bytes)` | Yes | `bytes` | Up to `max_bytes` bytes; empty once the far side closes. `max_bytes` of `0` raises `ValueError: max_bytes must be non-zero`; reading a closed connection raises with `connection is closed` |
+| `write(data)` | Yes | `int` | Writes all of `data` (`bytes`) and returns the number of bytes written |
+| `shutdown_write()` | Yes | — | Half-closes the write direction. Read [Limits](#limits) before you depend on it |
+| `close()` | Yes | — | Closes both directions |
+
+## What a tunnel carries
+
+These behaviors are verified end to end against BoxLite Cloud, so you can build on them:
+
+* **HTTP requests and responses**, `GET` and `POST`.
+* **WebSocket** — the upgrade handshake and frames in both directions.
+* **Several guest ports on one box**, tunnelled at the same time.
+* **Concurrent clients** against the same guest port, each on its own tunnel.
+* **Responses larger than 2 MiB** through a single connection, byte-for-byte intact.
+* **Slow readers** — a client that drains the stream slowly does not lose data.
+* **Client cancellation** — abandoning your side ends that stream without disturbing the box or its other streams.
+* **Service restart** — restart the server inside the box, open a fresh tunnel, and traffic flows again.
+* **Arbitrary TCP**, including a real SSH session to an `sshd` listening on port 2222. The path is not HTTP-specific.
+
+One isolation property is worth stating on its own: **two boxes serving on the same guest port never receive each other's traffic.** A tunnel is bound to the box that produced it, and that holds while both boxes take traffic concurrently.
+
+## Limits
+
+Three properties of this path to design around.
+
+**A `CONNECT` to a stopped box can be accepted before the stream fails.** A successful connect is not proof that the box is running — the accept can land and the stream fail immediately afterwards. Treat your first successful read or write as the readiness signal. For this raw `CONNECT` path, start the box first and check [Stop when idle](/cloud/box-lifecycle#stop-when-idle) if it stops under you. Registered HTTPS service URLs also support [request-triggered startup](/cloud/agent-in-box/hermes#optional-wake-on-a-request); the Hermes guide walks through that service path.
+
+**A response can be lost after `shutdown_write()`.** TCP half-close is not carried end to end, so a guest that waits for end-of-input before it replies may never reply, and a reply already in flight can be dropped. Use a protocol that frames its own messages — a newline, a length prefix, `Content-Length` — instead of one that signals "done" with EOF.
+
+**Direct browser use of a tunnel URL is not covered.** The URL from `uri()` is the address the SDK dials when you call `connect()` or `forward()`. Navigating to it in a browser, and browser authentication for a private box, sit outside the verified path. Drive tunnels from the SDK, and when you want a browser on the service, forward the port to your machine with [Port forwarding](/cloud/port-forwarding).
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| - | - | - |
+| `uri()` returns `None` | The box came from a local runtime, not from `Boxlite.rest(...)`. A local tunnel has no published address | Construct the runtime with `Boxlite.rest(BoxliteRestOptions(url=..., credential=...))` as in [Quickstart](/cloud/quickstart). The endpoint shape is the tell: a local runtime's endpoint is an integer file descriptor, a Cloud runtime's is a URL |
+| A BoxLite error carrying `tunnel connection has already been consumed` | `connect()` or `forward()` already spent that `BoxTunnel` | Call `await box.network.tunnel(port)` again for every connection. Never reuse or cache a tunnel object |
+| `RuntimeError: Box not started. Use 'async with SimpleBox(...) as box:' or call 'await box.start()' first.` | The tunnel was requested before the box was running | `await box.start()` first, then request the tunnel |
+| `InvalidStateError: invalid state: Box <ID> is not public; set public: true before opening a tunnel` | The box has inbound disabled, which is the default since 0.10.5 | Create it with `inbound=InboundNetworkSpec(mode="enabled")` (CLI: `--inbound enabled`), or flip an existing box from the console — see [Network policy](/cloud/network-policy#a-new-box-is-private) |
+| `ValueError: tunnel port must be non-zero` | `0` was passed as the guest port | Pass the port your service actually listens on inside the box |
+| `ValueError: tunnel listener host must be a numeric IP` | `forward()` got a hostname such as `localhost` | Use `SocketAddress.tcp(host="127.0.0.1", port=0)` |
+| `ValueError: tunnel Unix socket path must be absolute` | A relative path was passed to `SocketAddress.unix(...)` | Pass an absolute path, for example `/tmp/boxlite-forward.sock` |
+| `ValueError: max_bytes must be non-zero` | `read(0)` | Pass a real buffer size, for example `read(64 * 1024)` |
+| The connect succeeds and the stream drops immediately | The box is stopped. A `CONNECT` can be accepted before the stream fails | Confirm the box is running and start it if not. If it keeps stopping under you, it is being stopped for being idle — see [Stop when idle](/cloud/box-lifecycle#stop-when-idle) |
+| The connection is established but nothing answers | The service inside the box is bound to `127.0.0.1`. A tunnel arrives on the box's network interface, not on its loopback | Bind `0.0.0.0`, for example `python3 -m http.server 18080 --bind 0.0.0.0`, Flask `app.run(host="0.0.0.0")`, uvicorn `--host 0.0.0.0`. Background: [Network access](/manage-sandbox/network-access) |
+| No reply arrives after `shutdown_write()` | The guest is waiting for end-of-input, and TCP half-close is not carried end to end | Frame the protocol so the guest knows a message is complete without EOF — a newline, a length prefix, or `Content-Length` |
+| An `exec` that starts the server returns exit code `0` but nothing listens | The command was backgrounded, so its exit code says nothing about the server | Read the server's log file back out of the box, as [Serve HTTP](/cloud/serve-http) does with `/tmp/server.log` |
+
+## Next steps
+
+> [card] [Serve HTTP](/cloud/serve-http)
+>
+> Start a server inside a box and reach it over a tunnel.
+
+> [card] [Port forwarding](/cloud/port-forwarding)
+>
+> Publish a box port on your own machine.
+
+> [card] [Raw streams](/cloud/raw-streams)
+>
+> Read and write bytes for a protocol of your own.
+
+> [card] [Network policy](/cloud/network-policy)
+>
+> Who can reach the box, and what the box can reach.

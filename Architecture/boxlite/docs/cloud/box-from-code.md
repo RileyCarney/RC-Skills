@@ -1,0 +1,112 @@
+# Create, reuse, and remove a box from code
+Source: https://docs.boxlite.ai/cloud/box-from-code
+
+The full create-start-use-remove cycle over REST, reusing a box by name, managing one from the console, and passing environment variables.
+
+One runnable script for the whole cycle, plus the two things people get wrong: reusing a box by name, and tearing it down when an exception fires.
+
+## Prerequisites
+
+* An API key from the console, exported as `BOXLITE_API_KEY`. See [API keys](/cloud/api-keys).
+* `pip install boxlite`, and the REST URL exported as `BOXLITE_REST_URL`. See [Quickstart](/cloud/quickstart).
+
+## Create, reuse, and remove a box from code
+
+Name your box. The name is how a second process — a worker, a retry, tomorrow's cron job — finds the same box instead of building a new one.
+
+`name` is a parameter of `rt.create(...)`, not a field of `BoxOptions`. Passing `name=` inside `BoxOptions` fails at construction.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+import os
+
+from boxlite import ApiKeyCredential, Boxlite, BoxliteRestOptions, BoxOptions
+
+BOX_NAME = "nightly-report-runner"
+
+async def main() -> None:
+    box_id = None
+    rt = None
+    try:
+        # export BOXLITE_API_KEY=<YOUR_API_KEY> before running
+        rt = Boxlite.rest(BoxliteRestOptions(
+            url=os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
+            credential=ApiKeyCredential(os.environ["BOXLITE_API_KEY"]),
+        ))
+
+        box = await rt.create(
+            BoxOptions(image="ghcr.io/boxlite-ai/boxlite-agent-base:v0.1.0"),
+            name=BOX_NAME,
+        )
+        box_id = box.id
+        await box.start()
+
+        # REST boxes take command arguments as a list
+        execution = await box.exec("sh", args=["-c", "echo report ready"])
+        output = ""
+        async for line in execution.stdout():
+            output += line
+        result = await execution.wait()
+        print(f"exit code: {result.exit_code}")
+        print(output)
+
+        # any process holding your API key can pick the same box up by name
+        again = await rt.get(BOX_NAME)
+        if again is None:
+            raise RuntimeError(f"box {BOX_NAME} not found")
+        print(f"reused box: {again.id}")
+    except Exception as exc:
+        print(f"cloud box failed: {type(exc).__name__}: {exc}")
+    finally:
+        # remove is called on the runtime, so this script can be run again with the same name
+        if rt is not None and box_id:
+            try:
+                await rt.remove(box_id, force=True)
+            except Exception as exc:
+                print(f"remove failed: {exc}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Three shapes to keep in mind on Cloud:
+
+* `Boxlite.rest(...)` is constructed synchronously; `create`, `start`, `exec`, and `remove` are all awaited.
+* `box.exec("echo", args=["hi"])` takes its arguments as a list.
+* Teardown is `await rt.remove(box.id, force=True)` on the runtime.
+
+`rt.get_or_create(...)` creates a box or reuses an existing one with the same name in a single call. For the state model behind create, start, stop, and remove — and for the signatures of the runtime methods — see [Lifecycle](/manage-sandbox/lifecycle).
+
+## Manage a box from the console
+
+The **Boxes** list is the management surface for a box, so you do not need your own tooling to see what you are running. Each row shows the box name, its id, and its status, and carries two actions:
+
+| Action | What it does |
+| - | - |
+| **Stop** | Stops a running box, keeping its disk |
+| **More** → **Delete** | Removes the box, after a confirmation that warns the action cannot be undone |
+
+BoxLite generates a name for a box you create in the console — a two-word pair such as `golden-lynx` — and a short mixed-case id such as `9z8vat0excp9`. When you create a box from code you pass your own name, which is what makes a box findable later.
+
+Use the list to catch boxes a crashed script left behind. Filter by name, check which are still `RUNNING`, and stop or delete them.
+
+## Environment variables and secrets
+
+`BoxOptions` accepts `env` for plain configuration and `secrets` for values that should not sit in your box's environment or logs. Their shapes differ between Python and Node, and secrets carry extra options such as host scoping, so use the pages that own those tables: [Environment and startup](/manage-sandbox/environment) and [Inject secrets and harden a box](/manage-sandbox/secrets-and-security).
+
+Keep your BoxLite API key out of both. It belongs in the environment of the process that calls `Boxlite.rest(...)`, not inside the box.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| - | - | - |
+| `BoxOptions(name="my-box")` fails with a no-such-field error | `name` belongs to the create call | Use `await rt.create(BoxOptions(...), name="my-box")` |
+| `box.exec("sh", "-c", "echo hi")` fails on Cloud | REST boxes take arguments as a list | Use `box.exec("sh", args=["-c", "echo hi"])` |
+| `await box.remove()` raises an attribute error | Removal happens on the runtime | Use `await rt.remove(box.id, force=True)` |
+| A box is still billing after your script crashed | The script died before its cleanup ran | Open the **Boxes** list and stop or delete the leftovers, or list them from code with `await rt.list_info()` and remove each with `await rt.remove(box_id, force=True)`. Setting **Delete after stopping** on future boxes lets the platform reclaim them for you |
+
+## Next steps
+
+> [card] [Boxes](/cloud/boxes)
+>
+> Everything else about configuring a box on Cloud.

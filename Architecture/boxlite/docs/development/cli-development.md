@@ -1,0 +1,134 @@
+# CLI development guide
+Source: https://docs.boxlite.ai/development/cli-development
+
+Build, test, and extend the boxlite command — implemented in the boxlite-cli crate under src/cli/.
+
+The CLI is a thin front end over the runtime: it parses arguments, builds the same `BoxOptions` the SDKs use, and dispatches to a runtime created from a per-invocation home directory. Knowing that shape is what lets you add a subcommand without re-implementing runtime behavior. Style rules are in the [Rust style guide](/development/rust-style).
+
+## Prerequisites
+
+* The BoxLite source repository, with the Rust toolchain installed (`rustup` default stable). Prefer the `make` targets over calling `cargo` directly.
+* Familiarity with [clap](https://docs.rs/clap), [assert_cmd](https://docs.rs/assert_cmd), and [predicates](https://docs.rs/predicates), which the CLI and its tests use.
+
+## Building the CLI
+
+From the repository root:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+make cli
+```
+
+`make cli` depends on `runtime:debug`, so it builds the debug runtime first (if needed), then runs `cargo build -p boxlite-cli`. The binary is produced at:
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+./target/debug/boxlite
+```
+
+Run it with `./target/debug/boxlite --help`. For a release build:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+make cli:release   # depends on the release runtime, then: cargo build -p boxlite-cli --release
+```
+
+The release binary is at `./target/release/boxlite`.
+
+## Quick Example — run the CLI integration tests
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Builds the debug runtime first, then runs the CLI integration suite.
+make test:integration:cli
+```
+
+This is the same target CI runs (see [Integration tests](/development/e2e-local)). It uses `--no-fail-fast` so one failing test does not hide the rest. Pass `FILTER=<pattern>` to narrow the run:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+make test:integration:cli FILTER=test_run_exit_code
+```
+
+## CLI test layout
+
+The integration tests live under `src/cli/tests/`:
+
+* **Entry points:** `src/cli/tests/*.rs` — roughly one file per command (for example `run.rs`, `create.rs`, `exec.rs`, `list.rs`, `rm.rs`, `pull.rs`, `images.rs`, `inspect.rs`, `info.rs`, `start.rs`, `stop.rs`, `restart.rs`, `auth.rs`, `completion.rs`), plus a few cross-cutting suites such as `lifecycle_journey.rs` and `registry.rs`.
+* **Shared setup:** `src/cli/tests/common/mod.rs` provides a `TestContext` and the constructor functions that build it.
+
+`common::boxlite()` returns a `TestContext` that:
+
+* Resolves the binary under test from the `CARGO_BIN_EXE_boxlite` environment variable (set by Cargo for the integration test binary).
+* Allocates a **per-test, isolated home directory** via `PerTestBoxHome` (from the `boxlite-test-utils` crate) and passes it with `--home`. The image/rootfs cache is symlinked in read-only and shared across tests, while the database and `boxes/` directory are per-test and writable — so tests do not contend over a single global home, and the per-test home is cleaned up automatically on drop.
+* Applies the test registries (`--registry`) so image references resolve against the test mirrors.
+* Sets a 60-second per-command timeout on the `assert_cmd::Command`.
+* Exposes `cleanup_box(name)` / `cleanup_boxes(names)` helpers and `new_cmd()` to issue additional commands against the same home.
+
+Use `common::boxlite_bare()` instead when a test needs full control over which registries are used (it skips the default `--registry` flags).
+
+The first `PerTestBoxHome` constructed in a test process triggers a one-time warm-up of a shared cache: it pre-pulls the standard test images (`alpine:latest`, `python:alpine`) under a cross-process lock and warms the guest rootfs pipeline. Subsequent tests reuse that cache, which keeps the suite fast and avoids registry rate limits.
+
+## Writing a test
+
+Tests use `assert_cmd::Command` to invoke the binary and `predicates` to assert exit codes and stdout/stderr. Always start from `common::boxlite()` (or `boxlite_bare()`), and clean up any boxes the test creates — either by passing `--rm` to the command or by calling `ctx.cleanup_box(...)`.
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+use predicates::prelude::*;
+
+mod common;
+
+#[test]
+fn test_run_exit_code_success() {
+    let mut ctx = common::boxlite();
+    ctx.cmd
+        .args(["run", "--rm", "alpine:latest", "sh", "-c", "exit 0"]);
+    ctx.cmd.assert().success();
+}
+
+#[test]
+fn test_run_exit_code_custom() {
+    let mut ctx = common::boxlite();
+    ctx.cmd
+        .args(["run", "--rm", "alpine:latest", "sh", "-c", "exit 42"]);
+    ctx.cmd.assert().code(42);
+}
+```
+
+`PerTestBoxHome` has a drop guard that fails the test if a box's shim is left alive when the home is torn down, so a missing cleanup surfaces as a test failure rather than a leaked microVM.
+
+## Code structure
+
+* **Entry:** `src/cli/src/main.rs` — parses the CLI and dispatches each `Commands` variant to the matching `commands::*::execute(args, &global)` (for example `commands::run::execute`).
+* **Subcommands and flags:** `src/cli/src/cli.rs` — the clap definitions: `Cli`, `Commands`, `GlobalFlags`, `ProcessFlags`, `ResourceFlags`, `NetworkFlags`, `PublishFlags`, `VolumeFlags`, `CapabilityFlags`, `KernelFlags`, and `ManagementFlags`. `GlobalFlags` carries `--home` and registry flags and exposes helpers for building the runtime and applying flag groups to `BoxOptions`.
+* **Command implementations:** `src/cli/src/commands/*.rs` — one module per command (with `auth/` and `serve/` as submodule trees). Each exposes an `execute(args, global)` and shares runtime-construction helpers from `GlobalFlags`.
+
+## Adding a new subcommand
+
+1. Add a new variant to `Commands` in `src/cli/src/cli.rs`, along with its `Args` type (or reuse existing flag groups such as `ProcessFlags` / `ResourceFlags`).
+2. Add the new module to `src/cli/src/commands/mod.rs` and implement `execute(args, &global)` in `src/cli/src/commands/<command>.rs`.
+3. In `src/cli/src/main.rs`, add a `cli::Commands::<Variant>(args) => commands::<command>::execute(args, &global).await...` arm to the dispatch `match`.
+4. Add tests in `src/cli/tests/<command>.rs` (start from `common::boxlite()`) and run `make test:integration:cli`.
+
+## Parameters & Returns
+
+| Target / item | What it does |
+| - | - |
+| `make cli` | Build the debug CLI (after building the debug runtime). |
+| `make cli:release` | Build the release CLI (after building the release runtime). |
+| `make test:integration:cli` | Run the CLI integration suite with `--no-fail-fast` (supports `FILTER=<pattern>`). |
+| `make test:integration:core` | Run the core integration suites (Rust + CLI). |
+| `make test` | Run only the suites for changed components (`make test:changed`); a CLI change runs the CLI integration suite. |
+| `common::boxlite()` | A `TestContext` with default registries and a per-test isolated home. |
+| `common::boxlite_bare()` | A `TestContext` with no default registries (for full registry control). |
+| `ctx.cleanup_box(name)` | Force-remove a box created during the test. |
+| `CARGO_BIN_EXE_boxlite` | Cargo-provided path to the CLI binary under test. |
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| - | - | - |
+| `make test:integration:cli` fails to boot a VM | No hardware virtualization | Linux: confirm `/dev/kvm` is accessible and your user is in the `kvm` group; macOS Apple Silicon needs no `/dev/kvm`. See [Integration tests](/development/e2e-local). |
+| A test fails on drop with a "live shim" message | The test created a box but did not remove it | Pass `--rm` to the command, or call `ctx.cleanup_box(...)` before the test ends. |
+| Image pulls are slow or rate-limited on the first test | The shared cache has not been warmed yet | The first `PerTestBoxHome` warms the cache once per process; subsequent tests reuse it. Re-run after the warm-up completes. |
+| A new subcommand compiles but is never invoked | The dispatch arm in `main.rs` is missing | Add the `cli::Commands::<Variant>(...)` arm to the `match` in `src/cli/src/main.rs`. |
+
+## See also
+
+* [Integration tests](/development/e2e-local) — how the integration tests run in CI and how to reproduce them locally.
+* [Rust Style Guide](/development/rust-style) — coding standards for the BoxLite crates.

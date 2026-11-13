@@ -1,0 +1,235 @@
+# Go SDK reference
+Source: https://docs.boxlite.ai/reference/go
+
+github.com/boxlite-ai/boxlite/sdks/go is a CGO binding over the same Rust core every other SDK uses. It has no high-level wrapper like Python's SimpleBox — you drive *Runtime and *Box directly, with functional options in place of keyword arguments.
+
+Every signature below is verified against the built module (`go get github.com/boxlite-ai/boxlite/sdks/go@v0.9.7` + `go run .../cmd/setup`, then `go build`) and, where marked, against a real run's output.
+
+***
+
+## Prerequisites
+
+* Go 1.24+ with CGO enabled (the default) — see [Go quickstart](/getting-started/quickstart) for the full install flow (`go get` + `cmd/setup`).
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+go get github.com/boxlite-ai/boxlite/sdks/go
+go run github.com/boxlite-ai/boxlite/sdks/go/cmd/setup
+```
+
+***
+
+## Core types and methods
+
+### `*Runtime`
+
+| Function / Method | Signature | Description |
+| - | - | - |
+| `NewRuntime` | `func(opts ...RuntimeOption) (*Runtime, error)` | Construct a runtime |
+| `WithHomeDir` | `func(dir string) RuntimeOption` | Runtime's home directory |
+| `WithImageRegistry` / `WithImageRegistries` | `func(...ImageRegistry) RuntimeOption` | Configure image pull registries |
+| `Create` | `func(ctx, image string, opts ...BoxOption) (*Box, error)` | Create a box |
+| `GetOrCreate` | `func(ctx, image string, opts ...BoxOption) (*Box, bool, error)` | Get by name or create; `bool` is `true` when newly created |
+| `Get` | `func(ctx, idOrName string) (*Box, error)` | Look up an existing box |
+| `ListInfo` | `func(ctx) ([]BoxInfo, error)` | List all boxes |
+| `GetInfo` | `func(ctx, idOrName string) (*BoxInfo, error)` | Metadata without building a handle |
+| `Remove` / `ForceRemove` | `func(ctx, idOrName string) error` | Delete; `ForceRemove` also removes a running box |
+| `Metrics` | `func(ctx) (*RuntimeMetrics, error)` | Aggregate metrics |
+| `Images` | `func() (*Images, error)` | Image-management handle (`Pull` / `List` / `Close`) |
+| `Shutdown` | `func(ctx, timeout time.Duration) error` | Graceful shutdown of every box |
+| `Close` | `func() error` | Release the runtime |
+
+### `*Box`
+
+| Method | Signature | Description |
+| - | - | - |
+| `ID` / `Name` | `func() string` | Identifiers |
+| `Info` | `func(ctx) (*BoxInfo, error)` | Metadata |
+| `Start` | `func(ctx) error` | Idempotent explicit start |
+| `Exec` | `func(ctx, name string, arg ...string) (*ExecResult, error)` | Run a command and wait |
+| `StartExecution` | `func(ctx, name string, args []string, opts *ExecutionOptions) (*Execution, error)` | Lower-level: returns a handle you drive yourself |
+| `Command` | `func(name string, arg ...string) *Cmd` | Build a command in the shape of `os/exec` |
+| `Metrics` | `func(ctx) (*BoxMetrics, error)` | Per-box metrics |
+| `Stop` | `func(ctx) error` | Stop the VM |
+| `CopyInto` | `func(ctx, hostSrc, guestDst string) error` | Copy a file/dir into the box |
+| `CopyOut` | `func(ctx, guestSrc, hostDst string) error` | Copy a file/dir out of the box |
+| `Close` | `func() error` | Release the handle |
+
+> **A failed `Exec`/`StartExecution` returns `(nil, err)`.** Check `err` before touching the result — a nil-pointer dereference on the result is a real, reproduced panic if you skip this.
+
+### `*Cmd` (from `Box.Command`)
+
+| Method | Signature | Description |
+| - | - | - |
+| `Run` | `func(ctx) error` | Run and wait |
+| `Output` | `func(ctx) ([]byte, error)` | Run and capture stdout |
+| `CombinedOutput` | `func(ctx) ([]byte, error)` | Run and capture stdout+stderr merged |
+| `ExitCode` | `func() int` | Exit code after `Run`/`Output`/`CombinedOutput` returns |
+
+> **Differs from `os/exec`.** The standard library's `Cmd.Run`/`Output` return a `*exec.ExitError` on a non-zero exit. BoxLite's `Cmd` returns `nil` in that case — read `ExitCode()` yourself, matching `Box.Exec`'s own non-throwing behavior.
+
+### `ExecResult` (from `Exec`)
+
+| Field | Type | Description |
+| - | - | - |
+| `ExitCode` | `int` | Exit code (0 = success) |
+| `Stdout` / `Stderr` | `string` | Captured output |
+
+### `*Execution` (from `StartExecution`) / `ExecutionOptions`
+
+| Member | Signature | Description |
+| - | - | - |
+| `ExecutionOptions.Env` | `map[string]string` | Serialized as a flat `[k0, v0, k1, v1, ...]` array in deterministic key order |
+| `ExecutionOptions.WorkingDir` | `string` | Empty inherits the container default |
+| `ExecutionOptions.Timeout` | `time.Duration` | Zero means unbounded |
+| `ExecutionOptions.TTY` | `bool` | Allocate a pseudo-terminal |
+| `Write` | `func([]byte) (int, error)` | Write to the process's stdin |
+| `Wait` | `func(ctx) (int, error)` | Block for the exit code |
+| `Kill` | `func(ctx) error` | Send SIGKILL |
+| `Signal` | `func(ctx, sig int) error` | Send an arbitrary signal |
+| `ResizeTTY` | `func(ctx, rows, cols int) error` | Resize an allocated pseudo-terminal |
+| `Close` | `func() error` | Release the execution handle |
+
+### Functional options (`BoxOption`)
+
+| Option | Signature | Notes |
+| - | - | - |
+| `WithName` | `func(string) BoxOption` | — |
+| `WithCPUs` | `func(int) BoxOption` | vCPUs |
+| `WithMemory` | `func(int) BoxOption` | MiB |
+| `WithDiskSize` | `func(int) BoxOption` | GB |
+| `WithRootfsPath` | `func(string) BoxOption` | Use a prepared rootfs instead of an image |
+| `WithEnv` | `func(key, value string) BoxOption` | **One pair per call** — call it once per variable, unlike `ExecutionOptions.Env`'s map |
+| `WithVolume` | `func(hostPath, guestPath string) BoxOption` | Read-write mount |
+| `WithVolumeReadOnly` | `func(hostPath, guestPath string) BoxOption` | Read-only mount — a **separate option**, not a boolean flag on `WithVolume` |
+| `WithPort` | `func(PortSpec) BoxOption` | Forward a port |
+| `WithWorkDir` | `func(string) BoxOption` | Working directory |
+| `WithEntrypoint` / `WithCmd` | `func(...string) BoxOption` | Override the image's entrypoint/cmd |
+| `WithNetwork` | `func(NetworkSpec) BoxOption` | Network policy |
+| `WithSecret` | `func(Secret) BoxOption` | Inject a credential |
+| `WithAutoPauseInterval` | `func(seconds uint32) BoxOption` | Idle time before AutoPause |
+| `WithAutoDeleteInterval` | `func(seconds uint32) BoxOption` | `0` keeps the box after `Stop`; `n > 0` deletes after `n` seconds (locally: immediately) |
+| `WithAutoResumeEnabled` | `func(bool) BoxOption` | Resume-on-access after AutoPause |
+| `WithAutoRemove` | `func(bool) BoxOption` | **Deprecated** — superseded by `WithAutoDeleteInterval`, which takes precedence when set |
+| `WithDetach` | `func(bool) BoxOption` | Survive the creating process |
+| `WithAdvancedOptions` | `func(*AdvancedBoxOptions) BoxOption` | Security hardening; see `AdvancedBoxOptions` below |
+
+### `BoxInfo`
+
+| Field | Type | Description |
+| - | - | - |
+| `ID` / `Name` / `Image` | `string` | Identifiers |
+| `State` | `State` (a `string` type) | `"configured"` / `"running"` / `"stopping"` / `"stopped"` are the constants this binding exposes (`StateConfigured` etc.); the underlying core also has `paused` and `failed` states, which can appear as raw strings even without a matching Go constant |
+| `Running` | `bool` | Convenience flag |
+| `PID` | `int` | Guest process ID |
+| `CPUs` / `MemoryMiB` | `int` | Allocated resources |
+| `AutoPause` / `AutoDelete` | `uint32` | Configured intervals, in seconds |
+| `AutoResume` | `bool` | — |
+| `CreatedAt` | `time.Time` | — |
+
+### `RuntimeMetrics` / `BoxMetrics`
+
+| Type | Fields |
+| - | - |
+| `RuntimeMetrics` | `BoxesCreatedTotal`, `BoxesFailedTotal`, `RunningBoxes` (**no** `Num` prefix, unlike Node's `numRunningBoxes`), `TotalCommandsExecuted`, `TotalExecErrors` |
+| `BoxMetrics` | `CPUPercent`, `MemoryBytes`, `CommandsExecuted`, `ExecErrors`, `BytesSent`, `BytesReceived`, `CreateDurationMs`, `BootDurationMs`, `NetworkBytesSent`, `NetworkBytesReceived`, `NetworkTCPConns`, `NetworkTCPErrors` |
+
+### Error handling
+
+Errors are `*boxlite.Error`, with `.Code` an `ErrorCode` and `.Message` a string; `Error() string` formats both.
+
+| Code | Value | Meaning |
+| - | - | - |
+| `ErrInternal` | 1 | Internal/unclassified error |
+| `ErrNotFound` | 2 | Box or resource does not exist |
+| `ErrAlreadyExists` | 3 | — |
+| `ErrInvalidState` | 4 | Operation not valid for the box's current state |
+| `ErrInvalidArgument` | 5 | — |
+| `ErrConfig` | 6 | — |
+| `ErrStorage` | 7 | — |
+| `ErrImage` | 8 | Pull/build failure |
+| `ErrNetwork` | 9 | — |
+| `ErrExecution` | 10 | Command failed to start (spawn failure) |
+| `ErrStopped` | 11 | — |
+| `ErrEngine` | 12 | VM engine error |
+| `ErrUnsupported` | 13 | — |
+| `ErrDatabase` | 14 | — |
+| `ErrPortal` | 15 | — |
+| `ErrRpc` / `ErrRpcTransport` | 16 / 17 | — |
+| `ErrMetadata` | 18 | — |
+| `ErrUnsupportedEngine` | 19 | — |
+| `ErrResourceExhausted` | 20 | Disk full / VM slot exhaustion; REST servers return HTTP 429 |
+| `ErrSessionReaped` | 21 | An interactive session was reaped after disconnect; start a new exec instead of reattaching. REST servers return HTTP 410 |
+
+Typed helpers: `IsNotFound(err)` / `IsAlreadyExists(err)` / `IsInvalidState(err)` / `IsStopped(err)`.
+
+Verified: a start failure (missing binary) produced
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite: internal error: spawn_failed: ... executable 'definitely-not-a-binary' not found in $PATH (code=1)
+```
+
+— `code=1` is `ErrInternal`, not `ErrExecution`; do not assume a spawn failure is always `ErrExecution`.
+
+***
+
+## Troubleshooting
+
+### Nil-pointer dereference after a failed `Exec`
+
+See the [Go quickstart](#a-failed-exec-panics-with-a-nil-pointer-dereference) — a start failure returns `(nil, err)`; check `err` first.
+
+### `Cmd.Run`/`Output` return `nil` on a non-zero exit
+
+This is intentional and matches `Box.Exec`, but it is the opposite of `os/exec`'s behavior — see the [Go quickstart](#a-non-zero-exit-code-was-not-reported-as-an-error).
+
+### `ld: warning: ignoring duplicate libraries: '-lresolv'`
+
+A harmless link-time warning on macOS, reproduced on every build against this SDK; not an error.
+
+### `context deadline exceeded` from `cmd/setup`
+
+The one-time native-library download can exceed the tool's internal timeout on a slow connection. Re-running it resumes from whatever was already extracted — see the [Go quickstart](#setup-download-times-out).
+
+***
+
+## Next steps
+
+* [Go quickstart](/getting-started/quickstart) for the full install flow and a runnable first program.
+* [Box types](/manage-sandbox/sandbox-types) and [Manage sandboxes](/manage-sandbox/index) for the capabilities every SDK shares, expressed here as `BoxOption` functional options instead of keyword arguments.
+
+## Go-specific troubleshooting
+
+Carried over from the per-language quickstart, which is now one page for all languages.
+
+### Setup download times out
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+boxlite-setup: download failed: tar: context deadline exceeded (Client.Timeout or context cancellation while reading body)
+```
+
+`cmd/setup` downloads a large (\~100+ MB) archive under a fixed timeout. On a slow connection this can fail partway through — reproduced on this machine after successfully extracting `libboxlite.a` but before reaching `boxlite.h`. Re-run `go run github.com/boxlite-ai/boxlite/sdks/go/cmd/setup`; it detects the already-extracted files and resumes from there. It succeeded on the fourth attempt in this environment.
+
+### A failed `Exec` panics with a nil-pointer dereference
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+panic: runtime error: invalid memory address or nil pointer dereference
+```
+
+A start failure (for example, a missing binary) returns `(nil, err)` from `Exec`, not a `res` with a nonzero `ExitCode`. Always check `err` before reading `res`:
+
+```go theme={"theme":{"light":"github-light","dark":"github-dark"}}
+res, err := box.Exec(ctx, "definitely-not-a-binary")
+if err != nil {
+	log.Fatal(err) // res is nil here — do not dereference it
+}
+fmt.Println(res.ExitCode)
+```
+
+### A non-zero exit code was not reported as an error
+
+`Exec`, `Cmd.Run`, and `Cmd.Output` all return `nil` for `err` when the command itself ran and simply exited non-zero — check `ExitCode` yourself:
+
+```go theme={"theme":{"light":"github-light","dark":"github-dark"}}
+res, _ := box.Exec(ctx, "sh", "-c", "exit 7")
+fmt.Println(res.ExitCode) // 7, err was nil
+```

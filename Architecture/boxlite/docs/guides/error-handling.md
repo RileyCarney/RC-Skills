@@ -1,0 +1,346 @@
+# Error handling
+Source: https://docs.boxlite.ai/guides/error-handling
+
+Tell command failure, timeout, parse failure, and low-level runtime errors apart — and recover from each separately.
+
+One fact shapes everything else: **`box.exec(...)` does not raise on a non-zero exit code.** It returns an `ExecResult` and leaves the decision to you. The `BoxliteError` hierarchy covers the other failures.
+
+## Which failures actually raise
+
+| Failure scenario | Python raises | Node throws | Catchable by `except BoxliteError`? |
+| - | - | - | - |
+| Command non-zero exit | Does not raise (returns ExecResult) | Does not throw (returns ExecResult) | — |
+| Missing command binary (spawn failure) | Raises `RuntimeError` (message contains `spawn_failed: ... not found in $PATH`) | Throws a bare `Error` (message contains `spawn_failed`) | No (Python: catch with `except RuntimeError`; Node: catch in the `else` branch) |
+| Image pull failure (network instability, etc.) | `RuntimeError` | `Error` | No |
+| Virtualization unavailable / box fails to start | `RuntimeError` | `Error` | No |
+| `SimpleBox` missing both `image` and `rootfs_path` | `ValueError` | Construction error | No |
+| Calling `id`/`info`/`exec`/`stop` before start | `RuntimeError` | Throws | No |
+| The third volume element is a string (should be bool) | `TypeError` | Type error | No |
+
+> Practical takeaway: catch in the order **specific subclasses
+> (`ExecError`/`TimeoutError`/`ParseError`) -> `BoxliteError` -> standard
+> `RuntimeError`/`Error`**, otherwise low-level failures escape.
+
+***
+
+## Handling all four in one place
+
+The most concise, directly runnable robust execution pattern: run a command,
+check the exit code, raise `ExecError` on failure, and catch every possible
+failure.
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+from boxlite import SimpleBox, ExecError, TimeoutError, BoxliteError
+
+async def main() -> None:
+    try:
+        # SimpleBox is an async context manager; the box is actually created and started only on entry
+        async with SimpleBox(image="alpine:latest") as box:
+            # A non-zero exit code does NOT raise; it returns an ExecResult; check exit_code yourself
+            result = await box.exec("sh", "-c", "echo hello && exit 0")
+            if result.exit_code != 0:
+                # Promote a command failure to an exception so upper layers handle it uniformly
+                raise ExecError(
+                    command="sh -c 'echo hello && exit 0'",
+                    exit_code=result.exit_code,
+                    stderr=result.stderr,
+                )
+            print("stdout:", result.stdout.strip())
+
+    except ExecError as e:
+        # The command itself failed (non-zero exit)
+        print(f"command failed: {e.command} -> exit {e.exit_code}\n{e.stderr}")
+    except TimeoutError as e:
+        # Operation timed out
+        print(f"operation timed out: {e}")
+    except BoxliteError as e:
+        # Other BoxLite-layer errors
+        print(f"BoxLite error: {e}")
+    except RuntimeError as e:
+        # Low-level failures (image pull failure / virtualization unavailable) raise a standard RuntimeError, not BoxliteError
+        print(f"runtime failure (check virtualization/network): {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import { SimpleBox, ExecError, BoxliteError } from "@boxlite-ai/boxlite";
+
+async function main(): Promise<void> {
+  try {
+    // SimpleBox implements Symbol.asyncDispose; use await using for automatic cleanup
+    await using box = new SimpleBox({ image: "alpine:latest" });
+
+    const result = await box.exec("sh", "-c", "echo hello && exit 0");
+    if (result.exitCode !== 0) {
+      throw new ExecError(
+        "sh -c 'echo hello && exit 0'",
+        result.exitCode,
+        result.stderr,
+      );
+    }
+    console.log("stdout:", result.stdout.trim());
+  } catch (err) {
+    if (err instanceof ExecError) {
+      console.error(`command failed: ${err.command} -> exit ${err.exitCode}\n${err.stderr}`);
+    } else if (err instanceof BoxliteError) {
+      console.error(`BoxLite error: ${(err as Error).message}`);
+    } else {
+      console.error(`low-level failure: ${(err as Error).message}`);
+    }
+  }
+}
+
+main();
+```
+
+***
+
+## Parameters and Returns
+
+### Exception hierarchy
+
+All SDK-layer errors inherit from `BoxliteError`, so `except BoxliteError` /
+`instanceof BoxliteError` catches every error the SDK actively raises.
+
+| Exception class | Inherits from | When raised | Key attributes |
+| - | - | - | - |
+| `BoxliteError` | `Exception` (Py) / `Error` (TS) | Base class for all BoxLite SDK-layer errors | `message` |
+| `ExecError` | `BoxliteError` | Command execution failed (**you must check the exit code and raise it yourself**; the SDK does not auto-raise on non-zero exit) | `command` / `exit_code` (`exitCode`) / `stderr` |
+| `TimeoutError` | `BoxliteError` | Operation timed out (e.g. waiting for desktop/browser readiness) | `message` |
+| `ParseError` | `BoxliteError` | Failed to parse structured output (e.g. parsing coordinates/JSON) | `message` |
+
+> Note: Python's `boxlite.TimeoutError` is a subclass of `BoxliteError`, **not**
+> Python's built-in `builtins.TimeoutError`. If you import both, use an alias to
+> disambiguate.
+
+### `ExecError` constructor parameters (Python)
+
+| Parameter | Type | Required | Description |
+| - | - | - | - |
+| `command` | `str` | Yes | The failed command string |
+| `exit_code` | `int` | Yes | The non-zero exit code |
+| `stderr` | `str` | Yes | The command's standard error output |
+
+### `ExecError` constructor parameters (Node, positional)
+
+| Positional argument | Type | Required | Description |
+| - | - | - | - |
+| `command` | `string` | Yes | The failed command |
+| `exitCode` | `number` | Yes | The non-zero exit code |
+| `stderr` | `string` | Yes | Standard error output |
+
+### `ExecResult` (the return value of `box.exec(...)`, **not** an exception)
+
+This is the core of robust error handling: check the return value first, then
+decide whether to raise.
+
+| Field (Python) | Field (Node) | Type | Description |
+| - | - | - | - |
+| `exit_code` | `exitCode` | `int` / `number` | Process exit code; `0` success, non-zero failure. **The SDK does not raise on this** |
+| `stdout` | `stdout` | `str` / `string` | Standard output |
+| `stderr` | `stderr` | `str` / `string` | Standard error |
+| `error_message` | — | `str \| None` | Python only; non-None when the process died abnormally |
+
+> Note: the `stdout`/`stderr` above apply to the `ExecResult` returned by the
+> **high-level `SimpleBox.exec(...)`**. If you use the **native**
+> `await (await box.exec(...)).wait()` path, its `ExecResult` **has only
+> `exit_code` and `error_message`** — accessing `.stdout`/`.stderr` raises
+> `AttributeError`. To get output, use `SimpleBox.exec`.
+
+## Recommended wrapper: a `run_checked` that raises `ExecError`
+
+Wrap "check the exit code + raise ExecError" into a helper so that the upper
+layer only needs a single try/except style.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+from boxlite import SimpleBox, ExecError, TimeoutError, BoxliteError
+
+async def run_checked(box: SimpleBox, cmd: str, *args: str, timeout: float | None = None):
+    """Run a command; raise ExecError on non-zero exit. timeout is a float in seconds."""
+    # SimpleBox.exec's timeout parameter is named timeout (float); the native Box.exec uses timeout_secs
+    result = await box.exec(cmd, *args, timeout=timeout)
+    if result.exit_code != 0:
+        full_cmd = " ".join([cmd, *args])
+        raise ExecError(command=full_cmd, exit_code=result.exit_code, stderr=result.stderr)
+    return result.stdout
+
+async def main() -> None:
+    try:
+        async with SimpleBox(image="alpine:latest") as box:
+            out = await run_checked(box, "sh", "-c", "echo ok", timeout=10.0)
+            print("ok:", out.strip())
+
+            # This one fails with exit code 7 -> raises ExecError
+            await run_checked(box, "sh", "-c", "echo boom 1>&2; exit 7")
+
+    except ExecError as e:
+        print(f"command failed: '{e.command}' exit={e.exit_code} stderr={e.stderr.strip()}")
+    except TimeoutError as e:
+        print(f"timed out: {e}")
+    except BoxliteError as e:
+        print(f"BoxLite error: {e}")
+    except RuntimeError as e:
+        print(f"low-level runtime failure: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Distinguishing a timeout from a general failure
+
+> **Key fact**: when `SimpleBox.exec(timeout=...)` hits a timeout it **does not
+> raise `boxlite.TimeoutError`** — it terminates the process on the sandbox
+> side with `SIGTERM` and returns `ExecResult(exit_code == -15)`. So in the
+> example below, `sleep 5 / timeout=1.0` reaches `print("exit_code:",
+> result.exit_code)` and prints `-15`; the `except TimeoutError` branch **does
+> not fire**. Always detect a timeout by **checking `result.exit_code`**
+> (negative = terminated by signal); do not rely on `except TimeoutError`.
+>
+> `boxlite.TimeoutError` mainly models a higher-level SDK "waited for a
+> readiness state and timed out" (e.g. waiting for desktop/browser readiness),
+> not an `exec` command timeout.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+from boxlite import SimpleBox, TimeoutError, ExecError, BoxliteError
+
+async def main() -> None:
+    try:
+        async with SimpleBox(image="alpine:latest") as box:
+            # Give a 1-second timeout while the command deliberately sleeps 5 seconds
+            result = await box.exec("sh", "-c", "sleep 5", timeout=1.0)
+            # Timeout does not raise; it returns exit_code == -15 (SIGTERM). Detect timeout here.
+            if result.exit_code < 0:
+                print(f"command killed by signal (likely a timeout), exit_code={result.exit_code}; retry or increase timeout")
+            else:
+                print("exit_code:", result.exit_code)
+
+    except TimeoutError:
+        # Note: an exec timeout does not reach here (see explanation above); this branch is for high-level "readiness wait" timeouts
+        print("readiness wait timed out; retry or increase timeout")
+    except ExecError as e:
+        print(f"command failed: {e}")
+    except BoxliteError as e:
+        print(f"BoxLite error: {e}")
+    except RuntimeError as e:
+        print(f"low-level failure: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+***
+
+## Troubleshooting
+
+### You try/except `ExecError`, but a command failure is not caught
+
+**Cause**: `box.exec(...)` **does not raise** on a non-zero command exit; it
+returns `ExecResult(exit_code != 0)`.
+**Fix**: after running, check `result.exit_code` (Node: `result.exitCode`) and
+`raise ExecError(...)` yourself on failure, or use the `run_checked` wrapper
+above.
+
+### A missing command raises — and which error you get depends on *which* command
+
+Two different commands can be missing, and they fail differently. Neither returns an
+`ExecResult`, so never read `exit_code` to detect them.
+
+| What is missing | When it fails | Python | Message |
+| - | - | - | - |
+| The **main command** — your `entrypoint` / `cmd` | `start()`, before the box is usable | `InvalidArgumentError` | `invalid argument: executable 'httpd' not found in $PATH` |
+| A command you passed to **`exec`** | The `exec` call | `InternalError` | `internal error: spawn_failed: internal error: build failed: ... executable 'httpd' not found in $PATH` |
+
+The main command's clean, single-sentence error arrived in 0.10.6; before that it was
+three stacked `internal error:` prefixes carrying the container id and bundle path.
+
+> [!WARNING]
+>
+> **Both are `BoxliteError`s.** Every native error inherits
+> `BoxliteError` and `RuntimeError`:
+>
+> ```
+> InternalError -> _NativeError -> BoxliteError -> RuntimeError -> Exception
+> ```
+>
+> So `except BoxliteError` catches a spawn failure, and any `except RuntimeError`
+> placed after it is dead code that never runs. Order your handlers by specificity —
+> `except InvalidArgumentError` before `except BoxliteError` — rather than expecting
+> spawn failures to escape the `BoxliteError` branch.
+
+**Node** is the exception to that rule: `SimpleBox.exec` throws a **bare `Error`** on
+spawn failure — `err instanceof BoxliteError === false`, `err.code === "GenericFailure"`
+— with the same `spawn_failed` message. Catch it in the `else` branch after your
+`BoxliteError` check.
+
+### `from boxlite import TimeoutError` collides with Python's built-in `TimeoutError`
+
+**Cause**: `boxlite.TimeoutError` is a subclass of `BoxliteError` — the same
+name as `builtins.TimeoutError` but a different class.
+**Fix**: import with an alias:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+from boxlite import TimeoutError as BoxliteTimeoutError
+```
+
+### Passing the volume string `"ro"`/`"rw"` raises `TypeError`
+
+**Error message**: `TypeError: argument 'volumes': 'str' object cannot be cast as 'bool'`.
+**Cause**: the SDK's third volume element is the **bool `read_only`** (`True` =
+read-only / `False` = read-write), not the CLI's `"ro"`/`"rw"` string.
+**Fix**:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Correct: the third element is a bool; a 2-tuple also works (default read-write)
+from boxlite import BoxOptions
+opts = BoxOptions(
+    image="alpine:latest",
+    volumes=[("/host/data", "/data", True)],  # True = read-only
+)
+# Wrong: volumes=[("/host/data", "/data", "ro")]  -> TypeError
+```
+
+> Note: only the **CLI**'s `-v host:box:ro` syntax uses `ro`/`rw` strings; the
+> SDK API uses a bool, so do not confuse them.
+
+### Image pull failure / network instability
+
+**Error message**: `RuntimeError` (not `BoxliteError`).
+**Fix**: catch with `except RuntimeError` and retry (retry needs network access
+and a correctly spelled image reference). Always be online for the first run.
+
+### Box fails to start: no virtualization
+
+**Cause**: BoxLite needs Linux + KVM/hardware virtualization; macOS uses the
+built-in Hypervisor.framework (no /dev/kvm required); WSL2 needs KVM with the
+user in the `kvm` group. Without virtualization, the box cannot start.
+**Symptom**: entering `async with SimpleBox(...)` or the first `exec` raises
+`RuntimeError` (Python) / `Error` (Node); the process itself does not crash and
+can be caught and degraded with try/except.
+**Fix**: run in an environment that supports virtualization; in CI, confirm
+`/dev/kvm` is mounted and permissioned.
+
+### C SDK: the command failure code and the API call error code are two distinct concepts
+
+In the C SDK you likewise distinguish two layers: the API call itself returns a
+`BoxliteErrorCode` (such as `NotFound=2`, `InvalidArgument=5`), while the command
+process's exit code is reported separately in `ExecResult.exit_code` — an API
+return of `Ok` does not mean the command succeeded. See
+`examples/c/04_error_handling.c`:
+
+```c theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// The API call succeeded (code==Ok), but you still must check the process exit code separately
+BoxliteErrorCode code = boxlite_simple_run(box, "/bin/ls", args, 1, &result, &error);
+if (code == Ok) {
+  printf("API ok, process exit code=%d\n", result->exit_code);  // may be non-zero
+  boxlite_result_free(result);
+} else {
+  // Branch by error code
+  if (code == NotFound) { /* handle specifically */ }
+  boxlite_error_free(&error);
+}
+```

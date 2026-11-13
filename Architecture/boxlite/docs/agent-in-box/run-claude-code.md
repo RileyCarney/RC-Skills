@@ -1,0 +1,551 @@
+# Run Claude Code
+Source: https://docs.boxlite.ai/agent-in-box/run-claude-code
+
+Install and drive the Claude Code CLI inside a microVM, where it can read, write, execute, and install freely without touching the host.
+
+The agent gets the freedom that `--dangerously-skip-permissions` implies, with the blast radius confined to a single-use VM. Each box is an independent rootfs and kernel, and `SkillBox` ships a noVNC desktop so you can watch it work.
+
+## Prerequisites
+
+* A working BoxLite install (Python `boxlite` or Node `@boxlite-ai/boxlite`) and a machine with hardware virtualization — see [Installation](/getting-started/installation#platform-and-virtualization-requirements-common-to-all-sdks).
+* **Claude Code OAuth token**: `SkillBox` authenticates via the `CLAUDE_CODE_OAUTH_TOKEN` environment variable.
+
+  * Run `claude setup-token` from an already-authenticated Claude Code CLI session to generate a long-lived token.
+  * Then export it:
+
+    ```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+    export CLAUDE_CODE_OAUTH_TOKEN="<YOUR_CLAUDE_OAUTH_TOKEN>"  # replace with your real token
+    ```
+
+  > Without this token, `SkillBox` raises `ValueError` when entering the `async with` block (see Troubleshooting).
+
+***
+
+## Quick Example (Minimal Happy Path)
+
+Minimal code: enter a `SkillBox`, ask a single question, and read the answer. The first `call()` automatically installs the Claude CLI and its dependencies inside the box (this takes a few minutes), and they are reused afterward.
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# pip install boxlite
+# export CLAUDE_CODE_OAUTH_TOKEN="<YOUR_CLAUDE_OAUTH_TOKEN>"  # replace with your real token
+import asyncio
+import os
+import boxlite
+
+async def main() -> None:
+    # Explicit check to surface a helpful hint (SkillBox also validates internally and raises ValueError if missing)
+    if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        raise SystemExit("Please export CLAUDE_CODE_OAUTH_TOKEN=<your token> first")
+
+    try:
+        # SkillBox is an async context manager; token defaults to reading CLAUDE_CODE_OAUTH_TOKEN
+        async with boxlite.SkillBox() as box:
+            print(f"Box ID: {box.id}")
+            # The first call() lazily installs the Claude CLI, bash, git, python (takes a while)
+            answer = await box.call("What is 2 + 2? Just give the number.")
+            print("Claude:", answer)
+    except ValueError as e:
+        # For example, a missing OAuth token
+        print("Configuration error:", e)
+    except RuntimeError as e:
+        # For example, no virtualization, image pull failure
+        print("Runtime error:", e)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// npm install @boxlite-ai/boxlite
+// export CLAUDE_CODE_OAUTH_TOKEN="<YOUR_CLAUDE_OAUTH_TOKEN>"  // replace with your real token
+import { SkillBox } from "@boxlite-ai/boxlite";
+
+async function main(): Promise<void> {
+  const token = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  if (!token) {
+    console.error("Please export CLAUDE_CODE_OAUTH_TOKEN=<your token> first");
+    process.exit(1);
+  }
+
+  // SkillBox supports await using (asyncDispose); cleans up automatically when leaving scope
+  const box = new SkillBox({ oauthToken: token });
+  try {
+    await box.start();
+    // The first call() installs the Claude CLI and dependencies inside the box
+    const answer = await box.call("What is 2 + 2? Just give the number.");
+    console.log("Claude:", answer);
+  } catch (err) {
+    // Missing token / no virtualization / image pull failure, etc.
+    console.error("Run failed:", err instanceof Error ? err.message : err);
+  } finally {
+    await box.stop();
+  }
+}
+
+main();
+```
+
+> Multi-turn conversation: call `call()` repeatedly on the same box. Claude retains context within the same session.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+async with boxlite.SkillBox() as box:
+    await box.call("My name is Alice and I work with Python and Rust.")
+    # Same session; Claude remembers the prior context
+    print(await box.call("What do you know about me? Be brief."))
+```
+
+***
+
+## Parameters and Returns
+
+### `SkillBox(...)` Constructor Parameters (Python)
+
+Source: `sdks/python/boxlite/skillbox.py`. The Node equivalents are listed below.
+
+| Parameter | Type | Required | Default | Description |
+| - | - | - | - | - |
+| `skills` | `list[str]` | Optional | `None` | Skill IDs installed on the first `call()`, in the form `["anthropics/skills"]` (owner/repo) |
+| `oauth_token` | `str` | Optional\* | reads `CLAUDE_CODE_OAUTH_TOKEN` | Claude OAuth token. \*At least one of the parameter or the env var must be set, otherwise entering the context raises `ValueError` |
+| `name` | `str` | Optional | `"skill-box"` | Box name, used for persistence and reuse |
+| `image` | `str` | Optional | `ghcr.io/boxlite-ai/boxlite-skillbox:0.1.0` | Image bundling the AI CLI + noVNC desktop |
+| `rootfs_path` | `str` | Optional | `None` | Path to a local OCI image layout directory (the on-disk form of a container image); an alternative to `image` |
+| `memory_mib` | `int` | Optional | `4096` | Memory (MiB) |
+| `disk_size_gb` | `int` | Optional | `10` | Disk (GB) |
+| `gui_http_port` | `int` | Optional | `0` (random port) | Host port mapped to noVNC HTTP |
+| `gui_https_port` | `int` | Optional | `0` (random port) | Host port mapped to noVNC HTTPS |
+| `auto_remove` | `bool` | Optional | `True` | Remove the box on exit; set to `False` to reuse across sessions and skip reinstallation |
+| `runtime` | `Boxlite` | Optional | `None` (uses the global default runtime) | Custom runtime instance |
+
+> Node's `SkillBoxOptions` uses camelCase field names: `skills`, `oauthToken`, `name`, `image`, `memoryMib`, `diskSizeGb`, `guiHttpPort`, `guiHttpsPort`, `autoRemove`, and so on.
+
+### `SkillBox` Methods
+
+| Method | Signature | Returns | Description |
+| - | - | - | - |
+| `call` | `await box.call(prompt: str)` | `str` | Send one message; returns Claude's final answer text. Multiple calls on the same box form a multi-turn conversation |
+| `install_skill` | `await box.install_skill(skill_id: str)` | `bool` | Install a skill (`owner/repo`) at runtime; returns `True` on success |
+| `wait_until_ready` | `await box.wait_until_ready(timeout: int = 60)` | `None` | Wait for the noVNC desktop to be ready (call before using computer-use tools); raises `TimeoutError` on timeout |
+| `info` | `await box.info()` | `BoxInfo` | async — `SkillBox` inherits it from `SimpleBox`. `info.name` / `info.memory_mib` / `info.image` / `info.state.status` |
+| Properties | `box.id` / `box.gui_http_port` / `box.gui_https_port` | — | Box ID and host-side noVNC ports |
+
+> `SkillBox` inherits from `SimpleBox`, so it also has the common methods `exec(...)`, `copy_in/copy_out(...)`, `start/stop()`, and others.
+
+### Watching Claude Work in a Browser (noVNC)
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+async with boxlite.SkillBox() as box:
+    await box.wait_until_ready()           # Wait for the desktop to come up
+    # Open the address below to watch the agent operate the desktop in real time
+    print(f"Desktop: https://localhost:{box.gui_https_port}")
+    print(await box.call("Open a text editor and write hello.txt"))
+```
+
+***
+
+## Advanced: Manually Installing Claude Code into a `SimpleBox`
+
+If you need to choose your own base image, authenticate with an API key instead of OAuth, or use the stream-json protocol for fine-grained control, skip `SkillBox` and install `claude` into a plain box yourself.
+
+Three constraints shape this path, and all three will bite you if you skip them:
+
+| Constraint | Why | What to do |
+| - | - | - |
+| The CLI refuses to run permission-bypass mode as root | A guardrail in Claude Code itself: `--dangerously-skip-permissions cannot be used with root/sudo privileges` | Create a non-root user in the box and pass `user=` to `exec` |
+| A global npm install needs more disk than the default | `npm install -g` on a slim Node image exhausts the default box disk with `ENOSPC` | `SimpleBox(..., disk_size_gb=20)` |
+| `claude -p` waits on stdin | With no pipe attached, the CLI blocks | Append `< /dev/null` to the command |
+
+### Python (API-key mode, non-root)
+
+Point the CLI at any Anthropic-compatible endpoint with environment variables — no OAuth login, which makes this the practical choice for CI and unattended runs.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+
+from boxlite import SimpleBox
+
+BASE_URL = "<ANTHROPIC_BASE_URL>"   # e.g. https://api.anthropic.com, or your own gateway
+API_KEY = "<YOUR_API_KEY>"          # an API key for that endpoint, not an OAuth token
+MODEL = "<MODEL_NAME>"              # a model the endpoint serves
+
+
+async def run(box, *cmd, env=None, user=None, timeout=None):
+    result = await box.exec(*cmd, env=env, user=user, timeout=timeout)
+    # exec does not raise on a non-zero exit — check it yourself
+    if result.exit_code != 0:
+        raise RuntimeError(f"`{' '.join(cmd)}` failed (exit={result.exit_code}): {result.stderr}")
+    return result
+
+
+async def main() -> None:
+    try:
+        # disk_size_gb=20 leaves room for the global npm install
+        async with SimpleBox(image="node:20-slim", memory_mib=2048, disk_size_gb=20) as box:
+            await run(box, "npm", "install", "-g", "@anthropic-ai/claude-code", timeout=600.0)
+            version = await run(box, "claude", "--version")
+            print("installed:", version.stdout.strip())
+
+            # The CLI will not bypass permissions as root — create a user for it
+            await run(box, "sh", "-c",
+                      "useradd -m -s /bin/bash agent && mkdir -p /home/agent/work && "
+                      "chown -R agent:agent /home/agent")
+
+            cli_env = {
+                "ANTHROPIC_BASE_URL": BASE_URL,
+                "ANTHROPIC_AUTH_TOKEN": API_KEY,  # used by most compatible gateways
+                "ANTHROPIC_API_KEY": API_KEY,     # used by the official API
+                "ANTHROPIC_MODEL": MODEL,
+                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "HOME": "/home/agent",
+            }
+
+            # < /dev/null closes stdin so the CLI does not wait for piped input
+            answer = await run(
+                box, "sh", "-c",
+                "cd /home/agent/work && claude -p "
+                "\"Create a file hello.txt containing the line 'hello from box', "
+                "then explain in one sentence what you did.\" "
+                f"--permission-mode bypassPermissions --model {MODEL} < /dev/null",
+                env=cli_env, user="agent", timeout=300.0,
+            )
+            print(answer.stdout)
+
+            # Confirm the agent really wrote the file inside the box
+            check = await run(box, "sh", "-c", "cat /home/agent/work/hello.txt")
+            print(check.stdout)
+    except RuntimeError as exc:
+        print(f"runtime error: {exc}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Verified inside a box on macOS (Apple Silicon) against an Anthropic-compatible endpoint: `claude --version` reported **2.1.197**, the prompt ran as the non-root `agent` user under `--permission-mode bypassPermissions`, and the file the agent was asked to create was readable back from inside the box.
+
+> **Pointing the CLI at a compatible endpoint.** Claude Code takes its endpoint from
+> environment variables, so `ANTHROPIC_BASE_URL` plus `ANTHROPIC_AUTH_TOKEN` is all it
+> needs to talk to an Anthropic-compatible gateway. That is not true of every agent CLI:
+> [Pi](/agent-in-box/run-pi) and [OpenCode](/agent-in-box/run-opencode) ignore those variables and require a
+> provider entry in their own configuration instead.
+
+### Python (OAuth mode)
+
+The example below uses `node:20-alpine` + npm to install and authenticates with an OAuth token instead.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# pip install boxlite
+# export CLAUDE_CODE_OAUTH_TOKEN="<YOUR_CLAUDE_OAUTH_TOKEN>"  # replace with your real token
+import asyncio
+import os
+import boxlite
+
+OAUTH_TOKEN = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+
+async def main() -> None:
+    if not OAUTH_TOKEN:
+        raise SystemExit("Please export CLAUDE_CODE_OAUTH_TOKEN=<your token> first")
+
+    # SimpleBox: use a plain image and inject the token as an environment variable.
+    # Constructor env is a list of (key, value) tuples — exec's env is a dict.
+    box = boxlite.SimpleBox(
+        image="node:20-alpine",
+        memory_mib=2048,
+        name="claude-box",
+        auto_remove=False,  # Persist to avoid reinstalling each time
+        env=[("CLAUDE_CODE_OAUTH_TOKEN", OAUTH_TOKEN)],
+    )
+    try:
+        async with box:
+            # 1) Install the Claude Code CLI (a non-zero exit code does not raise; check exit_code yourself)
+            install = await box.exec(
+                "npm", "install", "-g", "@anthropic-ai/claude-code",
+                timeout=600.0,  # SimpleBox.exec timeout parameter is named timeout (float, seconds)
+            )
+            if install.exit_code != 0:
+                raise RuntimeError(f"Failed to install Claude CLI: {install.stderr}")
+
+            # 2) Verify the installation
+            version = await box.exec("claude", "--version")
+            print("Installed:", version.stdout.strip())
+
+            # 3) Single-shot prompt (--print makes claude exit after running and print the result directly)
+            ask = await box.exec(
+                "claude", "--print", "--dangerously-skip-permissions",
+                "What is the capital of France? One word.",
+                timeout=120.0,
+            )
+            if ask.exit_code != 0:
+                raise RuntimeError(f"Claude execution failed: {ask.stderr}")
+            print("Claude:", ask.stdout.strip())
+    except RuntimeError as e:
+        # Image pull failure / no virtualization / missing command all surface as a standard RuntimeError
+        print("Runtime error:", e)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Multi-Turn Conversation: the stream-json Protocol (Low-Level `Box.exec`)
+
+`SkillBox.call()` internally implements multi-turn through Claude's bidirectional `stream-json` protocol. The key points when implementing it yourself:
+
+* Start: `claude --input-format stream-json --output-format stream-json --verbose` (add `--dangerously-skip-permissions` for agent mode).
+* Write: write one line of JSON to `execution.stdin()`: `{"type":"user","message":{"role":"user","content":...},"session_id":...}`.
+* Read: read **chunks** (not lines) from `execution.stdout()`; buffer them yourself, split on `\n`, and `json.loads` line by line until you receive `{"type":"result"}`.
+* Multi-turn: take the `session_id` from the response and carry it into the next message.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Low-level handle path: the native Box returned by runtime.create(...) (note: exec uses list-form args/env)
+import asyncio, json
+import boxlite
+from boxlite import BoxOptions
+
+async def chat_once(box, stdin, stdout, content, session_id="default"):
+    msg = {
+        "type": "user",
+        "message": {"role": "user", "content": content},
+        "session_id": session_id,
+        "parent_tool_use_id": None,
+    }
+    await stdin.send_input((json.dumps(msg) + "\n").encode())
+
+    buffer, responses, new_session = "", [], session_id
+    try:
+        while True:
+            chunk = await asyncio.wait_for(stdout.__anext__(), timeout=120)
+            buffer += chunk.decode("utf-8", "replace") if isinstance(chunk, bytes) else chunk
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                parsed = json.loads(line)
+                responses.append(parsed)
+                if parsed.get("session_id"):
+                    new_session = parsed["session_id"]
+                if parsed.get("type") == "result":
+                    raise StopAsyncIteration
+    except (asyncio.TimeoutError, StopAsyncIteration):
+        pass
+
+    result = next((r for r in responses if r.get("type") == "result"), None)
+    return (result.get("result", "") if result else ""), new_session
+# Usage shown above: runtime = boxlite.Boxlite.default(); box = await runtime.create(BoxOptions(...));
+#           execution = await box.exec("claude", [..stream-json flags..], [("CLAUDE_CODE_OAUTH_TOKEN", token)])
+```
+
+> For complete, runnable multi-turn / interactive examples, see the repository files `examples/python/06_ai_agents/chat_with_claude.py` and `examples/node/claude_in_boxlite.js`.
+
+***
+
+## Troubleshooting (Symptoms and Real Errors)
+
+| Symptom / error | Cause | Fix |
+| - | - | - |
+| `--dangerously-skip-permissions cannot be used with root/sudo privileges` | A Claude Code guardrail: permission-bypass mode refuses to run as root | Create a non-root user in the box and pass `user="agent"` to `exec` |
+| `npm install -g` fails with `ENOSPC: no space left on device` | The default box disk is too small for a global Node install | `SimpleBox(..., disk_size_gb=20)` |
+| `claude -p` hangs, or reports no stdin data | The CLI is waiting for piped input | Append `< /dev/null` to the command |
+| The CLI returns a 401 or an authentication error | The endpoint variables never reached the CLI, or the endpoint is not Anthropic-compatible | Inject `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` (plus `ANTHROPIC_API_KEY` for the official API) through `exec(env=...)` |
+| `ValueError: OAuth token required. Set CLAUDE_CODE_OAUTH_TOKEN env var or pass oauth_token parameter.` | Entering `SkillBox` with neither the env var set nor `oauth_token` passed | `export CLAUDE_CODE_OAUTH_TOKEN=...` or `SkillBox(oauth_token="...")` |
+| Virtualization-related error on box startup / the process stays alive but the box cannot start | The current machine has no hardware virtualization (Linux without KVM, or `/dev/kvm` not passed through inside a container) | Use Linux+KVM or macOS; WSL2 needs KVM enabled and the user in the `kvm` group. This is an environment constraint; catch it with `try/except RuntimeError` |
+| `RuntimeError` (image pull failure / network blip) | Failure pulling `ghcr.io/boxlite-ai/boxlite-skillbox` or the base image | Check network/registry reachability and retry. Note: a pull failure raises a standard `RuntimeError` (**not** a `BoxliteError` subclass) |
+| `exec("claude", ...)` returns `exit_code != 0` but does not raise | BoxLite's `exec` **does not raise** on a non-zero exit; it returns the result | After the call, check `result.exit_code`, then inspect `result.stderr`. This is intended behavior |
+| Missing command (e.g. calling `claude` before installing it) raises a **plain `Error`** / `RuntimeError`, with `instanceof BoxliteError === false` | A missing executable is a low-level spawn failure | Install first and verify with `claude --version`; catch the generic `RuntimeError`/`Error`, not only `BoxliteError` |
+| The first `call()` takes a long time | The first call runs `apt-get` inside the box and installs the Claude CLI/git/python | This is expected; set `auto_remove=False` + a fixed `name` to reuse the box and skip installation on the second start |
+| Context lost across `SkillBox` multi-turn calls | Sessions are not persisted across different `async with` sessions | Multi-turn requires consecutive `call()`s on the **same** box instance; across sessions only dependencies are reused, not conversation context |
+| Writing the security option as `SkillBox(security=...)` raises an error | There is no top-level `security=` keyword | Security options go through `advanced`: `BoxOptions(advanced=AdvancedBoxOptions(security=SecurityOptions.maximum()))`, with \`from boxlite import AdvancedBoxOptions |
+
+***
+
+## Related Reading
+
+* [Box types](/manage-sandbox/sandbox-types) — `SimpleBox` / `CodeBox` / `SkillBox` and more
+* [Manage Sandbox Lifecycle](/manage-sandbox/lifecycle) — `create` / `get_or_create` / `list_info` / `remove`
+* [Secrets and Security](/manage-sandbox/secrets-and-security) — inject credentials for the agent, tighten isolation
+
+## A tour of the agent-in-a-box shapes
+
+Moved here from the section index, which is now a summary and an index.
+
+### Python: Run a complete agent inside a Box with SkillBox (simplest path)
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+import os
+
+from boxlite import SkillBox
+
+async def main():
+    # SkillBox requires a Claude Code OAuth token.
+    # Read from the environment variable first; may also pass oauth_token=...
+    if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        # Without a token, entering async with raises ValueError; surface a helpful hint early
+        print("Please set it first: export CLAUDE_CODE_OAUTH_TOKEN=<YOUR_OAUTH_TOKEN>")
+        return
+
+    try:
+        # Image defaults to boxlite-skillbox; no need to pass image
+        # auto_remove defaults to True: exiting async with cleans up the entire VM
+        async with SkillBox() as skill_box:
+            # id is a property; info() must be awaited
+            print("Box ID:", skill_box.id)
+
+            # The first call() triggers lazy installation (Claude CLI / bash / git / python)
+            # call(prompt) returns Claude's final reply (str)
+            answer = await skill_box.call("What is 2 + 2? Just give the number.")
+            print("Claude:", answer)
+
+            # Multi-turn conversation: context is maintained automatically within the same SkillBox session
+            await skill_box.call("My name is Alice.")
+            who = await skill_box.call("What is my name? One word.")
+            print("Claude:", who)
+    except ValueError as e:
+        # For example, a missing oauth_token
+        print("Configuration error:", e)
+    except RuntimeError as e:
+        # Image pull failure / no hardware virtualization, etc. raise a standard RuntimeError (not BoxliteError)
+        print("Startup or pull failed:", e)
+
+asyncio.run(main())
+```
+
+### Pre-install skill packs for the agent
+
+```python Python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+import os
+
+from boxlite import SkillBox
+
+async def main():
+    if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        print("Please set it first: export CLAUDE_CODE_OAUTH_TOKEN=<YOUR_OAUTH_TOKEN>")
+        return
+
+    try:
+        # skills are installed alongside the Claude CLI on the first call()
+        async with SkillBox(skills=["anthropics/skills"]) as skill_box:
+            answer = await skill_box.call("List the top 3 skills you have, briefly.")
+            print(answer)
+
+            # A skill can also be installed manually at runtime; returns a bool indicating success
+            ok = await skill_box.install_skill("anthropics/skills")
+            print("install_skill ->", ok)
+    except (ValueError, RuntimeError) as e:
+        print("Failed:", e)
+
+asyncio.run(main())
+```
+
+```typescript Node.js theme={"theme":{"light":"github-light","dark":"github-dark"}}
+// Package name is @boxlite-ai/boxlite (not 'boxlite', not '@boxlite/sdk')
+import { SkillBox } from "@boxlite-ai/boxlite";
+
+async function main(): Promise<void> {
+  if (!process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+    console.error("Please set it first: export CLAUDE_CODE_OAUTH_TOKEN=<YOUR_OAUTH_TOKEN>");
+    return;
+  }
+
+  try {
+    // await using: at end of scope, cleans up automatically per autoRemove (default true) by calling stop()
+    // Note: Node's SkillBox does not auto-start() on construction or await using;
+    // you must explicitly await skillBox.start(), otherwise call() throws "SkillBox not started."
+    await using skillBox = new SkillBox();
+    await skillBox.start();
+
+    // The first call() triggers lazy installation; returns Claude's reply (string)
+    const answer = await skillBox.call("What is 2 + 2? Just give the number.");
+    console.log("Claude:", answer);
+  } catch (e) {
+    // On Node, a missing token makes start() throw a plain Error("OAuth token required...");
+    // pull failure / no virtualization also throw a plain Error (instanceof BoxliteError === false)
+    console.error("Failed:", e);
+  }
+}
+
+main();
+```
+
+### Python: Build your own Box for full control over the Claude CLI (advanced)
+
+When you need to choose your own image, customize CLI flags, or drive the stream-json protocol directly for multi-turn sessions, use the low-level `Box` to run `claude` yourself. Below is a minimal, self-contained skeleton (for the full protocol details, see the repository example `examples/python/06_ai_agents/chat_with_claude.py`).
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+import json
+import os
+
+import boxlite
+
+async def main():
+    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+    if not token:
+        print("Please set it first: export CLAUDE_CODE_OAUTH_TOKEN=<YOUR_OAUTH_TOKEN>")
+        return
+
+    try:
+        with boxlite.Boxlite.default() as runtime:
+            from boxlite import BoxOptions
+
+            options = BoxOptions(
+                image="node:20-alpine",
+                memory_mib=2048,
+                disk_size_gb=5,
+                auto_remove=False,                       # Persist to reuse the already-installed CLI
+                # The native Box env is list[tuple[str, str]] (note: not a dict)
+                env=[("CLAUDE_CODE_OAUTH_TOKEN", token)],
+            )
+
+            # runtime.get_or_create returns an awaitable through the wrapper layer
+            box, _created = await runtime.get_or_create(options, name="claude-box")
+            async with box:
+                # Install the Claude Code CLI (native Box.exec returns an Execution; await wait())
+                install = await box.exec(
+                    "npm", ["install", "-g", "@anthropic-ai/claude-code"], None
+                )
+                result = await install.wait()
+                if result.exit_code != 0:
+                    print("Failed to install Claude CLI")
+                    return
+
+                # Start Claude with the stream-json protocol and take over stdin/stdout yourself
+                proc = await box.exec(
+                    "claude",
+                    ["--input-format", "stream-json",
+                     "--output-format", "stream-json", "--verbose"],
+                    [("CLAUDE_CODE_OAUTH_TOKEN", token)],
+                )
+                stdin = proc.stdin()
+                stdout = proc.stdout()
+
+                msg = {
+                    "type": "user",
+                    "message": {"role": "user", "content": "Say OK."},
+                    "session_id": "default",
+                    "parent_tool_use_id": None,
+                }
+                await stdin.send_input((json.dumps(msg) + "\n").encode())
+
+                # Read and parse NDJSON until a type=="result" message arrives
+                buffer = ""
+                while True:
+                    chunk = await asyncio.wait_for(stdout.__anext__(), timeout=120)
+                    buffer += chunk.decode() if isinstance(chunk, bytes) else chunk
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        if not line.strip():
+                            continue
+                        parsed = json.loads(line)
+                        if parsed.get("type") == "result":
+                            print("Claude:", parsed.get("result", ""))
+                            await stdin.close()
+                            await proc.wait()
+                            return
+    except RuntimeError as e:
+        print("Startup or pull failed:", e)
+
+asyncio.run(main())
+```
+
+***

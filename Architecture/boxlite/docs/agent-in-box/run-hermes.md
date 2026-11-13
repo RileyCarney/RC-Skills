@@ -1,0 +1,198 @@
+# Run Hermes
+Source: https://docs.boxlite.ai/agent-in-box/run-hermes
+
+Run the Hermes agent inside a microVM using its official image — one-shot prompts, or the messaging gateway behind a forwarded port.
+
+Hermes bundles its own Python runtime, tooling, and a supervised process tree, so there is nothing to install: point a box at the published image and it is ready. Its `--yolo` switch removes approval prompts, which is safe to use precisely because the box is the boundary.
+
+## Prerequisites
+
+* The `boxlite` Python package and a machine with hardware virtualization — see [Installation](/getting-started/installation#platform-and-virtualization-requirements-common-to-all-sdks).
+* An API key for a provider Hermes supports.
+* Room for the image: it is roughly 900 MB, and a 12 GB box disk measured **26% used** after it unpacked. The first pull dominates start-up time.
+
+## Quick Example
+
+One non-interactive prompt. `-z` takes the prompt and exits; `--yolo` skips the approval prompts that would otherwise block an unattended run.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+
+from boxlite import SimpleBox
+
+BASE_URL = "<YOUR_BASE_URL>"               # an Anthropic-compatible endpoint
+API_KEY = "<YOUR_API_KEY>"                 # TODO: read from your own secret store
+MODEL = "<MODEL_ID>"
+
+
+async def main() -> None:
+    try:
+        async with SimpleBox(
+            image="docker.io/nousresearch/hermes-agent:latest",
+            memory_mib=4096,
+            disk_size_gb=12,
+        ) as box:
+            result = await box.exec(
+                "sh", "-c",
+                f'hermes -z "Write a one-line Python snippet that reverses a string." '
+                f'--provider anthropic -m {MODEL} --yolo',
+                env={
+                    "ANTHROPIC_BASE_URL": BASE_URL,
+                    "ANTHROPIC_API_KEY": API_KEY,
+                    "ANTHROPIC_AUTH_TOKEN": API_KEY,
+                },
+                timeout=420.0,
+            )
+            # exec does not raise on a non-zero exit — check it yourself
+            if result.exit_code != 0:
+                print(f"hermes failed (exit={result.exit_code}): {result.stderr}")
+            else:
+                print(result.stdout.strip())
+    except RuntimeError as exc:
+        print(f"runtime error: {exc}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Verified inside a box on macOS (Apple Silicon) against an Anthropic-compatible endpoint: the prompt returned `exit=0` with the answer on stdout. Allow generously for the first run — pulling and unpacking the image took the bulk of the elapsed time.
+
+## What the image gives you
+
+Checked from inside a running box:
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+$ hermes --version
+Hermes Agent v0.22.2 (2026.9.24) · upstream d923a5eb
+Install directory: /opt/hermes
+Install method: docker
+Python: 3.14.7
+OpenAI SDK: 2.24.0
+
+$ which hermes hermes-agent hermes-acp
+/opt/hermes/bin/hermes
+/opt/hermes/.venv/bin/hermes-agent
+/opt/hermes/.venv/bin/hermes-acp
+```
+
+| Entry point | Purpose |
+| - | - |
+| `hermes` | Terminal UI, or a one-shot prompt with `-z` |
+| `hermes-agent` | The agent runner |
+| `hermes-acp` | Agent Client Protocol adapter |
+
+## Parameters and Returns
+
+From `hermes --help` inside the image:
+
+| Flag | Meaning |
+| - | - |
+| `-z PROMPT` | Run the prompt and exit — the non-interactive entry point |
+| `-m MODEL` | Model to use |
+| `--provider PROVIDER` | Provider override for this invocation |
+| `--reasoning LEVEL` | Reasoning level |
+| `-t TOOLSETS` | Restrict which toolsets the agent may use |
+| `--yolo` | Bypass all dangerous-command approval prompts |
+| `--safe-mode` | Troubleshooting mode |
+| `--ignore-user-config` | Ignore user configuration — useful for a reproducible box |
+| `--tui` / `--cli` | Force the interface |
+
+Subcommands include `chat`, `model`, `secrets`, `egress`, `gateway`, `proxy`, `setup`, and messaging integrations. `hermes gateway run` starts the messaging gateway in the foreground; `gateway` also has `start` / `stop` / `status` for supervised operation.
+
+## Running the gateway behind a forwarded port
+
+For chat over Telegram, Discord, and similar messaging platforms, run the gateway instead of one-shot prompts and forward its port. The service must bind all interfaces — a forwarded port arrives at the guest's network interface, not its loopback:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+
+from boxlite import SimpleBox
+
+GATEWAY_PORT = 8080
+
+
+async def wait_for_port(box, port: int, timeout: float = 300.0, interval: float = 3.0) -> bool:
+    """Poll /proc/net/tcp inside the box until the port is listening.
+
+    exec returns as soon as a command is launched, so nothing health-checks a
+    backgrounded service for you. /proc/net/tcp lists ports in uppercase hex.
+    """
+    port_hex = f"{port:04X}"
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        result = await box.exec("cat", "/proc/net/tcp")
+        if port_hex in result.stdout.upper():
+            return True
+        await asyncio.sleep(interval)
+    return False
+
+
+async def main() -> None:
+    try:
+        async with SimpleBox(
+            image="docker.io/nousresearch/hermes-agent:latest",
+            memory_mib=4096,
+            disk_size_gb=12,
+            ports=[(GATEWAY_PORT, GATEWAY_PORT)],
+        ) as box:
+            # Launch in the background — this exec returns immediately.
+            # The gateway runs beside init, so the box survives a gateway crash and
+            # the port simply stops answering. Check the log, not the box status.
+            await box.exec("sh", "-c", "nohup hermes gateway run > /tmp/gateway.log 2>&1 &")
+
+            if not await wait_for_port(box, GATEWAY_PORT):
+                # The gateway's own log is the only place the reason appears
+                log = await box.exec("cat", "/tmp/gateway.log")
+                print(f"gateway did not come up:\n{log.stdout}{log.stderr}")
+                return
+
+            print(f"gateway ready on http://127.0.0.1:{GATEWAY_PORT}")
+            # Keep the box alive for as long as you need the gateway
+            await asyncio.sleep(3600)
+    except RuntimeError as exc:
+        print(f"runtime error: {exc}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Configure the gateway with `hermes gateway setup` before relying on it; the flags it needs depend on which messaging platform you connect.
+
+## Why `--yolo` belongs in a box
+
+Hermes asks for approval before dangerous commands, which is the right default on a laptop and a blocker for anything unattended. `--yolo` removes those prompts. Inside a box that trade is sound: the agent can do whatever it wants to a disposable VM, and the host is untouched.
+
+What that does **not** cover is the network. An agent with unrestricted egress can still send data out. Narrow it when the task is not fully trusted:
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+from boxlite import NetworkSpec, OutboundNetworkSpec, Secret, SimpleBox
+
+box = SimpleBox(
+    image="docker.io/nousresearch/hermes-agent:latest",
+    disk_size_gb=12,
+    secrets=[Secret(name="provider", value="<YOUR_API_KEY>", hosts=["<YOUR_HOST>"])],
+    network=NetworkSpec(outbound=OutboundNetworkSpec(mode="enabled", allow_net=["<YOUR_HOST>"])),
+)
+```
+
+With `Secret` the real key stays on the host and the box sees only a placeholder — see [Secrets and hardening](/manage-sandbox/secrets-and-security). Hermes also has its own `hermes egress` subcommand; the box-level allowlist and the agent-level control are independent, and the box-level one is the boundary you can rely on.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| - | - | - |
+| The box takes minutes to start | The image is roughly 900 MB and is pulled on first use | Expected once per image; later starts use the cache |
+| `No space left on device` while starting | The default box disk is too small for this image | `disk_size_gb=12` — measured at 26% used |
+| The run stops waiting for confirmation | Hermes asks before dangerous commands | Add `--yolo` when the box is your containment |
+| A user config on a mounted volume changes behavior unexpectedly | Hermes reads user configuration by default | Add `--ignore-user-config` for a reproducible run |
+| The gateway is unreachable from the host | The service bound loopback inside the box | Bind all interfaces; see [Network access](/manage-sandbox/network-access#port-forwarding-ports) |
+| `exec` returned non-zero but nothing raised | `exec` never raises on a non-zero exit | Check `result.exit_code` and read `result.stderr` |
+
+## Related
+
+* [Preview a sandboxed web app](/use-cases/sandboxed-web-app) — the general shape of forwarding a long-running service out of a box.
+* [Run Pi](/agent-in-box/run-pi) — a CLI you install into a box rather than a prebuilt image.
+* [Secrets and hardening](/manage-sandbox/secrets-and-security) — keeping the provider key outside the sandbox.

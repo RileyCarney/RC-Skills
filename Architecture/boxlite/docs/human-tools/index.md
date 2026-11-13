@@ -1,0 +1,24 @@
+# Human tools
+Source: https://docs.boxlite.ai/human-tools/index
+
+Hand a running box to a person — a desktop in their browser, or their own DevTools attached to a browser inside the box.
+
+Sometimes the right move is to stop automating and let a human look. Both pages here take a box that is already running and put a person in front of it.
+
+## In this section
+
+> [card] [Desktop access](/human-tools/desktop-access)
+>
+> Share the box's Linux desktop with a person, through a browser.
+
+> [card] [Browser access](/human-tools/browser-access)
+>
+> Attach your own Chrome DevTools to a browser inside the box.
+
+## Which page do I want?
+
+| You are asking | Page |
+| - | - |
+| Let someone see and click the box's screen | [desktop access](/human-tools/desktop-access) |
+| Debug a page the agent is driving | [browser access](/human-tools/browser-access) |
+| Give an agent the same desktop instead | [computer use](/agent-tools/computer-use) |

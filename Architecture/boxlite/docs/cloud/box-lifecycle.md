@@ -1,0 +1,114 @@
+# Box lifecycle on Cloud
+Source: https://docs.boxlite.ai/cloud/box-lifecycle
+
+The three controls that decide when a Cloud box stops, whether it wakes again, and when it is deleted — and the idle rule that can end a job you thought was safe.
+
+A Cloud box does not run until you stop it. The platform stops it when it looks idle, wakes it when you reach for it, and can delete it once it has been stopped for a while. These three controls are the most consequential settings on a box.
+
+## Prerequisites
+
+* An API key from the console, exported as `BOXLITE_API_KEY`. See [API keys](/cloud/api-keys).
+* `pip install boxlite`, and the REST URL exported as `BOXLITE_REST_URL`. See [Quickstart](/cloud/quickstart).
+
+## Lifecycle on Cloud
+
+Three controls in the **New Box** dialog govern how long your box lives. They behave differently from a box you run yourself, and the first one can end a job you thought was safe.
+
+| Control | Choices | Default |
+| - | - | - |
+| **Stop when idle** | `Never`, `5 min`, `15 min`, `30 min`, `1 hour`, `4 hours`, or a custom value | `15 min` |
+| **Wake on access** | A switch | On |
+| **Delete after stopping** | A delay, or `Never` to keep the box | `Never` |
+
+Set them in the console when you create a box there, or from code with three `BoxOptions` fields:
+
+| Field | Type | Meaning |
+| - | - | - |
+| `auto_stop` | `int` (seconds) | Idle time before the box is stopped. `0` disables it |
+| `auto_delete` | `int` (seconds) | Time spent stopped before the box is deleted. `0` disables it |
+| `auto_resume` | `bool` | Whether an incoming operation resumes the box after an auto-stop |
+
+Two rules to know before you set them:
+
+* **`auto_delete` must be greater than `auto_stop`** when both are non-zero. Otherwise creation fails with `auto_delete must be greater than auto_stop`, because a box that deletes itself before it stops has no reachable state.
+* **The defaults come from the platform, not from the SDK.** Omit these fields and the SDK leaves them out of the request entirely, so the platform applies its own defaults: `auto_stop=900` (15 idle minutes), `auto_delete=0` (never), and `auto_resume=true`. A box created from code therefore behaves like one created in the console — **it will stop itself after 15 idle minutes whether you asked for that or not.**
+
+The console's `15 min` corresponds to `auto_stop=900`, which is the same value a box created from code receives by default. To keep a box running through unattended work, you must pass `auto_stop` explicitly — see [Stop when idle](#stop-when-idle).
+
+The field names matter: `idle_timeout`, `stop_when_idle`, `wake_on_access`, `delete_after_stopping`, and `auto_pause` are not fields of `BoxOptions` and each fails construction with a no-such-field error.
+
+## Stop when idle
+
+Idleness is measured at the boundary of the box, not inside it. The console is explicit:
+
+> Idle means no SDK, terminal or preview traffic. Work running inside the box does not count — a long job can be stopped mid-run.
+
+That is the single most important sentence on this page. A 40-minute build that you kick off and then stop talking to looks idle from the outside, and the platform stops it at 15 minutes with the build half-finished.
+
+Two ways to keep a long job alive:
+
+* **Keep touching the box from your client.** Poll the job while it runs — read its progress file or check its process — so real SDK traffic keeps arriving.
+* **Raise the idle timeout, or disable it.** In the console, pick a longer value or `Never`; from code, pass a larger `auto_stop` or `auto_stop=0`. Disabling it is the right choice for a box whose whole purpose is unattended work — and the one that makes you responsible for tearing it down.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import asyncio
+
+async def run_long_job(box) -> int:
+    """Start a long job, then poll it so the box keeps seeing SDK traffic."""
+    starter = await box.exec("sh", args=["-c", "nohup ./build.sh > /tmp/build.log 2>&1 & echo started"])
+    await starter.wait()
+
+    while True:
+        # each exec is SDK traffic, so the box does not look idle
+        probe = await box.exec("sh", args=["-c", "pgrep -f build.sh > /dev/null && echo running || echo done"])
+        state = ""
+        async for line in probe.stdout():
+            state += line
+        await probe.wait()
+
+        if "done" in state:
+            break
+        await asyncio.sleep(60)
+
+    tail = await box.exec("tail", args=["-n", "20", "/tmp/build.log"])
+    async for line in tail.stdout():
+        print(line, end="")
+    result = await tail.wait()
+    return result.exit_code
+```
+
+> [!NOTE]
+>
+> Pass this helper a box you already created and started, using the pattern in [Create, reuse, and remove a box from code](/cloud/box-from-code). Choose a poll interval comfortably shorter than the box's idle timeout.
+
+## Wake on access
+
+Resume is on by default — the console switch starts on, and `auto_resume` defaults to `true` over the API. With it enabled, a stopped box comes back on its own when you reach for it:
+
+SDK exec, file operations, and terminal attach can wake a stopped box. Requests to a registered HTTPS service URL can also start the box and reach its saved startup service. See the [Hermes Gateway walkthrough](/cloud/agent-in-box/hermes#optional-wake-on-a-request).
+
+Waking a stopped box starts new guest processes with the retained disk. It does not restore process memory; a service must have a saved startup command.
+
+This is what makes a named Cloud box feel durable: your script calls `exec` after a weekend, the box restarts with its disk intact, and your code carries on. Enable it for any box you intend to reuse. Leave it off when a stop should be final until you intervene.
+
+## Delete after stopping
+
+**Delete after stopping** defaults to `Never`, so a stopped box keeps its disk and stays addressable by name. Set a delay when you want the platform to reclaim throwaway boxes for you instead of remembering to call `remove` yourself.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| - | - | - |
+| A long job dies partway through, around the 15-minute mark | **Stop when idle** counts only SDK, terminal, and preview traffic. Work inside the box does not count, so the platform stopped the box mid-run | Poll the box from your client while the job runs, or raise or disable the idle timeout for that box in the console |
+| `exec` against a stopped box fails instead of restarting it | Resume was switched off for that box. It is on by default in both the console and over the API, so this only happens if it was turned off at creation | Recreate the box with **Wake on access** left on, or `auto_resume=True` from code — that is what lets SDK exec, file operations, and terminal attach bring a stopped box back |
+| `BoxOptions(idle_timeout=3600)` or `BoxOptions(auto_pause=True)` fails with a no-such-field error | Those are not the field names | Use `auto_stop`, `auto_delete`, and `auto_resume` — see [Lifecycle on Cloud](/cloud/box-lifecycle) |
+| Creation fails with `auto_delete must be greater than auto_stop` | `auto_delete` is non-zero but not larger than `auto_stop` | Raise `auto_delete` above `auto_stop`, or set `auto_delete=0` to disable deletion |
+| A box created from code stopped in the middle of unattended work | Omitting `auto_stop` does not disable it — the platform applies its `900` second default, and work inside the box does not count as activity | Pass `auto_stop=0` to disable auto-stop, or a value longer than the job. See [Stop when idle](#stop-when-idle) |
+| A box you expected to keep running was gone or stopped after 15 minutes | Same cause: `auto_stop` defaults to `900`, not to `0` | Set `auto_stop` explicitly for any box doing unattended work |
+| A box you expected to reuse is gone | Its **Delete after stopping** delay elapsed after an idle stop | Create the replacement with **Delete after stopping** set to `Never`, and put anything you must keep on a volume — see [Volumes on Cloud](/cloud/volumes) |
+
+## Next steps
+
+> [card] [Boxes](/cloud/boxes)
+>
+> Everything else about configuring a box on Cloud.

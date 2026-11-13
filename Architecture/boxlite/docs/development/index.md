@@ -1,0 +1,17 @@
+# Contributing
+Source: https://docs.boxlite.ai/development/index
+
+Documentation for people working on BoxLite itself rather than building on it: how to develop the CLI, how to run the tests that boot real microVMs, and the conventions a pull request has to satisfy.
+
+If you are building an application on top of BoxLite, you want [Manage sandboxes](/manage-sandbox/index) or the [use cases](/use-cases/index) instead. Everything here starts from a BoxLite source checkout.
+
+| Page | Use it when |
+| - | - |
+| [CLI development guide](/development/cli-development) | You are changing the `boxlite` command — adding a subcommand, a flag, or output |
+| [Integration tests](/development/e2e-local) | You need the integration tests to pass, in CI or on your own machine |
+| [Rust style guide](/development/rust-style) | You want your PR to clear the `cargo fmt` / `cargo clippy` gates on the first try |
+| [Contributor license agreement](/legal/CLA) | You are about to open your first pull request and need the terms you are agreeing to |
+| [Concurrent execution deadlock investigation](/development/concurrent-exec-deadlock) | You are debugging a hang and want a worked example of how one was traced to its root cause |
+| [Debug macOS Seatbelt denials](/development/macos-sandbox-debugging) | Diagnosing sandbox denials on macOS |
+
+Before your first pull request, read the [contributor license agreement](/legal/CLA). To build the runtime from source — including the native prerequisites — see [Building from source](/development/building-from-source).

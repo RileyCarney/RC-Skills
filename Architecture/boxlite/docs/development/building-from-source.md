@@ -1,0 +1,251 @@
+# Building from source
+Source: https://docs.boxlite.ai/development/building-from-source
+
+From git clone to a working local SDK, using the repository's own make targets.
+
+Read this when you need to modify the runtime, build for a platform with no release, or get a symbol-bearing build for debugging. Most users should install the published package instead.
+
+## Prerequisites
+
+* A working BoxLite install (Python `boxlite` or Node `@boxlite-ai/boxlite`) and a machine with hardware virtualization — see [Installation](/getting-started/installation#platform-and-virtualization-requirements-common-to-all-sdks).
+
+### Hardware virtualization (required to run, not to build)
+
+BoxLite starts microVMs, so **running** sandboxes requires hardware
+virtualization; but **building** the source alone does not require
+virtualization to be available.
+
+| Platform | Requirement |
+| - | - |
+| macOS Intel | Not supported |
+
+> Without virtualization the build can succeed, but running examples will fail
+> to start a box. See Troubleshooting at the end.
+
+### Toolchain (installed automatically by `make setup`)
+
+You do **not** need to install these dependencies one by one — `make setup`
+calls the right script per platform (`scripts/setup/setup-macos.sh` or
+`setup-ubuntu.sh`, etc.) and installs everything. The table below only documents
+which components get installed and their minimum versions.
+
+| Dependency | Minimum version | Purpose | Evidence |
+| - | - | - | - |
+| Rust (stable) | 1.88 (`Cargo.toml` declares `rust-version`) | Core runtime, CLI, the native layer of each SDK | `rust-version` in `Cargo.toml`, `rust-toolchain.toml` |
+| `protobuf` (`protoc`) | Distro's current version | Compile the gRPC/protobuf protocol in `src/shared` | `setup-ubuntu.sh:101` (`protobuf-compiler`); `setup-macos.sh:193` (`brew install protobuf`) |
+| Go | 1.24+ | Go SDK (CGO) | `GO_MIN_MAJOR`/`GO_MIN_MINOR` in `scripts/setup/setup-common.sh` (`GO_MIN_MAJOR=1` / `GO_MIN_MINOR=24`) |
+| CMake | Current version | C SDK test cases | `setup-macos.sh:208` (`brew install cmake`); `setup-ubuntu.sh:104` (`cmake`) |
+| musl cross toolchain / LLVM / dtc | --- | Cross-compile the guest binary, build libkrun (only configured by the script on macOS) | `setup-macos.sh:76-194` |
+
+The build also depends on git submodules (libkrun, libkrunfw, e2fsprogs,
+bubblewrap); see the steps below.
+
+***
+
+## Quick Example: the fastest path to a local Python SDK
+
+Run the following commands in order at the repository root, taking you from
+nothing to "a local wheel installed into `.venv` and importable".
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# 1. Clone the repository
+git clone https://github.com/boxlite-ai/boxlite.git
+cd boxlite
+
+# 2. Fetch the git submodules required for the build (libkrun / libkrunfw / e2fsprogs / bubblewrap)
+#    Without this step, the runtime build fails because it cannot find the vendor sources
+git submodule update --init --recursive
+
+# 3. One-time install of the platform toolchain + test/dev dependencies (script selected by OS)
+#    The first run is slow: it installs Rust, protobuf, cmake, etc.
+make setup
+
+# 4. Build and install the Python SDK into the project .venv in editable mode (debug)
+make dev:python
+
+# 5. Verify: import with the project .venv Python and print the version
+.venv/bin/python -c "import boxlite; print('boxlite', boxlite.__version__)"
+```
+
+The final step should print the version you built (the latest published version when building from a release tag).
+
+> Build other SDKs: replace step 4 with `make dev:node` / `make dev:go` /
+> `make dev:c`. When you need the CLI binary, use `make cli` (artifact at
+> `./target/debug/boxlite`).
+
+### Verify the local build runs (requires virtualization)
+
+Save the snippet below as `verify_build.py` and run it with
+`.venv/bin/python verify_build.py`. It uses the freshly built local SDK to start
+a minimal sandbox and run one command.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# verify_build.py -- verify that a locally source-built boxlite can start a box and run a command
+import asyncio
+
+from boxlite import SimpleBox
+from boxlite import BoxliteError
+
+async def main() -> None:
+    # SimpleBox is an async context manager; it actually creates + starts only on entry
+    try:
+        async with SimpleBox(image="alpine:latest") as box:
+            result = await box.exec("echo", "hello from source build")
+            # A non-zero exit code does not raise; check exit_code yourself
+            if result.exit_code != 0:
+                print("command failed:", result.stderr)
+                return
+            print("stdout:", result.stdout.strip())
+    except BoxliteError as exc:
+        # Wrapper-layer error (parse/exec/timeout, etc.)
+        print("boxlite error:", exc)
+    except RuntimeError as exc:
+        # Image pull failure, no virtualization, etc. raise a standard RuntimeError (not BoxliteError)
+        print("runtime error (no virtualization or image pull failed?):", exc)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+***
+
+## Core `make` targets (Parameters and Returns)
+
+Run all targets at the repository root: `make <target>`. For the full list, see
+`make help`.
+
+### Setup
+
+| Target | Effect | Artifacts / side effects |
+| - | - | - |
+| `make setup` | Equivalent to `make setup:dev`: build deps + test/dev deps | Installs the toolchain, creates `.venv`, installs git hooks |
+| `make setup:build` | Build deps only (recommended for CI) | Calls `scripts/setup/setup-*.sh` per OS |
+| `make setup:test` | Test/dev extras only (nextest, Node deps, hooks, Python venv) | Prepares the test runtime environment |
+
+### Build (core runtime and CLI)
+
+| Target | Effect | Artifacts |
+| - | - | - |
+| `make guest` | Cross-compile the guest binary (runs inside the VM) | Guest binary |
+| `make runtime` | Build the runtime artifact (release) | Release runtime |
+| `make runtime:debug` | Build the runtime artifact (debug) | Debug runtime |
+| `make cli` | Build the `boxlite` CLI (debug, depends on `runtime:debug`) | `./target/debug/boxlite` |
+| `make cli:release` | Build the CLI (release, depends on `runtime`) | `./target/release/boxlite` |
+| `make skillbox-image` | Build the SkillBox Docker image | `boxlite-skillbox:latest` (use a mirror to speed up: `make skillbox-image APT_SOURCE=mirrors.aliyun.com`) |
+
+### Local development (install SDK locally, debug mode)
+
+| Target | Effect | Artifacts |
+| - | - | - |
+| `make dev:python` | maturin builds a wheel (with embedded runtime) and installs it editable into `.venv` | `import boxlite` works in `.venv` |
+| `make dev:node` | napi-rs builds the native module + compiles TS, and links it into `examples/node` | `sdks/node` usable locally |
+| `make dev:go` | Build the native lib (debug) + `go build` (run with `-tags boxlite_dev`) | Go SDK debug build |
+| `make dev:c` | Build the C SDK (debug) | `target/debug/libboxlite.{dylib,so,a}` + `sdks/c/include/boxlite.h` |
+
+### Distribution (distributable artifacts, release)
+
+| Target | Effect | Artifacts |
+| - | - | - |
+| `make dist:python` | cibuildwheel builds portable wheels | Platform wheels |
+| `make dist:node` | napi-rs packages the npm package | npm tarball |
+| `make dist:go` | Build the Go SDK release (with symbol fixups) | Release native lib |
+| `make dist:c` | Build the C SDK release and stage it into `sdks/c/dist/` | `sdks/c/dist/lib/`, `sdks/c/dist/include/` |
+
+> **Ordering dependencies (handled automatically)**: `cli` depends on
+> `runtime:debug`, `cli:release` depends on `runtime`, and each `dev:*` triggers
+> `runtime:debug` first when `SETUP_DONE` is not marked. Invoke the
+> top-level target; make fills in the prerequisites automatically.
+
+***
+
+## Cross-platform notes
+
+* **macOS (Apple Silicon)**: `make setup` uses Homebrew to install `protobuf`,
+  `cmake`, `llvm`, `dtc`, etc., and writes the musl cross-linker into
+  `~/.cargo/config.toml` (for cross-compiling the guest). The runtime uses
+  Hypervisor.framework and **does not require KVM**.
+* **Linux (Ubuntu/Debian)**: `make setup` uses `apt-get` to install
+  `build-essential`, `protobuf-compiler`, `musl-tools`, `llvm`, `libclang-dev`,
+  `cmake`, etc.; other distributions auto-select `setup-manylinux.sh` (yum) or
+  `setup-musllinux.sh` (apk). Running requires `/dev/kvm` to be accessible.
+* **Windows**: follow the Linux flow inside WSL2; make sure WSL2 has KVM enabled
+  and the user is in the `kvm` group.
+* **macOS Intel**: not supported; the build scripts exit with an error on
+  unsupported platforms.
+
+***
+
+## Troubleshooting
+
+The following are common failure modes when building from source, and how to
+fix them.
+
+### `make setup` reports "Unsupported Linux distribution / Unsupported platform"
+
+`setup:build` only recognizes the apt-get / yum / apk package managers and
+Darwin. Other platforms `exit 1` directly (see `make/setup.mk:24-30`).
+**Fix**: build on a supported platform, or follow the corresponding
+`scripts/setup/setup-*.sh` to install the full toolchain manually, then skip
+`make setup` and run `make dev:*` directly.
+
+### Runtime build fails, cannot find libkrun / vendor sources
+
+The cause is that submodules were not fetched. `src/deps/*/vendor/` is provided
+by git submodules (libkrun, libkrunfw, e2fsprogs, bubblewrap; see
+`.gitmodules`).
+**Fix**:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+git submodule update --init --recursive
+```
+
+### `protoc` / protobuf compilation errors
+
+Code generation for the gRPC/protobuf in `src/shared` requires `protoc`. If you
+skip `make setup` and build manually, this tool may be missing.
+**Fix**: install the protobuf compiler (macOS: `brew install protobuf`;
+Ubuntu/Debian: `sudo apt-get install protobuf-compiler`), or run
+`make setup:build` and let the script handle it.
+
+### Rust too old / edition 2024 errors
+
+The repository's `Cargo.toml` declares `rust-version = "1.88"` and uses edition
+2024\. Older Rust will report unsupported edition or features.
+**Fix**: `rustup update stable` (`rust-toolchain.toml` pins the channel to stable
+and requires the rustfmt/clippy components).
+
+### Go SDK: symbols not found after `go build` / cannot run
+
+The Go SDK uses CGO, and the debug build needs a build tag. `make dev:go` uses
+`go build -tags boxlite_dev`; running `go build` directly is missing the symbols.
+**Fix**:
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Build with the tag the debug build needs
+cd sdks/go && go build -tags boxlite_dev ./...
+# The same tag is required for tests
+go test -tags boxlite_dev -v ./...
+```
+
+### Build succeeds on macOS, but a box won't start when running examples
+
+Building does not require virtualization; running does. macOS uses
+Hypervisor.framework (no `/dev/kvm` required); Linux requires `/dev/kvm` to be
+accessible, and WSL2 requires the user to be in the `kvm` group. Without
+virtualization, startup failure usually raises a standard `RuntimeError` (the
+process stays alive and can be caught and retried).
+**Fix**: confirm the platform meets the prerequisites; use `verify_build.py` from
+the Quick Example to distinguish a "build problem" from a "virtualization/image
+pull problem".
+
+### Image pull failure raises `RuntimeError` (not `BoxliteError`)
+
+A missing command or an image pull failure raises a standard `RuntimeError` (Python) / bare `Error` (Node), not `BoxliteError`. See [Error Handling](/guides/error-handling#troubleshooting).
+
+### Do not hand-write `cargo` / `npm` / `maturin`
+
+The repository convention is to always use `make` targets — the Makefile
+encapsulates the correct flags, cross-compilation config, environment, and
+ordering. Calling the low-level tools by hand often misses these.
+**Fix**: check `make help` first to find the corresponding target; only if there
+is none should you consider a low-level command.

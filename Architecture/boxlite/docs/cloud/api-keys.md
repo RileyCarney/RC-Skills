@@ -1,0 +1,232 @@
+# API keys and authentication
+Source: https://docs.boxlite.ai/cloud/api-keys
+
+Create a BoxLite Cloud API key, hand it to the SDK, CLI, or curl through the environment, and rotate it without downtime.
+
+Every call to BoxLite Cloud carries one credential: an API key you create in the console and send as a bearer token. There is no local runtime to fall back on and no permissive mode — a request without a valid key does not create a box.
+
+## What a key grants
+
+A key is a **fleet-level credential, not a read-only token**. Its holder can create,
+start, inspect, and remove boxes on your account, manage your image catalog, and spend
+your account's capacity. There is no narrower key to issue instead — the create dialog
+offers no permission choice.
+
+| Property | Value |
+| - | - |
+| Format | `blk_live_...` |
+| Transport | `Authorization: Bearer <YOUR_API_KEY>` |
+| Permissions | `Full` on keys issued today. Older keys may show `Boxes`, which cannot reach the image endpoints — those answer `403` |
+| Expiry | Set when you create the key; the default is `No expiration` |
+
+> [!NOTE]
+>
+> The create dialog describes the key as *"Boxes API access — this key can create and
+> manage Boxes. Shared Linux base images are available automatically."* Read that as a
+> floor, not a ceiling: the key the dialog issues lands in the list with **`Full`** in its
+> **PERMISSIONS** column. Check that column rather than the dialog when you need to know
+> what a key can reach.
+
+## Create a key in the console
+
+Sign in to the console at `https://app.boxlite.ai`, open **API Keys**, and click **Create Key**. The dialog asks for two things:
+
+| Field | Required | Notes |
+| - | - | - |
+| **Key Name** | Yes | How you will recognize the key in the list — use the environment or service that will hold it, such as `ci-pull-requests`. |
+| **Expires** | No | An optional expiration date. Defaults to `No expiration`. |
+
+The full key is shown once, at creation. **Copy it before you close the dialog** — from then on the list view shows only a masked form such as `blk_live_********************UHK`.
+
+The list view gives you one row per key with these columns:
+
+| Column | What it tells you |
+| - | - |
+| **NAME** | The name you chose. |
+| **KEY** | The masked key, enough to match a key against a value you hold. |
+| **PERMISSIONS** | The API surface the key can reach. `Full` reaches everything, including images; `Boxes` cannot reach the image endpoints. This is the authoritative value — the create dialog does not show it. |
+| **CREATED** | When the key was issued. |
+| **LAST USED** | The signal to check before you delete a key: a key with no recent use is safe to remove. |
+| **EXPIRES** | The expiration date, or nothing when the key does not expire. |
+
+## Give the key to your code
+
+BoxLite Cloud reads two environment variables. Both the SDKs and the CLI use the same names, so one export pair serves all of them:
+
+| Variable | Required | Value |
+| - | - | - |
+| `BOXLITE_API_KEY` | Yes | Your `blk_live_...` key. |
+| `BOXLITE_REST_URL` | Yes | `https://api.boxlite.ai` |
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+read -rs BOXLITE_API_KEY   # prompts without echoing; nothing lands in shell history
+export BOXLITE_API_KEY
+export BOXLITE_REST_URL="https://api.boxlite.ai"
+```
+
+Read the key from the environment at runtime and pass it as an `ApiKeyCredential`. The snippets below construct a client and list your boxes, which is the cheapest way to prove a credential works.
+
+> [tab] Python
+>
+> ```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> # check_credentials.py — prove the key in your environment reaches Cloud
+> # Run: python check_credentials.py
+> import asyncio
+> import os
+>
+> from boxlite import ApiKeyCredential, Boxlite, BoxliteRestOptions
+>
+> api_key = os.environ.get("BOXLITE_API_KEY")
+> if not api_key:
+>     raise SystemExit("Set BOXLITE_API_KEY to your blk_live_... key before running this.")
+>
+>
+> async def main() -> None:
+>     rt = Boxlite.rest(
+>         BoxliteRestOptions(
+>             url=os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
+>             credential=ApiKeyCredential(api_key),
+>         )
+>     )
+>
+>     try:
+>         boxes = await rt.list_info()
+>         print(f"Credential accepted. Boxes visible to this key: {len(boxes)}")
+>         for info in boxes:
+>             print(f"  - {info.id} name={info.name} status={info.state.status}")
+>     except Exception as exc:
+>         # A rejected key surfaces here as an HTTP 401
+>         print(f"Credential check failed: {exc!r}")
+>
+>
+> if __name__ == "__main__":
+>     asyncio.run(main())
+> ```
+
+> [tab] Node
+>
+> ```typescript theme={"theme":{"light":"github-light","dark":"github-dark"}}
+> // check-credentials.ts — prove the key in your environment reaches Cloud
+> // Run: npx tsx check-credentials.ts
+> import { JsBoxlite, BoxliteRestOptions, ApiKeyCredential } from "@boxlite-ai/boxlite";
+>
+> async function main(): Promise<void> {
+>   const apiKey = process.env.BOXLITE_API_KEY;
+>   if (!apiKey) {
+>     throw new Error("Set BOXLITE_API_KEY to your blk_live_... key before running this.");
+>   }
+>
+>   // The runtime class is JsBoxlite; there is no bare Boxlite export
+>   const rt = JsBoxlite.rest(
+>     new BoxliteRestOptions({
+>       url: process.env.BOXLITE_REST_URL ?? "https://api.boxlite.ai",
+>       credential: new ApiKeyCredential(apiKey),
+>     }),
+>   );
+>
+>   try {
+>     const boxes = await rt.listInfo();
+>     console.log(`Credential accepted. Boxes visible to this key: ${boxes.length}`);
+>     for (const info of boxes) {
+>       console.log(`  - ${info.id} name=${info.name} status=${info.state.status}`);
+>     }
+>   } catch (err) {
+>     // A rejected key surfaces here as an HTTP 401
+>     console.error("Credential check failed:", err instanceof Error ? err.message : err);
+>   } finally {
+>     rt.close(); // synchronous
+>   }
+> }
+>
+> main();
+> ```
+
+### Load the whole configuration from the environment
+
+`BoxliteRestOptions.from_env()` builds the options object for you, wrapping `BOXLITE_API_KEY` into an `ApiKeyCredential` automatically. It is the shortest correct form for CI jobs and services, where the credential is injected by the platform rather than typed by a person.
+
+```python theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# from_env_check.py — let the SDK read BOXLITE_REST_URL and BOXLITE_API_KEY for you
+import asyncio
+
+from boxlite import Boxlite, BoxliteRestOptions
+
+
+async def main() -> None:
+    try:
+        opts = BoxliteRestOptions.from_env()
+    except Exception as exc:
+        # Raised when BOXLITE_REST_URL is unset
+        print(f"Missing configuration: {exc!r}")
+        print("Set BOXLITE_REST_URL and BOXLITE_API_KEY, then run this again.")
+        return
+
+    rt = Boxlite.rest(opts)
+    try:
+        boxes = await rt.list_info()
+        print(f"Credential accepted. Boxes visible to this key: {len(boxes)}")
+    except Exception as exc:
+        print(f"Credential check failed: {exc!r}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+For the full list of variables `from_env()` reads, see [Manage remote sandboxes over REST](/guides/agent-service-endpoint). One of them, `BOXLITE_REST_PATH_PREFIX`, exists for self-hosted control planes — leave it unset for Cloud, and see the `path_prefix` row under [Troubleshooting](#troubleshooting) below.
+
+## Persist credentials for the CLI
+
+Exports live and die with a shell. `boxlite auth login` writes the credential to a profile in `~/.boxlite/credentials.toml` instead, so every later `boxlite` command in every shell finds it.
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Read the key without echoing it, then hand it to the CLI over stdin so it
+# never appears in argv or in your shell history
+read -rs BOXLITE_API_KEY
+printf '%s' "$BOXLITE_API_KEY" | boxlite auth login \
+  --url https://api.boxlite.ai --api-key-stdin
+
+boxlite auth status    # what is stored locally, no network call
+boxlite auth whoami    # confirm the identity the service sees, via GET /v1/me
+boxlite auth logout    # delete the stored credential
+```
+
+Profiles let one machine hold several identities. Each profile stores its own URL, bearer, and route prefix; `--profile <NAME>` or `BOXLITE_PROFILE` selects one, and the default profile is named `default`.
+
+```bash theme={"theme":{"light":"github-light","dark":"github-dark"}}
+# Store a second identity, then use it for one command
+printf '%s' "$STAGING_KEY" | boxlite auth login --profile staging \
+  --url https://api.boxlite.ai --api-key-stdin
+boxlite --profile staging ps
+```
+
+One interaction is worth knowing before it surprises you: `BOXLITE_API_KEY` in the environment overrides **only** the bearer from the stored profile, not the profile's URL or route prefix. A stale export can therefore send the wrong key to the right service. For the complete flag table, see [`boxlite auth`](/reference/cli#boxlite-auth).
+
+## Handle keys safely
+
+* **Never commit a key, and never put it in argv.** Both source control and shell history are searchable forever. Read the key with `read -rs` and pass it through the environment or over stdin, as the snippets above do.
+* **Use one key per environment.** Separate keys for local development, CI, and production mean the **LAST USED** column tells you something, and a leak from CI does not force you to re-credential your laptop.
+* **Set an expiry when the key has a known lifetime.** A key issued for a two-week migration should stop working in two weeks, not in two years.
+* **Rotate by creating first, deleting second.** Create the replacement key, deploy it everywhere the old key was used, confirm traffic on the new key, and only then delete the old one. Deleting first means every box the old key manages goes unreachable until the new key lands.
+* **Give agents the narrowest key you can.** A key holder can create and remove boxes on your account, so an agent that only needs one box still gets a key that could remove them all — keep that key on your infrastructure and out of any prompt or model context.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| - | - | - |
+| `401 Unauthorized` on every call | The key is missing from the request, mistyped, or was deleted in the console. | Confirm the value starts with `blk_live_` and that its masked form matches a live row in **API Keys**. Cloud has no permissive mode, so there is no configuration that makes an unauthenticated request succeed. |
+| `SystemExit: Set BOXLITE_API_KEY ...`, or the CLI runs against your local runtime | The process did not inherit the export — a new shell, a cron job, or a service manager with its own environment. | Export both variables in the process that actually runs, or store the credential with `boxlite auth login` so it does not depend on the shell. |
+| An HTML page comes back instead of a box payload, with a `200` status | The base URL points at the console host `https://app.boxlite.ai`. The console serves the dashboard page on paths it does not recognise, so a wrong base URL does not fail loudly — it returns markup your client cannot parse. | Set `BOXLITE_REST_URL` to exactly `https://api.boxlite.ai`. That is the API host; `app.boxlite.ai` is the console you sign in to. |
+| Calls that worked before start returning `401` | The key passed the date in its **EXPIRES** column. | Create a replacement key, update the environment, then delete the expired row. |
+| `RuntimeError('box not found: {"detail":"Not Found"}')` while the key is valid | A `path_prefix` is being sent. Cloud serves `/v1/boxes` directly; the route prefix belongs to the open-source reference server, which mounts routes under `/v1/{prefix}/boxes`. | Drop `path_prefix` from `BoxliteRestOptions`, unset `BOXLITE_REST_PATH_PREFIX`, and drop `--path-prefix` from CLI invocations. See [BoxLite Cloud vs open source](/cloud/vs-opensource). |
+| `boxlite auth whoami` fails while `boxlite auth status` looks correct | `status` reads local state only; `whoami` calls `GET /v1/me`. A stored credential can be well-formed and still be rejected. | Log in again with the current key, and check whether a stale `BOXLITE_API_KEY` export is overriding the profile's bearer. |
+
+## Next steps
+
+> [card] [Cloud quickstart](/cloud/quickstart)
+>
+> Use the key you just created to run your first command inside a Cloud box.
+
+> [card] [Boxes](/cloud/boxes)
+>
+> Pick an image and a size, and learn the lifecycle controls Cloud applies while a box runs.

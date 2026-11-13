@@ -1,0 +1,46 @@
+# Introduction to BoxLite
+Source: https://docs.boxlite.ai/getting-started/index
+
+What a Box actually is, how it differs from a container, and which of its capabilities are ready to build on today.
+
+## A Box is a microVM, not a container
+
+A Box starts a lightweight virtual machine in one line of code and runs any standard container image (Docker / OCI) inside it. Four properties distinguish it from an ordinary container:
+
+* **Hardware-level isolation.** Each Box has its own kernel (KVM on Linux, Hypervisor.framework on macOS) rather than sharing the host kernel through namespaces. That boundary is what makes it safe to run untrusted or model-generated code.
+* **Stateful.** Most sandboxes are destroyed after a single execution, so the environment has to be rebuilt every time. A Box is a persistent workspace: after `stop` and a later `start`, installed packages and written files are still there.
+* **No daemon.** BoxLite is embedded as a library inside your process. It needs no root and no background service.
+* **Local-first.** It runs entirely on your machine without a cloud account, and scales out horizontally when you need it.
+
+## When to use it
+
+| Scenario | Why it fits |
+| - | - |
+| Running LLM- or agent-generated code | Hardware isolation and an egress allowlist keep mistakes and exfiltration away from the host |
+| An environment you "install once, reuse repeatedly" | A Box keeps its state across stop/start, so you do not rebuild it each time |
+| Multi-tenant or concurrent execution of untrusted tasks | An async-first API lets you run many mutually isolated Boxes on one host |
+| Browser automation, desktop automation, or running a coding agent | `BrowserBox`, `ComputerBox`, and `SkillBox` cover these directly |
+
+## What is ready to build on
+
+Every Box type, lifecycle management, custom resources / volumes / network, snapshots, secrets, code execution, browser automation, running a coding agent in a box, and a REST client are all available today.
+
+For the capabilities people most often ask about, here is the current path:
+
+| You want to | How it works today |
+| - | - |
+| Expose a sandbox over MCP | Wrap `SimpleBox.exec` in your own MCP server — [MCP tool handler](/agent-tools/mcp-server) |
+| Run Git / GitHub workflows | `exec` the `git` / `gh` CLIs with the token injected via `secrets` — [GitHub operations](/agent-tools/github-operations) |
+| Give a human a graphical desktop | `ComputerBox`'s noVNC desktop plus port forwarding — [Desktop access](/human-tools/desktop-access) |
+| Drive a sandbox from an agent loop | An LLM tool-use loop calling `SimpleBox.exec` — [Drive a sandbox from your agent loop](/agent-tools/drive-from-agent-loop) |
+| Use a PTY from Rust / C / Go | Set the TTY flag on the exec call — Rust `.tty(true)`, C `cmd.tty = 1`, Go `WithTty(true)`; the `InteractiveBox` wrapper is Python and Node — [Interactive shell (PTY)](/agent-tools/pseudo-terminal) |
+| Connect to a remote BoxLite service | The `Boxlite.rest(...)` client — [Manage remote sandboxes over REST](/guides/agent-service-endpoint) |
+
+## Next
+
+1. **Install it** — [Installation](/getting-started/installation) covers every SDK, the CLI, and the virtualization requirement.
+2. **Run something** — pick the [Python](/getting-started/quickstart), [Node.js](/getting-started/quickstart), [Rust](/getting-started/quickstart), [Go](/getting-started/quickstart), or [C](/getting-started/quickstart) quickstart.
+3. **Choose a Box type** — [Box types](/manage-sandbox/sandbox-types) compares all six and their defaults.
+4. **See what you are operating** — [Architecture overview](/architecture/index) traces one `exec` from your process to the guest.
+
+Hitting an error already? Environment and install problems are on [Installation](/getting-started/installation#troubleshooting); exception types and API pitfalls are on [Error handling](/guides/error-handling); quick answers are in the [FAQ](/faq).

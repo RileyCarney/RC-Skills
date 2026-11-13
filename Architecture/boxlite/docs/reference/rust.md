@@ -1,0 +1,945 @@
+# Rust SDK reference
+Source: https://docs.boxlite.ai/reference/rust
+
+the boxlite crate is the core implementation of BoxLite — a Tokio-based, async-first library for creating, running, and destroying hardware-isolated microVM sandboxes directly from a Rust process. Every other language SDK (Python / Node / Go / C) is a binding over this layer. Use it when you need to run untrusted code, agent-generated commands, or third-party binaries inside a real virtual machine without pulling in an external process or daemon.
+
+Every code block below is copy-runnable: `use` statements, `#[tokio::main]`, and error handling are already filled in. The crate itself is the source of truth (`src/boxlite/src/`); check the version you have with `boxlite::VERSION`, which equals `CARGO_PKG_VERSION`.
+
+***
+
+## Prerequisites
+
+* The `boxlite` crate and a machine with hardware virtualization — see [Installation](/getting-started/installation#platform-and-virtualization-requirements-common-to-all-sdks).
+
+| Item | Requirement |
+| - | - |
+| Rust | 2021 edition, stable toolchain |
+| Async runtime | **Tokio** (the library API is entirely `async` and must be called from within a Tokio runtime) |
+| Dependencies | crate `boxlite`; streaming reads of stdout/stderr require `futures` (`StreamExt`) |
+
+`Cargo.toml` (the crate name is `boxlite`):
+
+```toml theme={"theme":{"light":"github-light","dark":"github-dark"}}
+[dependencies]
+boxlite = "0.10"            # the crate name is boxlite
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"           # required for streaming reads of stdout/stderr
+```
+
+> Note: BoxLite is currently distributed primarily alongside the per-language SDKs and the CLI. If your environment has no publish source configured yet, depend on this repository's `src/boxlite/` by path (`boxlite = { path = "..." }`). The crate version is managed centrally by the workspace and corresponds to the latest published release (`boxlite::VERSION` reads `CARGO_PKG_VERSION` at compile time).
+
+***
+
+## Quick Example (minimal happy path)
+
+The shortest "create a box -> run a command -> read the exit code -> clean up" loop. The execution method is **`exec`** (not `run`); once it completes you obtain an `ExecResult` via `Execution::wait()`:
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+use boxlite::{BoxliteRuntime, BoxOptions, BoxCommand};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1) Get the runtime (synchronous construction, not async). with_defaults uses ~/.boxlite as home.
+    let runtime = BoxliteRuntime::with_defaults()?;
+
+    // 2) Create a box (default rootfs = alpine:latest). create is async.
+    //    Note: the default deletes the box on stop; auto_delete: Some(0) keeps it for an explicit remove later.
+    let options = BoxOptions { auto_delete: Some(0), ..Default::default() };
+    let litebox = runtime
+        .create(options, Some("hello-box".to_string()))
+        .await?;
+    println!("created box id = {}", litebox.id());
+
+    // 3) Run a command: exec returns an Execution handle; wait() blocks until the process exits.
+    let execution = litebox.exec(BoxCommand::new("echo").arg("hello from boxlite")).await?;
+    let result = execution.wait().await?;
+    println!("exit code = {}", result.exit_code);   // 0 = success
+
+    // 4) Cleanup: stop terminates the VM; remove is called on the [runtime], not the box.
+    //    (Under the default policy stop() has already deleted it, so remove is unnecessary and should not be called.)
+    litebox.stop().await?;
+    runtime.remove("hello-box", false).await?;
+
+    Ok(())
+}
+```
+
+> **Key points**
+>
+> * The runtime constructors (`with_defaults` / `new` / `rest`) are **synchronous `fn`**; only the operations (`create` / `exec` / `start` / `stop`, etc.) are `async`.
+> * The execution method is **`exec`** and returns an `Execution`. **There is no `litebox.run(...)`.**
+> * `ExecResult` has only `exit_code` and `error_message`, **not stdout/stderr** — output is read as a stream (see [Execution](#execution-handle-to-a-running-command)).
+> * To delete a box use **`runtime.remove(id_or_name, force)`**, not `box.remove()`.
+
+***
+
+## Core types and methods
+
+### `BoxliteRuntime` (runtime entry point)
+
+The main entry point for creating and managing boxes. Source: `src/boxlite/src/runtime/core.rs`.
+
+**Constructors (all synchronous `fn`)**
+
+| Method | Signature | Description |
+| - | - | - |
+| `new` | `fn new(options: BoxliteOptions) -> BoxliteResult<Self>` | Create with custom options |
+| `with_defaults` | `fn with_defaults() -> BoxliteResult<Self>` | Default options (home defaults to `~/.boxlite`) |
+| `rest` | `fn rest(options: BoxliteRestOptions) -> BoxliteResult<Self>` | Connect to a remote BoxLite REST service (requires the `rest` feature) |
+| `default_runtime` | `fn default_runtime() -> &'static Self` | Global singleton (initialized on demand) |
+| `try_default_runtime` | `fn try_default_runtime() -> Option<&'static Self>` | Returns only if already initialized |
+| `init_default_runtime` | `fn init_default_runtime(options: BoxliteOptions) -> BoxliteResult<()>` | Initialize the global singleton with options |
+
+**Operations (all `async`, `&self`)**
+
+| Method | Signature | Description |
+| - | - | - |
+| `create` | `async fn create(&self, options: BoxOptions, name: Option<String>) -> BoxliteResult<LiteBox>` | Create and persist a box (VM not yet started) |
+| `get_or_create` | `async fn get_or_create(&self, options: BoxOptions, name: Option<String>) -> BoxliteResult<(LiteBox, bool)>` | Get by name or create; returns `(box, created)`, where `created=true` means newly created |
+| `get` | `async fn get(&self, id_or_name: &str) -> BoxliteResult<Option<LiteBox>>` | Get a handle by ID or name |
+| `get_info` | `async fn get_info(&self, id_or_name: &str) -> BoxliteResult<Option<BoxInfo>>` | Get info (without building a handle) |
+| `list_info` | `async fn list_info(&self) -> BoxliteResult<Vec<BoxInfo>>` | List all boxes (most recent first) |
+| `exists` | `async fn exists(&self, id_or_name: &str) -> BoxliteResult<bool>` | Whether a box exists |
+| `metrics` | `async fn metrics(&self) -> BoxliteResult<RuntimeMetrics>` | Runtime-wide aggregate metrics |
+| `remove` | `async fn remove(&self, id_or_name: &str, force: bool) -> BoxliteResult<()>` | Delete permanently (`force=true` force-removes a running box) |
+| `import_box` | `async fn import_box(&self, archive: BoxArchive, name: Option<String>) -> BoxliteResult<LiteBox>` | Import a `.boxlite` archive (construct it first with `BoxArchive::new(path)`, not a bare `&Path`) |
+| `shutdown` | `async fn shutdown(&self, timeout: Option<i32>) -> BoxliteResult<()>` | Graceful shutdown (`None` = 10s default, `Some(-1)` = wait indefinitely) |
+
+Non-async handles: `images() -> BoxliteResult<ImageHandle>`, `auth() -> BoxliteResult<AuthHandle>`.
+
+> **Note**: `metrics()` returns **`BoxliteResult<RuntimeMetrics>`** (needs `?`). To enumerate boxes use `list_info()` (not `list()`).
+
+### `LiteBox` (box handle)
+
+A handle to a box instance. All methods take `&self`, so it can be shared across threads via `Arc`. Source: `src/boxlite/src/litebox/mod.rs`.
+
+| Method | Signature | Description |
+| - | - | - |
+| `id` | `fn id(&self) -> &BoxID` | Box ID (synchronous) |
+| `name` | `fn name(&self) -> Option<&str>` | Optional name (synchronous) |
+| `info` | `async fn info(&self) -> BoxliteResult<BoxInfo>` | Box metadata; `.await` it |
+| `start` | `async fn start(&self) -> BoxliteResult<()>` | Start the VM; idempotent (a no-op when already Running) |
+| `exec` | `async fn exec(&self, command: BoxCommand) -> BoxliteResult<Execution>` | Run a command; implicitly calls `start()` if not started |
+| `attach` | `async fn attach(&self, execution_id: &str) -> BoxliteResult<Execution>` | Reattach to an execution that is still running |
+| `metrics` | `async fn metrics(&self) -> BoxliteResult<BoxMetrics>` | Per-box metrics |
+| `stop` | `async fn stop(&self) -> BoxliteResult<()>` | Terminate the VM; can be restarted |
+| `copy_into` | `async fn copy_into(&self, host_src, container_dst, opts: CopyOptions) -> BoxliteResult<()>` | Host -> container |
+| `copy_out` | `async fn copy_out(&self, container_src, host_dst, opts: CopyOptions) -> BoxliteResult<()>` | Container -> host |
+| `snapshots` | `fn snapshots(&self) -> SnapshotHandle` | Get the snapshot handle (synchronous) |
+| `ssh` | `fn ssh(&self) -> SshHandle` | Get the SSH control handle (synchronous). **Local runtime only** — see [SSH control](#ssh-control-local-runtime-only) |
+| `clone_box` | `async fn clone_box(&self, options: CloneOptions, name: Option<String>) -> BoxliteResult<LiteBox>` | Clone into a new box |
+| `clone_boxes` | `async fn clone_boxes(&self, options: CloneOptions, count: usize, names: Vec<String>) -> BoxliteResult<Vec<LiteBox>>` | Clone in bulk (shares the base disk, more space-efficient) |
+| `export` | `async fn export(&self, options: ExportOptions, dest: &Path) -> BoxliteResult<BoxArchive>` | Export to a portable archive |
+
+**Lifecycle**: `create()` -> `Configured` (persisted, no VM); `start()` (or the first `exec()`) -> `Running`; `stop()` -> `Stopped` (can be restarted).
+
+### SSH control (local runtime only)
+
+`box.ssh()` turns on an SSH server **inside** the box, so a person or a tool can reach
+a shell in it with an ordinary `ssh` client instead of going through `exec`. You supply
+the host key and the authorized public keys; the box does not generate or store either
+for you.
+
+> [!WARNING]
+>
+> **This is available only on the local runtime.** Over REST — including BoxLite Cloud —
+> every method on the handle returns:
+>
+> ```
+> Unsupported("SSH control requires the local backend")
+> ```
+>
+> It is also absent from the CLI and from the Python and Node SDKs. If you need a shell
+> in a Cloud box, use [the interactive PTY](/agent-tools/pseudo-terminal) instead, which
+> works on every runtime.
+
+| Method | Signature | Description |
+| - | - | - |
+| `configure` | `async fn configure(&self, config: SshConfig) -> BoxliteResult<SshStatus>` | Enable the server, or replace its configuration. The only method that may implicitly start a box |
+| `status` | `async fn status(&self) -> BoxliteResult<SshStatus>` | Read the current state. Never starts a VM |
+| `disable` | `async fn disable(&self) -> BoxliteResult<SshStatus>` | Turn the server off. Never starts a VM |
+
+`SshConfig`:
+
+| Field | Type | Required | Description |
+| - | - | - | - |
+| `listen_address` | `String` | Required | Address inside the box, for example `0.0.0.0:22`. Bind `0.0.0.0`, not loopback, or nothing outside the guest can reach it |
+| `host_private_key` | `String` | Required | The server's host key, in OpenSSH private-key form. **You generate it** — `ssh-keygen -t ed25519 -f hostkey` |
+| `accounts` | `Vec<SshAccount>` | Required | Who may log in. An empty list enables a server nobody can use |
+
+`SshAccount`:
+
+| Field | Type | Required | Description |
+| - | - | - | - |
+| `login` | `String` | Required | The account inside the box, for example `root` |
+| `authorized_keys` | `Vec<String>` | Required | Public keys allowed to log in as that account, in `authorized_keys` form |
+| `ca` | `Option<SshCaConfig>` | Optional | Accept certificates signed by a CA instead of listing keys. `SshCaConfig { public_key, principal }` |
+
+`SshStatus` is returned by all three methods:
+
+| Field | Type | Description |
+| - | - | - |
+| `enabled` | `bool` | Whether the server is currently on |
+| `generation` | `u64` | Increments on each `configure`. Does **not** reset on `disable`, so it tells you how many times the box has been reconfigured |
+| `listen_address` | `String` | The address in effect, or empty when disabled |
+| `host_public_key` | `String` | The public half of the host key you supplied, or empty when disabled |
+| `host_key_fingerprint` | `String` | `SHA256:...` fingerprint — compare this against what your client reports on first connect |
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+use std::sync::Arc;
+
+use boxlite::{BoxOptions, BoxliteRuntime, RootfsSpec, SshAccount, SshConfig};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Generate these once, outside your program:
+    //   ssh-keygen -t ed25519 -N "" -f hostkey     # the box's host key
+    //   ssh-keygen -t ed25519 -N "" -f userkey     # the key you log in with
+    let host_private_key = std::fs::read_to_string("hostkey")?;
+    let user_public_key = std::fs::read_to_string("userkey.pub")?;
+
+    let rt = BoxliteRuntime::with_defaults()?;
+    let options = BoxOptions {
+        rootfs: RootfsSpec::Image("python".into()),
+        ..Default::default()
+    };
+    let litebox = rt.create(options, None).await?;
+    litebox.start().await?;
+
+    let status = litebox
+        .ssh()
+        .configure(SshConfig {
+            listen_address: "0.0.0.0:22".to_string(),
+            host_private_key,
+            accounts: vec![SshAccount {
+                login: "root".to_string(),
+                authorized_keys: vec![user_public_key.trim().to_string()],
+                ca: None,
+            }],
+        })
+        .await?;
+
+    println!("enabled={} fingerprint={}", status.enabled, status.host_key_fingerprint);
+
+    litebox.ssh().disable().await?;
+    rt.remove(&litebox.id().to_string(), true).await?;
+    Ok(())
+}
+```
+
+Run against a local box, that prints:
+
+```text theme={"theme":{"light":"github-light","dark":"github-dark"}}
+enabled=true fingerprint=SHA256:fXKTZSUz4kS5s2aFpi85pSQCn5btfWMMENKbj/slUnM
+```
+
+**Reaching the server.** `listen_address` is an address *inside* the box, so publish it
+the way you would any other guest service — a `PortSpec` in `BoxOptions`, or a tunnel.
+Forwarded traffic arrives on the guest's network interface rather than its loopback,
+which is why the address above is `0.0.0.0:22` and not `127.0.0.1:22`.
+
+**Troubleshooting**
+
+| Symptom | Cause | Fix |
+| - | - | - |
+| `Unsupported("SSH control requires the local backend")` | The handle came from a box on a REST runtime | SSH control is local-only. Use [the interactive PTY](/agent-tools/pseudo-terminal) on Cloud |
+| `configure` works but no client can connect | Nothing publishes the guest port, or the server is bound to loopback | Bind `0.0.0.0` and add a `PortSpec` or a tunnel for the port — see [Network access](/manage-sandbox/network-access) |
+| `status()` reports `enabled: false` with empty fields on a box you configured earlier | `disable()` was called, or the box was recreated. `generation` surviving at its old value tells the two apart | Call `configure` again |
+| Your client warns about an unknown host key | Expected on first connect — you supplied the host key, so no client has seen it before | Compare the warning against `host_key_fingerprint` from `SshStatus` before accepting |
+
+### `BoxCommand` (command builder)
+
+Builder style, chained methods that consume `self`. Source: `src/boxlite/src/litebox/exec.rs`.
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+use boxlite::BoxCommand;
+use std::time::Duration;
+
+let cmd = BoxCommand::new("python3")
+    .args(["-c", "print('hello')"])
+    .env("PYTHONPATH", "/app")
+    .timeout(Duration::from_secs(30))   // Note: the argument is a Duration
+    .working_dir("/workspace")
+    .user("nobody")                      // Same format as docker --user: <name|uid>[:<group|gid>]
+    .tty(true);
+```
+
+| Method | Signature | Description |
+| - | - | - |
+| `new` | `fn new(command: impl Into<String>) -> Self` | Create a command |
+| `arg` | `fn arg(self, arg: impl Into<String>) -> Self` | Add a single argument |
+| `args` | `fn args<I, S>(self, args: I) -> Self` | Add multiple arguments |
+| `env` | `fn env(self, key, val) -> Self` | Set an environment variable (callable multiple times) |
+| `timeout` | `fn timeout(self, timeout: Duration) -> Self` | Timeout (note: a `Duration`, not a bare number) |
+| `working_dir` | `fn working_dir(self, dir) -> Self` | Working directory |
+| `user` | `fn user(self, spec) -> Self` | Execution user |
+| `tty` | `fn tty(self, enable: bool) -> Self` | Enable a pseudo-terminal (terminal size is auto-detected) |
+
+### `Execution` (handle to a running command)
+
+Returned by `exec()`. Source: `src/boxlite/src/litebox/exec.rs`. stdout/stderr implement `futures::Stream<Item = String>` and **can each be taken only once**.
+
+| Method | Signature | Description |
+| - | - | - |
+| `id` | `fn id(&self) -> &ExecutionId` | Execution ID |
+| `stdin` | `fn stdin(&mut self) -> Option<ExecStdin>` | Take the stdin handle (one-shot) |
+| `stdout` | `fn stdout(&mut self) -> Option<ExecStdout>` | Take the stdout stream (one-shot) |
+| `stderr` | `fn stderr(&mut self) -> Option<ExecStderr>` | Take the stderr stream (one-shot) |
+| `wait` | `async fn wait(&self) -> BoxliteResult<ExecResult>` | Wait for completion (the result is cached, so it can be awaited repeatedly) |
+| `kill` | `async fn kill(&self) -> BoxliteResult<()>` | Terminate (SIGKILL) |
+| `signal` | `async fn signal(&self, signal: i32) -> BoxliteResult<()>` | Send a Unix signal |
+| `resize_tty` | `async fn resize_tty(&self, rows: u32, cols: u32) -> BoxliteResult<()>` | Resize the PTY window (effective only in TTY mode) |
+
+> **Note**: `wait`/`kill`/`signal`/`resize_tty` all take **`&self`** (only `stdin`/`stdout`/`stderr`, which take a stream, take `&mut self`). This means you can share an `Arc<Execution>` and call `kill()` concurrently.
+
+Streaming read of stdout (complete, runnable):
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+use boxlite::{BoxliteRuntime, BoxOptions, BoxCommand};
+use futures::StreamExt;   // provides .next()
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = BoxliteRuntime::with_defaults()?;
+    let litebox = runtime.create(BoxOptions::default(), None).await?;
+
+    let mut execution = litebox
+        .exec(BoxCommand::new("sh").args(["-c", "echo line1; echo line2"]))
+        .await?;
+
+    // stdout is a Stream<Item = String>; take it and read line by line.
+    if let Some(mut stdout) = execution.stdout() {
+        while let Some(line) = stdout.next().await {
+            println!("stdout: {line}");
+        }
+    }
+
+    let result = execution.wait().await?;
+    if !result.success() {
+        eprintln!("command failed, exit code = {}", result.exit_code);
+        if let Some(msg) = &result.error_message {
+            eprintln!("diagnostic: {msg}");
+        }
+    }
+
+    litebox.stop().await?;
+    Ok(())
+}
+```
+
+Writing to stdin (`ExecStdin` provides `write` / `write_all` / `close`):
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+use boxlite::{BoxliteRuntime, BoxOptions, BoxCommand};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = BoxliteRuntime::with_defaults()?;
+    let litebox = runtime.create(BoxOptions::default(), None).await?;
+
+    let mut execution = litebox.exec(BoxCommand::new("cat")).await?;
+
+    if let Some(mut stdin) = execution.stdin() {
+        stdin.write(b"hello stdin\n").await?;
+        stdin.write_all(b"more data\n").await?;
+        stdin.close();   // Explicit close = send EOF to the process (dropping also closes it)
+    }
+
+    let result = execution.wait().await?;
+    println!("exit code = {}", result.exit_code);
+    litebox.stop().await?;
+    Ok(())
+}
+```
+
+### `ExecResult`
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+pub struct ExecResult {
+    pub exit_code: i32,                  // 0=success; negative signal number when terminated by a signal
+    pub error_message: Option<String>,   // Diagnostic when the process dies abnormally (None on normal exit)
+}
+// Methods: success() -> bool (exit_code==0), code() -> i32
+```
+
+> **No stdout/stderr fields** (this differs from the C / Go / Python wrapper layers, which add output fields). At the Rust core layer, output comes from the streams in [Execution](#execution-handle-to-a-running-command).
+
+***
+
+## Box configuration (`BoxOptions` and related types)
+
+Source: `src/boxlite/src/runtime/options.rs`. `BoxOptions` implements `Default`; fill the remaining fields with `..Default::default()`.
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+use boxlite::runtime::options::{PortSpec, VolumeSpec};  // not re-exported at the crate root
+use boxlite::{AdvancedBoxOptions, BoxOptions, NetworkSpec, RootfsSpec, SecurityOptions};
+
+let options = BoxOptions {
+    cpus: Some(2),                                       // None = the runtime default of 1 vCPU (see note in 4.1)
+    memory_mib: Some(1024),                              // None = the runtime default of 1024 MiB (see note in 4.1)
+    rootfs: RootfsSpec::Image("python:3.11-slim".into()),
+    env: vec![("PYTHONPATH".to_string(), "/app".to_string())],
+    volumes: vec![VolumeSpec {
+        host_path: "<YOUR_PROJECT_PATH>".to_string(),  // <-- replace with an absolute host path
+        guest_path: "/app".to_string(),
+        read_only: false,                               // bool, not a "ro"/"rw" string
+    }],
+    network: NetworkSpec::Enabled { allow_net: vec!["api.github.com".into()] },
+    ports: vec![PortSpec { host_port: Some(8080), guest_port: 80, ..Default::default() }],
+    auto_delete: Some(0),                               // keep the box after stopping
+    advanced: AdvancedBoxOptions {
+        security: SecurityOptions::enabled(),           // enabled by default
+        ..Default::default()
+    },
+    ..Default::default()
+};
+```
+
+### `BoxOptions` fields
+
+| Field | Type | Required | Default | Description |
+| - | - | - | - | - |
+| `cpus` | `Option<u8>` | Optional | `None` | Number of vCPUs. When `None`, the runtime allocates 1 vCPU (`vm_defaults::DEFAULT_CPUS`). |
+| `memory_mib` | `Option<u32>` | Optional | `None` | Memory in MiB. When `None`, the runtime allocates 1024 MiB (`vm_defaults::DEFAULT_MEMORY_MIB`). |
+| `disk_size_gb` | `Option<u64>` | Optional | `None` | rootfs disk cap (sparse, grows on demand) |
+| `working_dir` | `Option<String>` | Optional | `None` | Default working directory inside the box |
+| `env` | `Vec<(String, String)>` | Optional | `[]` | Environment variables |
+| `rootfs` | `RootfsSpec` | Optional | `Image("alpine:latest")` | Root filesystem source |
+| `volumes` | `Vec<VolumeSpec>` | Optional | `[]` | Volume mounts |
+| `network` | `NetworkSpec` | Optional | `Enabled { allow_net: [] }` | Network isolation |
+| `ports` | `Vec<PortSpec>` | Optional | `[]` | Port mappings |
+| `secrets` | `Vec<Secret>` | Optional | `[]` | Outbound HTTP(S) secret substitution rules |
+| `auto_delete` | `Option<u32>` | Optional | `None` | Seconds after a successful stop before deletion. `Some(0)` keeps the box; `Some(n>0)` deletes it — local runtimes delete immediately on stop, REST runtimes wait `n` seconds. `None` falls back to the deprecated `auto_remove`, whose default is `true`, so the box is deleted on stop |
+| `auto_remove` | `bool` | **Deprecated** | `true` | Superseded by `auto_delete`, which takes precedence when set. REST runtimes do not transmit this field |
+| `detach` | `bool` | Optional | `false` | Run detached from the parent process |
+| `advanced` | `AdvancedBoxOptions` | Optional | secure defaults | Security / mount isolation / health checks |
+| `entrypoint` | `Option<Vec<String>>` | Optional | `None` | Override the image entrypoint |
+| `cmd` | `Option<Vec<String>>` | Optional | `None` | Override the image cmd |
+| `user` | `Option<String>` | Optional | `None` | Default execution user |
+
+> **About the `cpus` / `memory_mib` defaults**: the field default is `None`. When `None`, the runtime allocates **1 vCPU / 1024 MiB** from `vm_defaults` in `src/boxlite/src/runtime/constants.rs`. Pass explicit values in production. See [Compute resources](/manage-sandbox/compute-resources).
+
+### `RootfsSpec`
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+pub enum RootfsSpec {
+    Image(String),       // Pull/resolve an image reference, e.g. "python:3.11-slim"
+    RootfsPath(String),  // Use a prepared host rootfs path
+}
+// Default = Image("alpine:latest")
+```
+
+### `VolumeSpec` (**third field is a bool**)
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+pub struct VolumeSpec {
+    pub host_path: String,
+    pub guest_path: String,
+    pub read_only: bool,   // true=read-only, false=read-write. Not a "ro"/"rw" string.
+}
+```
+
+> Note: the `ro`/`rw` strings are only used by the CLI form `-v host:guest:ro`, which lives in the CLI parsing layer; the SDK API uses a **bool**.
+
+### `NetworkSpec`
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+pub enum NetworkSpec {
+    Enabled { allow_net: Vec<String> },  // empty = all outbound; non-empty = allowlist only (supports exact host/wildcard/IP/CIDR)
+    Disabled,                            // fully removes the guest network interface
+}
+// Default = Enabled { allow_net: vec![] }
+```
+
+### `PortSpec`
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+pub struct PortSpec {
+    pub host_port: Option<u16>,    // None = same as guest_port (source comment: None => same as guest_port)
+    pub guest_port: u16,           // required: the guest port to expose
+    pub protocol: PortProtocol,    // defaults to Tcp
+    pub host_ip: Option<String>,   // None = 0.0.0.0
+}
+pub enum PortProtocol { Tcp, Udp }  // defaults to Tcp
+```
+
+### `Secret` (secrets / vault entry point)
+
+Code inside the box sees the `placeholder`; when traffic goes out to one of the hosts listed in `hosts`, the proxy substitutes the real `value`, so the plaintext never lands in the guest:
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+pub struct Secret {
+    pub name: String,           // human-readable name (e.g. "openai_api_key")
+    pub hosts: Vec<String>,     // injection hosts, supports wildcards (e.g. ["api.openai.com", "*.example.com"])
+    pub placeholder: String,    // required, no default. Conventional form: <BOXLITE_SECRET:openai>
+    pub value: String,          // real value, never enters the guest; redacted in Debug/Display
+}
+// Note: Secret has no Default / new(); all four fields must be set explicitly.
+```
+
+***
+
+## Security, metrics, and runtime options
+
+### `SecurityOptions` / `AdvancedBoxOptions`
+
+Security options are passed **through `advanced`**; the top-level `BoxOptions` has no `security` field. Source: `src/boxlite/src/runtime/advanced_options.rs`.
+
+The Rust core layer exposes a **two-state switch plus a builder** (unlike the Python binding's `development()/standard()/maximum()` preset static methods, which do not exist here):
+
+| Entry point | Signature | Description |
+| - | - | - |
+| `SecurityOptions::enabled()` | `fn enabled() -> Self` | Default: full host isolation (`== default()`) |
+| `SecurityOptions::disabled()` | `fn disabled() -> Self` | Master switch off, all sub-protections off (debugging / environments that cannot be sandboxed) |
+| `SecurityOptions::from_preset(name)` | `fn from_preset(name: &str) -> BoxliteResult<Self>` | Resolve by name; accepts `enable`/`enabled`/`on` and `disable`/`disabled`/`off` (case-insensitive); anything else is `InvalidArgument` |
+| `SecurityOptions::is_full_isolation_available()` | `fn is_full_isolation_available() -> bool` | Whether the current platform supports full isolation |
+| `SecurityOptions::builder()` | `fn builder() -> SecurityOptionsBuilder` | Fine-grained construction |
+
+#### `SecurityOptions` fields
+
+The struct fields and their meanings (source: `SecurityOptions` in `src/boxlite/src/runtime/advanced_options.rs`). Several fields are Linux-only or macOS-only; on a platform that does not support a feature the field is inert.
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+pub struct SecurityOptions {
+    pub jailer_enabled: bool,          // Master switch: jailer isolation (Linux: seccomp/namespaces; macOS: sandbox-exec)
+    pub seccomp_enabled: bool,         // Linux only: seccomp syscall filtering
+    pub uid: Option<u32>,              // Linux only: UID to drop to. None = auto-allocate
+    pub gid: Option<u32>,              // Linux only: GID to drop to. None = auto-allocate
+    pub new_pid_ns: bool,              // Linux only: create a new PID namespace
+    pub new_net_ns: bool,              // Linux only: create a new network namespace
+    pub chroot_base: PathBuf,          // Linux: base directory for chroot jails
+    pub chroot_enabled: bool,          // Linux only: enable chroot isolation
+    pub close_fds: bool,               // Close inherited file descriptors
+    pub sanitize_env: bool,            // Sanitize environment variables
+    pub env_allowlist: Vec<String>,    // Environment variables preserved through sanitization
+    pub resource_limits: ResourceLimits, // RLIMIT_* caps for the jailed process (see 5.1.2)
+    pub sandbox_profile: Option<PathBuf>, // macOS only: custom sandbox profile
+    pub network_enabled: bool,         // macOS only: allow network inside the sandbox
+}
+```
+
+Field defaults under `enabled()` (`== default()`, source: `SecurityOptions::enabled` in `advanced_options.rs`):
+
+| Field | Default (enabled) | Notes |
+| - | - | - |
+| `jailer_enabled` | `true` | Master switch on |
+| `seccomp_enabled` | `true` on Linux, `false` elsewhere | `cfg!(target_os = "linux")` |
+| `uid` / `gid` | `Some(65534)` | `nobody` / `nogroup` |
+| `new_pid_ns` | `true` on Linux | |
+| `new_net_ns` | `false` | gvproxy provides networking |
+| `chroot_base` | `/srv/boxlite` | |
+| `chroot_enabled` | `true` on Linux | |
+| `close_fds` | `true` | |
+| `sanitize_env` | `true` | |
+| `env_allowlist` | `["RUST_LOG"]` | |
+| `network_enabled` | `true` | macOS sandbox network |
+
+`disabled()` sets `jailer_enabled = false` and turns off every sub-protection (`uid`/`gid` become `None`).
+
+#### `SecurityOptionsBuilder` methods
+
+Obtain a builder with `SecurityOptions::builder()` (or `SecurityOptionsBuilder::enabled()` / `::disabled()` / `::new()`). The setters take `&mut self` (non-consuming), and `build()` produces the final `SecurityOptions` (source `SecurityOptionsBuilder` in `advanced_options.rs`):
+
+| Method | Maps to |
+| - | - |
+| `new()` | Start from defaults |
+| `enabled()` | Start from the enabled profile |
+| `disabled()` | Start from the disabled profile |
+| `jailer_enabled(bool)` | `jailer_enabled` (master switch) |
+| `seccomp_enabled(bool)` | `seccomp_enabled` |
+| `uid(u32)` | Drop-to UID |
+| `gid(u32)` | Drop-to GID |
+| `new_pid_ns(bool)` | PID namespace |
+| `new_net_ns(bool)` | Network namespace |
+| `chroot_base(path)` | chroot base directory |
+| `chroot_enabled(bool)` | Enable chroot |
+| `close_fds(bool)` | Close inherited FDs |
+| `sanitize_env(bool)` | Sanitize environment |
+| `env_allowlist(vec)` | Replace the env allowlist |
+| `allow_env(var)` | Append one variable to the env allowlist |
+| `resource_limits(limits)` | Set all `ResourceLimits` at once |
+| `max_open_files(u64)` | `resource_limits.max_open_files` (RLIMIT_NOFILE) |
+| `max_file_size_bytes(u64)` | `resource_limits.max_file_size` (RLIMIT_FSIZE) |
+| `max_processes(u64)` | `resource_limits.max_processes` (RLIMIT_NPROC) |
+| `max_memory_bytes(u64)` | `resource_limits.max_memory` (RLIMIT_AS) |
+| `max_cpu_time_seconds(u64)` | `resource_limits.max_cpu_time` (RLIMIT_CPU) |
+| `sandbox_profile(path)` | macOS sandbox profile |
+| `network_enabled(bool)` | macOS network access |
+| `build()` | Produce the `SecurityOptions` |
+
+> Note: the `development()` / `standard()` / `maximum()` presets available in the Python binding are **not** present on the Rust `SecurityOptionsBuilder`. Use `enabled()` / `disabled()` / `new()` as starting points and override individual fields.
+
+#### `ResourceLimits`
+
+RLIMIT\_\* caps applied to the jailed process (source: `ResourceLimits` in `advanced_options.rs`). Each field maps to a POSIX resource limit; `None` means "do not set this limit".
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+pub struct ResourceLimits {
+    pub max_open_files: Option<u64>,  // RLIMIT_NOFILE. Default (enabled): Some(1024)
+    pub max_file_size:  Option<u64>,  // RLIMIT_FSIZE (bytes). Default (enabled): Some(1 GiB)
+    pub max_processes:  Option<u64>,  // RLIMIT_NPROC. Default (enabled): Some(100)
+    pub max_memory:     Option<u64>,  // RLIMIT_AS (bytes). Default: None (VM config handles this)
+    pub max_cpu_time:   Option<u64>,  // RLIMIT_CPU (seconds). Default: None (VM config handles this)
+}
+```
+
+The builder takes `&mut self` (non-consuming) and ends with `build()`. The following is a complete, runnable example: build custom security options with the builder and attach them to `AdvancedBoxOptions.security`:
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+use boxlite::{BoxliteRuntime, BoxOptions, BoxCommand, RootfsSpec};
+use boxlite::{AdvancedBoxOptions, SecurityOptions};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = BoxliteRuntime::with_defaults()?;
+
+    // Start from enabled, adjust a few limits, then build (builder methods take &mut self, so declare mut first).
+    let mut builder = SecurityOptions::builder();
+    builder
+        .seccomp_enabled(false)
+        .max_open_files(2048)
+        .max_processes(100)
+        .allow_env("MY_VAR");
+    let security = builder.build();
+
+    let options = BoxOptions {
+        rootfs: RootfsSpec::Image("alpine:latest".into()),
+        auto_delete: Some(0),                      // keep the box so the explicit remove below is the only deletion
+        advanced: AdvancedBoxOptions {
+            security,                              // custom security options
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let litebox = runtime.create(options, Some("secured".to_string())).await?;
+    let result = litebox.exec(BoxCommand::new("id")).await?.wait().await?;
+    println!("exit = {}", result.exit_code);
+
+    litebox.stop().await?;
+    runtime.remove("secured", false).await?;
+    Ok(())
+}
+```
+
+`AdvancedBoxOptions` fields: `security: SecurityOptions`, `isolate_mounts: bool` (default `false`, requires CAP_SYS_ADMIN on Linux), `health_check: Option<HealthCheckOptions>`.
+
+### Metrics fields (real field and method names)
+
+Accessor methods on `RuntimeMetrics` (`runtime.metrics().await?`):
+
+| Method | Returns | Description |
+| - | - | - |
+| `boxes_created_total()` | `u64` | Total boxes created |
+| `boxes_failed_total()` | `u64` | Total boxes that failed to start |
+| `boxes_stopped_total()` | `u64` | Total boxes stopped |
+| `num_running_boxes()` | `u64` | Currently running (not `active_boxes`) |
+| `total_commands_executed()` | `u64` | Total commands executed (not `total_commands_run`) |
+| `total_exec_errors()` | `u64` | Total execution errors (not `total_run_errors`) |
+
+Public fields on `BoxMetrics` (`litebox.metrics().await?`, selected):
+
+| Field | Type | Description |
+| - | - | - |
+| `cpu_percent` | `Option<f32>` | CPU usage 0-100 (not `cpu_time_ms`) |
+| `memory_bytes` | `Option<u64>` | Memory in bytes (not `memory_usage_bytes`) |
+| `commands_executed_total` | `u64` | Commands executed on this box |
+| `exec_errors_total` | `u64` | Execution errors on this box |
+| `bytes_sent_total` / `bytes_received_total` | `u64` | stdin / stdout+stderr bytes |
+| `guest_boot_duration_ms` | `Option<u128>` | Guest boot time |
+| `total_create_duration_ms` | `Option<u128>` | Total time from create to ready |
+| `network_bytes_sent` / `network_bytes_received` | `Option<u64>` | Network TX / RX |
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+use boxlite::{BoxliteRuntime, BoxOptions, BoxCommand};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = BoxliteRuntime::with_defaults()?;
+    let litebox = runtime.create(BoxOptions::default(), None).await?;
+    litebox.exec(BoxCommand::new("true")).await?.wait().await?;
+
+    let box_metrics = litebox.metrics().await?;
+    println!("cpu%   = {:?}", box_metrics.cpu_percent);
+    println!("mem B  = {:?}", box_metrics.memory_bytes);
+    println!("boot ms= {:?}", box_metrics.guest_boot_duration_ms);
+
+    let rt_metrics = runtime.metrics().await?;   // returns BoxliteResult, needs ?
+    println!("running boxes = {}", rt_metrics.num_running_boxes());
+
+    litebox.stop().await?;
+    Ok(())
+}
+```
+
+### `BoxliteOptions` / `ImageRegistry` (runtime options)
+
+Customize the home directory and image registries (including resolution order, authentication, plain HTTP, and skipping TLS verification):
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+use boxlite::{BoxliteRuntime, BoxliteOptions, ImageRegistry};
+use std::path::PathBuf;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let options = BoxliteOptions {
+        home_dir: PathBuf::from("<YOUR_PATH>/boxlite-home"),  // replace with a real path
+        image_registries: vec![
+            ImageRegistry::https("ghcr.io/myorg").with_search(true),
+            ImageRegistry::https("docker.io").with_search(true),
+            ImageRegistry::http("registry.local:5000").with_search(true),
+            ImageRegistry::https("registry.example.com")
+                .with_skip_verify(true)
+                .with_basic_auth("user", "<YOUR_REGISTRY_PASSWORD>"),  // replace
+        ],
+    };
+
+    let runtime = BoxliteRuntime::new(options)?;
+    println!("runtime ready, version = {}", boxlite::VERSION);
+    let _ = runtime;
+    Ok(())
+}
+```
+
+`ImageRegistry` constructors: `https(host)` / `http(host)`, chained with `.with_search(bool)` / `.with_skip_verify(bool)` / `.with_basic_auth(user, pass)` / `.with_bearer_auth(token)`.
+
+***
+
+## State queries (`BoxInfo` / `BoxStatus` / `BoxState`)
+
+`litebox.info().await?` returns a `BoxInfo`. **At the Rust core layer, `BoxInfo` has a `status: BoxStatus` field directly** (this differs from the Python/Node binding layer, where it is the two-level `info.state.status`).
+
+`BoxInfo` fields: `id: BoxID`, `name: Option<String>`, `status: BoxStatus`, `created_at`, `last_updated`, `pid: Option<u32>`, `image: String`, `cpus: u8`, `memory_mib: u32`, `labels`, `health_status: HealthStatus`.
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+pub enum BoxStatus {
+    Unknown,      // Cannot be determined (error recovery)
+    Configured,   // Created and persisted, VM not started
+    Running,      // Running, accepting commands
+    Stopping,     // Gracefully shutting down (transient)
+    Stopped,      // Stopped, VM terminated, rootfs preserved — can be restarted
+    Paused,       // VM frozen via SIGSTOP; used during export/snapshot for a consistent point in time
+    Failed,       // Init pipeline failed; record and rootfs are preserved so you can retry or destroy.
+                  // BoxState::error_reason carries the cause
+}
+```
+
+Predicate methods: `is_running()` / `is_configured()` / `is_stopped()` / `is_active()` / `is_transient()` / `can_start()` / `can_stop()` / `can_remove()` / `can_exec()`.
+
+### `BoxState`
+
+The dynamic state of a box (changes over the lifecycle), as opposed to the static configuration. Source `src/boxlite/src/litebox/state.rs` (struct `BoxState`):
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+pub struct BoxState {
+    pub status: BoxStatus,                  // Current lifecycle status
+    pub pid: Option<u32>,                   // Process ID (None if not running)
+    pub container_id: Option<ContainerID>,  // Container ID (64-char hex; see 9.2)
+    pub last_updated: DateTime<Utc>,        // Last state-change timestamp (UTC)
+    pub lock_id: Option<LockId>,            // Allocated on first initialization, not at creation
+    pub health_status: HealthStatus,        // Current health state + consecutive failure count
+    pub error_reason: Option<String>,       // Why the box entered Failed; cleared on a successful transition
+    pub exit_code: Option<i32>,             // Init process exit code, set when the box stopped
+}                                           // because its main command exited (Docker semantics)
+```
+
+> When a box reports `Failed`, `error_reason` and `exit_code` are where the cause is. Both are
+> `None` while the box is healthy.
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+use boxlite::{BoxliteRuntime, BoxOptions, BoxStatus};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = BoxliteRuntime::with_defaults()?;
+    let litebox = runtime.create(BoxOptions::default(), None).await?;
+
+    let info = litebox.info().await?;   // async and fallible (status is a direct field)
+    println!("id={} image={} status={:?}", info.id, info.image, info.status);
+
+    if info.status == BoxStatus::Configured {
+        litebox.start().await?;
+    }
+
+    litebox.stop().await?;
+    Ok(())
+}
+```
+
+***
+
+## Type utilities (`Bytes` / `Seconds` / `BoxID` / `ContainerID`)
+
+These newtypes appear across the API (resource sizes, durations, identifiers). Source `src/boxlite/src/runtime/types.rs` and `src/boxlite/src/runtime/id.rs`.
+
+### `Bytes`
+
+A semantic newtype for byte sizes, so call sites carry units instead of bare integers.
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+use boxlite::runtime::types::Bytes;
+
+// Constructors (all const fn)
+let size = Bytes::from_bytes(1_000_000);
+let size = Bytes::from_kib(512);   // 512 * 1024
+let size = Bytes::from_mib(128);   // 128 * 1024^2
+let size = Bytes::from_gib(2);     // 2 * 1024^3
+
+// Accessors
+let bytes = size.as_bytes();
+let kib   = size.as_kib();
+let mib   = size.as_mib();
+
+// Display rounds down to the largest exact unit
+println!("{}", Bytes::from_mib(512));  // "512 MiB"
+println!("{}", Bytes::from_gib(2));    // "2 GiB"
+println!("{}", Bytes::from_bytes(1500)); // "1500 bytes" (not an exact KiB)
+```
+
+### `Seconds`
+
+A semantic newtype for durations.
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+use boxlite::runtime::types::Seconds;
+
+// Constructors (all const fn)
+let duration = Seconds::from_seconds(30);
+let duration = Seconds::from_minutes(5);   // 300 seconds
+let duration = Seconds::from_hours(1);     // 3600 seconds
+
+// Accessors
+let secs = duration.as_seconds();
+let mins = duration.as_minutes();
+
+// Display
+println!("{}", Seconds::from_minutes(30));  // "30 minutes"
+println!("{}", Seconds::from_seconds(45));   // "45 seconds"
+```
+
+### `BoxID`
+
+A box identifier. Locally minted IDs are 12-character Base62 (\~71 bits of entropy); the type also accepts other formats from remote REST servers (up to `MAX_LENGTH = 128` characters) so prefixed or namespaced IDs round-trip.
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+use boxlite::runtime::id::{BoxID, BoxIDMint};
+
+let id = BoxIDMint::mint();          // 12-char Base62 for locally started boxes
+println!("Full:  {}", id.as_str());  // e.g. "aB3cD4eF5gH6"
+println!("Short: {}", id.short());   // shortened prefix
+
+// Parse / validate an existing string
+let valid   = BoxID::parse("aB3cD4eF5gH6");
+let invalid = BoxID::parse("");       // None
+```
+
+### `ContainerID`
+
+A container identifier in OCI format: 64-character lowercase hex.
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+use boxlite::runtime::types::ContainerID;
+
+let id = ContainerID::new();
+println!("Full:  {}", id.as_str());  // 64 hex chars
+println!("Short: {}", id.short());   // 12 hex chars
+
+// Validation: exactly 64 lowercase hex characters
+let ok = ContainerID::is_valid(&"a".repeat(64));  // true
+let no = ContainerID::is_valid("abc123");          // false
+```
+
+***
+
+## Error types (`BoxliteError`)
+
+Source `src/shared/src/errors.rs`. `BoxliteResult<T> = Result<T, BoxliteError>`.
+
+Real variants (**there is no `BoxliteError::Run`** — command-execution errors are `Execution`):
+
+`UnsupportedEngine`, `Engine(String)`, `Config(String)`, `Storage(String)`, `Image(String)`, `Portal(String)`, `Network(String)`, `Rpc(String)`, `RpcTransport(String)`, `Internal(String)`, **`Execution(String)`**, `Unsupported(String)`, `NotFound(String)`, `AlreadyExists(String)`, `InvalidState(String)`, `Database(String)`, `MetadataError(String)`, `InvalidArgument(String)`, `Stopped(String)`, `ResourceExhausted(String)`, `SessionReaped(String)`.
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+use boxlite::{BoxliteRuntime, BoxOptions, BoxliteError};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = BoxliteRuntime::with_defaults()?;
+
+    match runtime.create(BoxOptions::default(), None).await {
+        Ok(litebox) => {
+            println!("created: {}", litebox.id());
+            litebox.stop().await?;
+        }
+        Err(BoxliteError::Image(msg))   => eprintln!("image error (pull/resolve failed): {msg}"),
+        Err(BoxliteError::Config(msg))  => eprintln!("config error: {msg}"),
+        Err(BoxliteError::Engine(msg))  => eprintln!("engine error (often due to missing virtualization): {msg}"),
+        Err(BoxliteError::NotFound(msg))=> eprintln!("not found: {msg}"),
+        Err(e)                          => eprintln!("other error: {e}"),
+    }
+    Ok(())
+}
+```
+
+***
+
+## Concurrency and thread safety
+
+`BoxliteRuntime` and `LiteBox` are both `Send + Sync` and can be shared across tasks via `Arc`:
+
+```rust theme={"theme":{"light":"github-light","dark":"github-dark"}}
+use boxlite::{BoxliteRuntime, BoxOptions, BoxliteError};
+use std::sync::Arc;
+use tokio::task;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = Arc::new(BoxliteRuntime::with_defaults()?);
+
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let rt = Arc::clone(&runtime);
+        handles.push(task::spawn(async move {
+            let litebox = rt.create(BoxOptions::default(), None).await?;
+            let id = litebox.id().clone();
+            litebox.stop().await?;
+            Ok::<_, BoxliteError>(id)
+        }));
+    }
+
+    for h in handles {
+        match h.await? {
+            Ok(id) => println!("created and stopped: {id}"),
+            Err(e) => eprintln!("task error: {e}"),
+        }
+    }
+    Ok(())
+}
+```
+
+***
+
+## Troubleshooting (common problems and typical errors)
+
+| Symptom / error | Cause | Fix |
+| - | - | - |
+| `error[E0599]: no method named \`run\` found ... LiteBox\` | Misuse of the old API `litebox.run(...)` | The execution method is **`exec`**: `litebox.exec(BoxCommand::new(...)).await?` |
+| No `stdout` / `stderr` field on `ExecResult` | The Rust core `ExecResult` has only `exit_code` + `error_message` | Output comes from streams: `execution.stdout()` returns `Stream<Item=String>` (needs `use futures::StreamExt;`) |
+| `error[E0308]: mismatched types ... expected RuntimeMetrics` at the `metrics()` call | `runtime.metrics()` returns `BoxliteResult<RuntimeMetrics>` | Add `?`: `let m = runtime.metrics().await?;` |
+| `no method named \`run\`/\`active_boxes\`/\`total_commands_run\`\` on metrics | Wrong method names | Use `total_commands_executed()`, `total_exec_errors()`, `num_running_boxes()`, `boxes_created_total()` |
+| `error[E0599]: no variant ... \`Run\``on`BoxliteError\` | `BoxliteError::Run` does not exist | Command-execution errors are **`BoxliteError::Execution(String)`** |
+| Type error when configuring a volume / security (passing the string `"ro"` for `read_only`) | `VolumeSpec.read_only` is a `bool` | Use `read_only: true/false` (only the CLI uses `ro`/`rw` strings). Passing a string in the Python binding raises `TypeError: 'str' object cannot be cast as 'bool'` |
+| `error[E0599]: no method named \`maximum\`/\`standard\`/\`development\``on`SecurityOptions\` | Those are Python-binding presets; the Rust core uses `enabled()`/`disabled()`/`from_preset()`/`builder()` | Use `SecurityOptions::enabled()` or `SecurityOptions::builder()....build()` |
+| `the \`?\` operator ... future ... not awaited`/`not in async\` | Runtime operations are async and must run inside a Tokio runtime | Use `#[tokio::main]` or `tokio::runtime::Runtime::block_on`, and `.await` |
+| Create/start fails with `BoxliteError::Engine(...)` indicating virtualization is unavailable | No hardware virtualization (no KVM / unsupported platform) | Linux needs KVM (user in the `kvm` group); macOS arm64 uses Hypervisor.framework (no `/dev/kvm`); WSL2 needs KVM enabled. This is an environment constraint — you can `match` the error and degrade gracefully |
+| `BoxliteError::Image(...)` while pulling an image | Network flakiness / missing registry auth / wrong reference | Check the image reference and network; configure private registries via `ImageRegistry::...with_basic_auth/with_bearer_auth` (see [runtime options](#boxliteoptions-imageregistry-runtime-options)); retry |
+| `BoxliteError::Config("remove-on-stop is incompatible with detach=true ...")` | Remove-on-stop is in effect together with `detach: true` | For a detached box, set `auto_delete: Some(0)` and manage the lifecycle yourself |
+| `box.remove()` method not found | Removal lives on the **runtime** | `runtime.remove(id_or_name, force).await?` |
+| `rest`/REST-related types not found (`BoxliteRestOptions`, etc.) | The REST client is behind the `rest` feature | Enable the crate feature `rest` |
+
+***
+
+## Related references
+
+* Resource defaults (`cpus`/`memory_mib`): the field default is `None`, and the runtime then allocates 1 vCPU / 1024 MiB; pass explicit values in production. See [Compute resources](/manage-sandbox/compute-resources).
+* Binding-layer differences: the Python/Node two-level `BoxInfo.state.status`, the Python `SecurityOptions.maximum()` preset, and so on — see the corresponding SDK reference pages.
